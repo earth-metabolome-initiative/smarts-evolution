@@ -1,10 +1,11 @@
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::Path;
 
 use log::{info, warn};
 use serde::Deserialize;
 
 use super::compound::Compound;
+use super::io::open_jsonl_reader;
 
 /// The taxonomy level names for ClassyFire, in order from coarsest to finest.
 pub const LEVELS: &[&str] = &[
@@ -36,14 +37,12 @@ struct TaxNode {
     name: Option<String>,
 }
 
-/// Load compounds from a ClassyFire `.jsonl.zst` file.
+/// Load compounds from a ClassyFire `.jsonl` or `.jsonl.zst` file.
 ///
 /// Returns the list of compounds and the level names.
 /// Compounds whose SMILES is empty are skipped.
 pub fn load(path: &Path) -> Result<Vec<Compound>, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let decoder = zstd::Decoder::new(file)?;
-    let reader = BufReader::new(decoder);
+    let reader = open_jsonl_reader(path)?;
 
     let mut compounds = Vec::new();
     let mut skipped = 0usize;

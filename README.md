@@ -1,7 +1,6 @@
-<!-- cSpell:ignore librdkit classyfire SMARTS smarts jsonl -->
 # smarts-evolution
 
-Evolutionary algorithm system that discovers optimal SMARTS patterns for each node in hierarchical chemical taxonomies. Fitness is evaluated using MCC, Information Gain, and Lin semantic similarity with k-fold stratified cross-validation.
+Evolutionary algorithm system that discovers optimal SMARTS patterns for each node in hierarchical chemical taxonomies. Fitness is evaluated using MCC with k-fold stratified cross-validation.
 
 ## Prerequisites
 
@@ -26,8 +25,8 @@ cargo build --release
 ### Inspect a dataset
 
 ```bash
-# NPC classifier (multi-label, .jsonl)
-cargo run --release -- load --dataset npc --path part-000002.jsonl
+# NPC classifier (multi-label, fully labeled subset, .jsonl.zst)
+cargo run --release -- load --dataset npc --path npc.fully_labeled.jsonl.zst
 
 # ClassyFire taxonomy (single-label, .jsonl.zst)
 cargo run --release -- load --dataset classyfire --path success-000001.jsonl.zst
@@ -39,7 +38,7 @@ cargo run --release -- load --dataset classyfire --path success-000001.jsonl.zst
 # NPC dataset — full run with defaults (200 pop, 500 gens, 5-fold CV)
 RUST_LOG=info cargo run --release -- evolve \
   --dataset npc \
-  --path part-000002.jsonl \
+  --path npc.fully_labeled.jsonl.zst \
   --checkpoint-dir checkpoints/npc
 
 # ClassyFire dataset
@@ -51,7 +50,7 @@ RUST_LOG=info cargo run --release -- evolve \
 # Short test run
 RUST_LOG=info cargo run --release -- evolve \
   --dataset npc \
-  --path part-000003.jsonl \
+  --path npc.fully_labeled.jsonl.zst \
   --population-size 50 \
   --generation-limit 10 \
   --stagnation-limit 100 \
@@ -78,7 +77,7 @@ As new labels arrive (~10k/day), append to the JSONL file and resume:
 ```bash
 RUST_LOG=info cargo run --release -- evolve \
   --dataset npc \
-  --path part-000002.jsonl \
+  --path npc.fully_labeled.jsonl.zst \
   --checkpoint-dir checkpoints/npc \
   --resume
 ```
@@ -92,7 +91,7 @@ Already-evolved nodes are skipped; new nodes above the 20-compound threshold are
 With `RUST_LOG=info`, each node logs per-generation progress:
 
 ```
-Gen 0: fitness=43612, MCC=0.152, IG=0.087, Lin=0.634, smarts=[#6][#6]=[#6]
+Gen 1: lead_score=43612, lead_mcc=0.152, global_mcc=0.152, unique=182/200, duplicates=18, avg_len=7.4, best_len=6, cache_hits=0/182, smarts=[#6][#6]=[#6]
 ```
 
 ### Checkpoints
@@ -106,10 +105,7 @@ Evolved SMARTS are saved to `checkpoint.json`:
       "node_name": "Penicillins",
       "level": 2,
       "best_smarts": "[#6][#6]([#6])[#16][C@@H][C@H]",
-      "best_fitness": 79248,
-      "best_mcc": 0.856,
-      "best_ig": 0.234,
-      "best_lin": 0.912
+      "best_mcc": 0.856
     }
   }
 }
@@ -117,11 +113,11 @@ Evolved SMARTS are saved to `checkpoint.json`:
 
 ## Architecture
 
-- **Data**: Loads ClassyFire (.jsonl.zst) and NPC (.jsonl) with multi-label support
+- **Data**: Loads ClassyFire and NPC from `.jsonl` or `.jsonl.zst`
 - **Taxonomy DAG**: Auto-constructed from data, grows with new classes
 - **Genome**: SMARTS token sequences with parser/display roundtrip
-- **Operators**: 6 mutation types, fragment-exchange crossover, all RDKit-validated
-- **Fitness**: MCC + Information Gain + Lin similarity (weighted composite, 5-fold CV)
+- **Operators**: bounded mutation and crossover with structural validation
+- **Fitness**: MCC-only, 5-fold CV
 - **Evolution**: Per-node in topological DAG order; parent SMARTS pre-filters candidates
 
 ## Tests
@@ -130,4 +126,4 @@ Evolved SMARTS are saved to `checkpoint.json`:
 cargo test
 ```
 
-20 tests covering parser roundtrip, fitness metrics, operator validity rates, and stratified splitting.
+The test suite covers parser roundtrip, compressed dataset loading, fitness metrics, operator validity rates, worker-process evaluation, and stratified splitting.

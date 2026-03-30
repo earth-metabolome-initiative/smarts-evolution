@@ -1,10 +1,11 @@
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::Path;
 
 use log::{info, warn};
 use serde::Deserialize;
 
 use super::compound::Compound;
+use super::io::open_jsonl_reader;
 
 /// The taxonomy level names for NPC, in order from coarsest to finest.
 pub const LEVELS: &[&str] = &["pathway", "superclass", "class"];
@@ -21,13 +22,12 @@ struct Record {
     class_results: Vec<String>,
 }
 
-/// Load compounds from an NPC `.jsonl` file.
+/// Load compounds from an NPC `.jsonl` or `.jsonl.zst` file.
 ///
 /// Entries where any of pathway_results, superclass_results, or class_results
 /// is empty are discarded.
 pub fn load(path: &Path) -> Result<Vec<Compound>, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
+    let reader = open_jsonl_reader(path)?;
 
     let mut compounds = Vec::new();
     let mut skipped = 0usize;
@@ -76,4 +76,52 @@ pub fn load(path: &Path) -> Result<Vec<Compound>, Box<dyn std::error::Error>> {
         path.display()
     );
     Ok(compounds)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::load;
+
+    fn unique_temp_path(name: &str, extension: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "smarts-evolution-npc-{name}-{}-{nanos}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn load_accepts_zstd_compressed_jsonl() {
+        let path = unique_temp_path("compressed", "jsonl.zst");
+        let file = File::create(&path).unwrap();
+        let mut encoder = zstd::Encoder::new(file, 0).unwrap();
+        writeln!(
+            encoder,
+            "{{\"cid\":1,\"smiles\":\"CC\",\"pathway_results\":[\"PathA\"],\"superclass_results\":[\"SuperA\"],\"class_results\":[\"ClassA\"]}}"
+        )
+        .unwrap();
+        writeln!(
+            encoder,
+            "{{\"cid\":2,\"smiles\":\"N\",\"pathway_results\":[\"PathB\"],\"superclass_results\":[],\"class_results\":[\"ClassB\"]}}"
+        )
+        .unwrap();
+        encoder.finish().unwrap();
+
+        let compounds = load(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(compounds.len(), 1);
+        assert_eq!(compounds[0].cid, 1);
+        assert_eq!(compounds[0].smiles, "CC");
+        assert_eq!(compounds[0].labels[0], vec!["PathA".to_string()]);
+        assert_eq!(compounds[0].labels[1], vec!["SuperA".to_string()]);
+        assert_eq!(compounds[0].labels[2], vec!["ClassA".to_string()]);
+    }
 }
