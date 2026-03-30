@@ -200,6 +200,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             worker_processes,
             resume,
         } => {
+            let notifier = RunNotifier::new();
+            eprintln!("NTFY URL: {}", notifier.topic_url());
+            eprintln!(
+                "Open that URL in ntfy or a browser to receive per-class completion messages.\n"
+            );
+
             let (compounds, levels) = load_dataset(&dataset, &path)?;
 
             let dag_pb = step_spinner("Building taxonomy DAG");
@@ -249,11 +255,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!("\nStarting evolution...\n");
-            let notifier = RunNotifier::new();
-            println!("NTFY URL: {}", notifier.topic_url());
-            println!(
-                "Open that URL in ntfy or a browser to receive per-class completion messages.\n"
-            );
             let results = runner::run_evolution(
                 &compounds,
                 &dag,

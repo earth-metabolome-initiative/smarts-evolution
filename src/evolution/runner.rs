@@ -5,7 +5,7 @@ use std::time::Instant;
 use genevo::operator::{CrossoverOp, MutationOp};
 use genevo::population::GenomeBuilder;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::genome::genome::SmartsGenome;
 
@@ -160,11 +160,9 @@ pub fn run_evolution(
 
     let gen_pb = mp.add(ProgressBar::new(0));
     gen_pb.set_style(
-        ProgressStyle::with_template(
-            "  {prefix} [{bar:25.green/dim}] gen {pos}/{len} | best MCC={msg}",
-        )
-        .unwrap()
-        .progress_chars("=> "),
+        ProgressStyle::with_template("  {prefix} [{bar:25.green/dim}] gen {pos}/{len} | {msg}")
+            .unwrap()
+            .progress_chars("=> "),
     );
 
     let step_pb = mp.add(ProgressBar::new(GENERATION_STEPS));
@@ -531,10 +529,18 @@ fn evolve_node(
             stagnation += 1;
         }
 
-        gen_pb.set_position(generation);
-        gen_pb.set_message(format!("{best_mcc:.3}"));
+        gen_pb.set_position(generation + 1);
+        gen_pb.set_message(generation_progress_message(
+            lead_mcc,
+            best_mcc,
+            unique_count,
+            total_count,
+            duplicate_count,
+            cache_hits,
+            lead_len,
+        ));
 
-        info!(
+        debug!(
             "    Gen {}: lead_score={}, lead_mcc={lead_mcc:.3}, global_mcc={best_mcc:.3}, unique={unique_count}/{total_count}, duplicates={duplicate_count}, avg_len={average_token_len:.1}, best_len={lead_len}, cache_hits={cache_hits}/{unique_count}, smarts={}",
             generation + 1,
             lead.1,
@@ -722,6 +728,20 @@ fn average_token_len(population: &[SmartsGenome]) -> f64 {
 
     let total_tokens: usize = population.iter().map(|genome| genome.tokens.len()).sum();
     total_tokens as f64 / population.len() as f64
+}
+
+fn generation_progress_message(
+    lead_mcc: f64,
+    best_mcc: f64,
+    unique_count: usize,
+    total_count: usize,
+    duplicate_count: usize,
+    cache_hits: usize,
+    lead_len: usize,
+) -> String {
+    format!(
+        "lead={lead_mcc:.3} best={best_mcc:.3} uniq={unique_count}/{total_count} dup={duplicate_count} cache={cache_hits}/{unique_count} len={lead_len}"
+    )
 }
 
 fn compare_scored_genomes(left: &(SmartsGenome, i64), right: &(SmartsGenome, i64)) -> Ordering {
@@ -991,5 +1011,15 @@ mod regression_tests {
 
         assert!(compare_scored_genomes(&short, &long).is_lt());
         assert!(compare_scored_genomes(&long, &short).is_gt());
+    }
+
+    #[test]
+    fn generation_progress_message_surfaces_diversity_stats() {
+        let message = generation_progress_message(0.6621, 0.7314, 382, 1024, 642, 208, 16);
+
+        assert_eq!(
+            message,
+            "lead=0.662 best=0.731 uniq=382/1024 dup=642 cache=208/382 len=16"
+        );
     }
 }
