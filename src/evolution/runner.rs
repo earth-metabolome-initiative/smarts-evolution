@@ -320,7 +320,10 @@ pub fn run_evolution(
             checkpoint_dir: &config.checkpoint_dir,
         };
         if let Err(error) = notifier.notify_class_complete(&notification) {
-            warn!("Failed to send ntfy notification for '{}': {error}", node.name);
+            warn!(
+                "Failed to send ntfy notification for '{}': {error}",
+                node.name
+            );
         }
 
         results.push(result);
@@ -510,8 +513,10 @@ fn evolve_node(
         // 2. Sort by fitness descending, preferring shorter SMARTS on ties.
         scored.sort_by(compare_scored_genomes);
 
+        let unique_scored = deduplicate_scored_population(&scored);
+
         // Track best MCC for the top-scoring genome
-        let lead = &scored[0];
+        let lead = &unique_scored[0];
         let lead_len = lead.0.tokens.len();
         let lead_mcc = MccFitness::to_mcc(lead.1);
         if generation == 0
@@ -553,7 +558,7 @@ fn evolve_node(
             .min(config.population_size.max(2));
         begin_generation_step(step_pb, generation, "select", num_parents as u64);
         let parents = tournament_select(
-            &scored,
+            &unique_scored,
             num_parents,
             config.tournament_size,
             &mut rng,
@@ -582,7 +587,8 @@ fn evolve_node(
         }
         complete_generation_step(step_pb);
 
-        // 5. Elitist reinsertion: keep a small fixed elite set, then offspring, then immigrants.
+        // 5. Elitist reinsertion: preserve strong genomes, but refill diversity gaps with
+        // unique offspring and immigrants before allowing any exact-SMARTS duplicates back in.
         begin_generation_step(
             step_pb,
             generation,
@@ -593,24 +599,22 @@ fn evolve_node(
         let immigrant_count = ((config.random_immigrant_ratio * config.population_size as f64)
             .round() as usize)
             .min(config.population_size.saturating_sub(elite_count));
-        let offspring_target = config.population_size - elite_count - immigrant_count;
-        let mut next_gen: Vec<SmartsGenome> = Vec::with_capacity(config.population_size);
-        for (g, _) in scored.iter().take(elite_count) {
-            next_gen.push(g.clone());
-            step_pb.inc(1);
-        }
-        for genome in offspring.into_iter().take(offspring_target) {
-            next_gen.push(genome);
-            step_pb.inc(1);
-        }
         let immigrant_base = generation as usize * config.population_size;
-        for immigrant_idx in 0..immigrant_count {
-            next_gen.push(genome_builder.build_genome(immigrant_base + immigrant_idx, &mut rng));
-            step_pb.inc(1);
-        }
+        let mut immigrant_idx = 0usize;
+        population = reinsert_population(
+            &unique_scored,
+            offspring,
+            config.population_size,
+            elite_count,
+            immigrant_count,
+            || {
+                let genome = genome_builder.build_genome(immigrant_base + immigrant_idx, &mut rng);
+                immigrant_idx += 1;
+                genome
+            },
+            step_pb,
+        );
         complete_generation_step(step_pb);
-
-        population = next_gen;
     }
 
     Ok(NodeResult {
@@ -633,6 +637,77 @@ fn deduplicate_population(population: &[SmartsGenome]) -> (Vec<SmartsGenome>, us
 
     let duplicate_count = population.len().saturating_sub(unique.len());
     (unique, duplicate_count)
+}
+
+fn deduplicate_scored_population(scored: &[(SmartsGenome, i64)]) -> Vec<(SmartsGenome, i64)> {
+    let mut unique = Vec::with_capacity(scored.len());
+    let mut seen = HashSet::with_capacity(scored.len());
+
+    for (genome, score) in scored {
+        if seen.insert(genome.smarts_string.clone()) {
+            unique.push((genome.clone(), *score));
+        }
+    }
+
+    unique
+}
+
+fn insert_unique_genome(
+    next_gen: &mut Vec<SmartsGenome>,
+    seen: &mut HashSet<String>,
+    genome: SmartsGenome,
+) -> bool {
+    if seen.insert(genome.smarts_string.clone()) {
+        next_gen.push(genome);
+        true
+    } else {
+        false
+    }
+}
+
+fn reinsert_population(
+    scored_unique: &[(SmartsGenome, i64)],
+    offspring: Vec<SmartsGenome>,
+    population_size: usize,
+    elite_count: usize,
+    immigrant_count: usize,
+    mut next_immigrant: impl FnMut() -> SmartsGenome,
+    step_pb: &ProgressBar,
+) -> Vec<SmartsGenome> {
+    let pre_immigrant_target = population_size.saturating_sub(immigrant_count);
+    let mut next_gen = Vec::with_capacity(population_size);
+    let mut seen = HashSet::with_capacity(population_size);
+
+    for (genome, _) in scored_unique.iter().take(elite_count) {
+        if insert_unique_genome(&mut next_gen, &mut seen, genome.clone()) {
+            step_pb.inc(1);
+        }
+    }
+
+    for genome in offspring {
+        if next_gen.len() >= pre_immigrant_target {
+            break;
+        }
+        if insert_unique_genome(&mut next_gen, &mut seen, genome) {
+            step_pb.inc(1);
+        }
+    }
+
+    let unique_attempt_limit = population_size.saturating_mul(8).max(32);
+    let mut attempts = 0usize;
+    while next_gen.len() < population_size && attempts < unique_attempt_limit {
+        attempts += 1;
+        if insert_unique_genome(&mut next_gen, &mut seen, next_immigrant()) {
+            step_pb.inc(1);
+        }
+    }
+
+    while next_gen.len() < population_size {
+        next_gen.push(next_immigrant());
+        step_pb.inc(1);
+    }
+
+    next_gen
 }
 
 fn build_reset_pool(population: &[SmartsGenome], limit: usize) -> Vec<SmartsGenome> {
@@ -850,6 +925,63 @@ mod regression_tests {
         assert_eq!(unique[0].smarts_string, "[#6]");
         assert_eq!(unique[1].smarts_string, "[#7]");
         assert_eq!(unique[2].smarts_string, "[#8]");
+    }
+
+    #[test]
+    fn deduplicate_scored_population_keeps_first_best_entry_per_smarts() {
+        let scored = vec![
+            (SmartsGenome::from_smarts("[#6]").unwrap(), 300),
+            (SmartsGenome::from_smarts("[#7]").unwrap(), 200),
+            (SmartsGenome::from_smarts("[#6]").unwrap(), 100),
+            (SmartsGenome::from_smarts("[#8]").unwrap(), 50),
+        ];
+
+        let unique = deduplicate_scored_population(&scored);
+
+        assert_eq!(unique.len(), 3);
+        assert_eq!(unique[0].0.smarts_string, "[#6]");
+        assert_eq!(unique[0].1, 300);
+        assert_eq!(unique[1].0.smarts_string, "[#7]");
+        assert_eq!(unique[2].0.smarts_string, "[#8]");
+    }
+
+    #[test]
+    fn reinsert_population_prefers_unique_offspring_and_immigrants() {
+        let scored = vec![
+            (SmartsGenome::from_smarts("[#6]").unwrap(), 400),
+            (SmartsGenome::from_smarts("[#7]").unwrap(), 300),
+        ];
+        let offspring = vec![
+            SmartsGenome::from_smarts("[#6]").unwrap(),
+            SmartsGenome::from_smarts("[#7]").unwrap(),
+            SmartsGenome::from_smarts("[#8]").unwrap(),
+            SmartsGenome::from_smarts("[#16]").unwrap(),
+        ];
+        let immigrant_smarts = ["[#9]", "[#15]", "[#17]"];
+        let mut immigrant_idx = 0usize;
+
+        let next_gen = reinsert_population(
+            &scored,
+            offspring,
+            5,
+            1,
+            1,
+            || {
+                let genome = SmartsGenome::from_smarts(
+                    immigrant_smarts[immigrant_idx % immigrant_smarts.len()],
+                )
+                .unwrap();
+                immigrant_idx += 1;
+                genome
+            },
+            &ProgressBar::hidden(),
+        );
+
+        let smarts: Vec<&str> = next_gen
+            .iter()
+            .map(|genome| genome.smarts_string.as_str())
+            .collect();
+        assert_eq!(smarts, vec!["[#6]", "[#7]", "[#8]", "[#16]", "[#9]"]);
     }
 
     #[test]

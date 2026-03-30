@@ -251,7 +251,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\nStarting evolution...\n");
             let notifier = RunNotifier::new();
             println!("NTFY URL: {}", notifier.topic_url());
-            println!("Open that URL in ntfy or a browser to receive per-class completion messages.\n");
+            println!(
+                "Open that URL in ntfy or a browser to receive per-class completion messages.\n"
+            );
             let results = runner::run_evolution(
                 &compounds,
                 &dag,
