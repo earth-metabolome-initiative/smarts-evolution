@@ -9,6 +9,7 @@ use rand::rngs::SmallRng;
 use smarts_evolution::data::{classyfire, molecule_cache, npc};
 use smarts_evolution::evolution::checkpoint::FullCheckpoint;
 use smarts_evolution::evolution::config::EvolutionConfig;
+use smarts_evolution::evolution::ntfy::RunNotifier;
 use smarts_evolution::evolution::process_pool;
 use smarts_evolution::evolution::runner;
 use smarts_evolution::taxonomy::builder;
@@ -248,8 +249,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!("\nStarting evolution...\n");
-            let results =
-                runner::run_evolution(&compounds, &dag, &splits, &config, &mut checkpoint)?;
+            let notifier = RunNotifier::new();
+            println!("NTFY URL: {}", notifier.topic_url());
+            println!("Open that URL in ntfy or a browser to receive per-class completion messages.\n");
+            let results = runner::run_evolution(
+                &compounds,
+                &dag,
+                &splits,
+                &config,
+                &mut checkpoint,
+                &notifier,
+            )?;
 
             println!("\n=== Evolution Complete ===");
             println!("Evolved {} nodes", results.len());

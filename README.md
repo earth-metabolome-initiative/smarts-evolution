@@ -5,9 +5,9 @@ Evolutionary algorithm system that discovers optimal SMARTS patterns for each no
 ## Prerequisites
 
 - Rust (nightly, edition 2024)
-- Conda with RDKit C++ libraries:
+- Conda environment with RDKit C++ headers/libs and Boost headers:
   ```bash
-  conda install -c conda-forge librdkit-dev
+  conda install -c conda-forge rdkit-dev boost-cpp cxx-compiler
   ```
 
 ## Build
@@ -46,6 +46,16 @@ RUST_LOG=info cargo run --release -- evolve \
   --dataset classyfire \
   --path success-000001.jsonl.zst \
   --checkpoint-dir checkpoints/classyfire
+
+# Recommended NPC run: moderate population, bounded stagnation
+RUST_LOG=info cargo run --release -- evolve \
+  --dataset npc \
+  --path npc.fully_labeled.jsonl.zst \
+  --population-size 1024 \
+  --generation-limit 100 \
+  --stagnation-limit 25 \
+  --folds 5 \
+  --checkpoint-dir checkpoints/npc-reasonable
 
 # Short test run
 RUST_LOG=info cargo run --release -- evolve \

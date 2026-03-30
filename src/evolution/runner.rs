@@ -1,16 +1,18 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use genevo::operator::{CrossoverOp, MutationOp};
 use genevo::population::GenomeBuilder;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::info;
+use log::{info, warn};
 
 use crate::genome::genome::SmartsGenome;
 
 use super::checkpoint::{FullCheckpoint, NodeCheckpoint};
 use super::config::EvolutionConfig;
 use crate::data::compound::Compound;
+use crate::evolution::ntfy::{ClassCompletionNotification, RunNotifier};
 use crate::evolution::process_pool::{
     ProcessEvaluationBackend, WorkerFoldPayload, WorkerNodeContext,
 };
@@ -93,6 +95,7 @@ pub fn run_evolution(
     splits: &FoldSplits,
     config: &EvolutionConfig,
     checkpoint: &mut FullCheckpoint,
+    notifier: &RunNotifier,
 ) -> Result<Vec<NodeResult>, Box<dyn std::error::Error>> {
     let valid_compound_count = compounds.iter().filter(|compound| compound.parsed).count();
     let startup_index_pb = startup_progress_bar(
@@ -205,6 +208,7 @@ pub fn run_evolution(
             node.level,
             node.compound_indices.len()
         );
+        let node_started_at = Instant::now();
 
         // Determine candidate set: if parent has evolved SMARTS, filter to matching molecules
         let candidate_set = determine_candidate_set(
@@ -260,8 +264,9 @@ pub fn run_evolution(
             &gen_pb,
             &step_pb,
         )?;
+        let completed_generations = completed_generation_count(&result, config.generation_limit);
 
-        gen_pb.set_position(result.generations);
+        gen_pb.set_position(completed_generations);
         gen_pb.set_message(format!("{:.3}", result.best_mcc));
         step_pb.set_position(GENERATION_STEPS);
         step_pb.set_message("generation phases complete");
@@ -269,7 +274,7 @@ pub fn run_evolution(
 
         info!(
             "  Best: {} (MCC={:.3}), {} gens",
-            result.best_smarts, result.best_mcc, result.generations
+            result.best_smarts, result.best_mcc, completed_generations
         );
 
         evolved_smarts.insert(node_id, result.best_smarts.clone());
@@ -293,6 +298,29 @@ pub fn run_evolution(
             let path = config.checkpoint_dir.join("checkpoint.json");
             checkpoint.save(&path)?;
             info!("  Checkpoint saved to {}", path.display());
+        }
+
+        let completed_classes = node_pb.position();
+        let notification = ClassCompletionNotification {
+            class_name: &node.name,
+            best_smarts: &result.best_smarts,
+            best_mcc: result.best_mcc,
+            elapsed: node_started_at.elapsed(),
+            completed_generations,
+            node_id,
+            node_level: node.level,
+            completed_classes,
+            total_classes: eligible_count as u64,
+            positive_count: positive_set.len(),
+            candidate_count: candidate_set.len(),
+            total_test_molecules: total_test,
+            fold_count: splits.k,
+            population_size: config.population_size,
+            worker_processes,
+            checkpoint_dir: &config.checkpoint_dir,
+        };
+        if let Err(error) = notifier.notify_class_complete(&notification) {
+            warn!("Failed to send ntfy notification for '{}': {error}", node.name);
         }
 
         results.push(result);
@@ -694,6 +722,14 @@ fn begin_node_setup_step(step_pb: &ProgressBar, step_name: &str, length: u64) {
 fn complete_generation_step(step_pb: &ProgressBar) {
     if let Some(length) = step_pb.length() {
         step_pb.set_position(length);
+    }
+}
+
+fn completed_generation_count(result: &NodeResult, generation_limit: u64) -> u64 {
+    if result.generations < generation_limit {
+        result.generations + 1
+    } else {
+        result.generations
     }
 }
 
