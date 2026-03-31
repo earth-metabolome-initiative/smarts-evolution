@@ -5,10 +5,32 @@ Evolutionary algorithm system that discovers optimal SMARTS patterns for each no
 ## Prerequisites
 
 - Rust (nightly, edition 2024)
-- Conda environment with RDKit C++ headers/libs and Boost headers:
+- Conda environment with matching RDKit runtime and C++ headers from conda-forge.
+  Older RDKit builds fail in `rdkit-sys` with missing `PeriodicTable::getMaxAtomicNumber()` /
+  `PeriodicTable::getRow()` symbols. Pin `rdkit` and `rdkit-dev` to the same conda-forge
+  release line. As of March 31, 2026, the conda-forge package pages list `2025.09.6` as
+  the latest version; if your channel already has `2026.03.*`, use that same line for both.
+  Install `libboost-headers` explicitly so the C++ build can find `boost/config.hpp`.
+  Do not add `boost-cpp` explicitly here: with current conda-forge packaging it can make the
+  solve fail.
   ```bash
-  conda install -c conda-forge rdkit-dev boost-cpp cxx-compiler
+  conda create -n smarts-evolution -c conda-forge \
+    "rdkit=2025.09.*" \
+    "rdkit-dev=2025.09.*" \
+    libboost-headers \
+    cxx-compiler
+  conda activate smarts-evolution
   ```
+
+If you already have an environment, update it in place instead:
+
+```bash
+conda install -c conda-forge \
+  "rdkit=2025.09.*" \
+  "rdkit-dev=2025.09.*" \
+  libboost-headers \
+  cxx-compiler
+```
 
 ## Build
 
@@ -45,14 +67,18 @@ RUST_LOG=info cargo run --release -- evolve \
 RUST_LOG=info cargo run --release -- evolve \
   --dataset classyfire \
   --path classyfire.jsonl.zst \
+  --population-size 2048 \
+  --generation-limit 1000 \
+  --stagnation-limit 25 \
+  --folds 5 \
   --checkpoint-dir checkpoints/classyfire
 
 # Recommended NPC run: moderate population, bounded stagnation
 RUST_LOG=info cargo run --release -- evolve \
   --dataset npc \
   --path npc.fully_labeled.jsonl.zst \
-  --population-size 1024 \
-  --generation-limit 100 \
+  --population-size 2048 \
+  --generation-limit 1000 \
   --stagnation-limit 25 \
   --folds 5 \
   --checkpoint-dir checkpoints/npc-reasonable
