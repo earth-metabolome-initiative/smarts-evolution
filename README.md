@@ -28,8 +28,8 @@ cargo build --release
 # NPC classifier (multi-label, fully labeled subset, .jsonl.zst)
 cargo run --release -- load --dataset npc --path npc.fully_labeled.jsonl.zst
 
-# ClassyFire taxonomy (single-label, .jsonl.zst)
-cargo run --release -- load --dataset classyfire --path success-000001.jsonl.zst
+# ClassyFire taxonomy (single-label, corrected .jsonl.zst)
+cargo run --release -- load --dataset classyfire --path classyfire.jsonl.zst
 ```
 
 ### Run evolution
@@ -44,7 +44,7 @@ RUST_LOG=info cargo run --release -- evolve \
 # ClassyFire dataset
 RUST_LOG=info cargo run --release -- evolve \
   --dataset classyfire \
-  --path success-000001.jsonl.zst \
+  --path classyfire.jsonl.zst \
   --checkpoint-dir checkpoints/classyfire
 
 # Recommended NPC run: moderate population, bounded stagnation
