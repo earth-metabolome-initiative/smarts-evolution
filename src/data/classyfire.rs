@@ -3,6 +3,7 @@ use std::path::Path;
 
 use log::{info, warn};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use super::compound::Compound;
 use super::io::open_jsonl_reader;
@@ -20,6 +21,13 @@ pub const LEVELS: &[&str] = &[
 struct Record {
     cid: u64,
     classyfire: ClassyFireData,
+}
+
+#[derive(Deserialize)]
+struct RawZenodoRecord {
+    #[serde(rename = "cid")]
+    _cid: u64,
+    classyfire: Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -46,19 +54,31 @@ pub fn load(path: &Path) -> Result<Vec<Compound>, Box<dyn std::error::Error>> {
 
     let mut compounds = Vec::new();
     let mut skipped = 0usize;
+    let mut raw_rows_without_smiles = 0usize;
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line?;
         if line.is_empty() {
             continue;
         }
-        let record: Record = match serde_json::from_str(&line) {
+        let record = match serde_json::from_str::<Record>(&line) {
             Ok(r) => r,
-            Err(e) => {
-                warn!("Skipping line {}: {e}", line_no + 1);
-                skipped += 1;
-                continue;
-            }
+            Err(error) => match serde_json::from_str::<RawZenodoRecord>(&line) {
+                Ok(raw) => {
+                    if !raw.classyfire.contains_key("smiles") {
+                        raw_rows_without_smiles += 1;
+                    } else {
+                        warn!("Skipping line {}: {error}", line_no + 1);
+                    }
+                    skipped += 1;
+                    continue;
+                }
+                Err(_) => {
+                    warn!("Skipping line {}: {error}", line_no + 1);
+                    skipped += 1;
+                    continue;
+                }
+            },
         };
 
         let cf = &record.classyfire;
@@ -99,5 +119,14 @@ pub fn load(path: &Path) -> Result<Vec<Compound>, Box<dyn std::error::Error>> {
         skipped,
         path.display()
     );
+
+    if compounds.is_empty() && raw_rows_without_smiles > 0 {
+        return Err(format!(
+            "{} appears to be a raw weekly ClassyFire Zenodo snapshot without SMILES; omit --path so smarts-evolution can prepare the labeled-SMILES dataset automatically",
+            path.display()
+        )
+        .into());
+    }
+
     Ok(compounds)
 }

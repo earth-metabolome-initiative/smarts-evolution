@@ -6,7 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
-use smarts_evolution::data::{classyfire, molecule_cache, npc};
+use smarts_evolution::data::{classyfire, molecule_cache, npc, sync};
 use smarts_evolution::evolution::checkpoint::FullCheckpoint;
 use smarts_evolution::evolution::config::EvolutionConfig;
 use smarts_evolution::evolution::ntfy::RunNotifier;
@@ -28,15 +28,17 @@ enum Command {
     Load {
         #[arg(long)]
         dataset: Dataset,
+        /// Optional explicit dataset path. If omitted, the latest prepared snapshot is synced automatically.
         #[arg(long)]
-        path: PathBuf,
+        path: Option<PathBuf>,
     },
     /// Run SMARTS evolution on a dataset.
     Evolve {
         #[arg(long)]
         dataset: Dataset,
+        /// Optional explicit dataset path. If omitted, the latest prepared snapshot is synced automatically.
         #[arg(long)]
-        path: PathBuf,
+        path: Option<PathBuf>,
         #[arg(long, default_value = "200")]
         population_size: usize,
         #[arg(long, default_value = "500")]
@@ -66,21 +68,25 @@ enum Dataset {
 
 fn load_dataset(
     dataset: &Dataset,
-    path: &PathBuf,
+    path: Option<PathBuf>,
 ) -> Result<
     (
         Vec<smarts_evolution::data::compound::Compound>,
         &'static [&'static str],
+        PathBuf,
     ),
     Box<dyn std::error::Error>,
 > {
+    let resolved_path = resolve_dataset_path(dataset, path)?;
+    println!("Dataset path: {}", resolved_path.display());
+
     let (mut compounds, levels) = match dataset {
         Dataset::Classyfire => {
-            let c = classyfire::load(path)?;
+            let c = classyfire::load(&resolved_path)?;
             (c, classyfire::LEVELS)
         }
         Dataset::Npc => {
-            let c = npc::load(path)?;
+            let c = npc::load(&resolved_path)?;
             (c, npc::LEVELS)
         }
     };
@@ -90,7 +96,20 @@ fn load_dataset(
     let parsed = compounds.iter().filter(|c| c.parsed).count();
     println!("Molecules parsed: {parsed}/{}", compounds.len());
 
-    Ok((compounds, levels))
+    Ok((compounds, levels, resolved_path))
+}
+
+fn resolve_dataset_path(
+    dataset: &Dataset,
+    path: Option<PathBuf>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match path {
+        Some(path) => Ok(path),
+        None => match dataset {
+            Dataset::Classyfire => sync::ensure_latest_classyfire_dataset(),
+            Dataset::Npc => sync::ensure_latest_npc_dataset(),
+        },
+    }
 }
 
 fn step_spinner(message: &str) -> ProgressBar {
@@ -112,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Load { dataset, path } => {
-            let (compounds, levels) = load_dataset(&dataset, &path)?;
+            let (compounds, levels, _) = load_dataset(&dataset, path)?;
 
             let dag_pb = step_spinner("Building taxonomy DAG");
             let dag = builder::build_dag(&compounds, levels)?;
@@ -206,7 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Open that URL in ntfy or a browser to receive per-class completion messages.\n"
             );
 
-            let (compounds, levels) = load_dataset(&dataset, &path)?;
+            let (compounds, levels, _) = load_dataset(&dataset, path)?;
 
             let dag_pb = step_spinner("Building taxonomy DAG");
             let dag = builder::build_dag(&compounds, levels)?;

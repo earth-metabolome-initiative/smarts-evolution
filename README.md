@@ -44,14 +44,24 @@ cargo build --release
 
 ## Usage
 
+If you omit `--path`, `smarts-evolution` now resolves the latest weekly Zenodo snapshot automatically:
+
+- `npc` downloads the latest `completed.jsonl.zst` from `npc-labeler` and rebuilds `npc.fully_labeled.jsonl.zst`
+- `classyfire` downloads the latest `classyfire-labels.jsonl.zst` from `classyfire`, fetches PubChem `CID-SMILES.gz` if needed, and rebuilds `classyfire.jsonl.zst`
+
+Prepared datasets are cached in the repository root, and raw downloads/state live under `.tmp/datasets/`.
+
 ### Inspect a dataset
 
 ```bash
-# NPC classifier (multi-label, fully labeled subset, .jsonl.zst)
-cargo run --release -- load --dataset npc --path npc.fully_labeled.jsonl.zst
+# NPC classifier (managed weekly snapshot)
+cargo run --release -- load --dataset npc
 
-# ClassyFire taxonomy (single-label, corrected .jsonl.zst)
-cargo run --release -- load --dataset classyfire --path classyfire.jsonl.zst
+# ClassyFire taxonomy (managed weekly snapshot)
+cargo run --release -- load --dataset classyfire
+
+# Optional explicit path override
+cargo run --release -- load --dataset npc --path /path/to/custom.jsonl.zst
 ```
 
 ### Run evolution
@@ -60,13 +70,11 @@ cargo run --release -- load --dataset classyfire --path classyfire.jsonl.zst
 # NPC dataset — full run with defaults (200 pop, 500 gens, 5-fold CV)
 RUST_LOG=info cargo run --release -- evolve \
   --dataset npc \
-  --path npc.fully_labeled.jsonl.zst \
   --checkpoint-dir checkpoints/npc
 
 # ClassyFire dataset
 RUST_LOG=info cargo run --release -- evolve \
   --dataset classyfire \
-  --path classyfire.jsonl.zst \
   --population-size 2048 \
   --generation-limit 1000 \
   --stagnation-limit 25 \
@@ -76,7 +84,6 @@ RUST_LOG=info cargo run --release -- evolve \
 # Recommended NPC run: moderate population, bounded stagnation
 RUST_LOG=info cargo run --release -- evolve \
   --dataset npc \
-  --path npc.fully_labeled.jsonl.zst \
   --population-size 2048 \
   --generation-limit 1000 \
   --stagnation-limit 25 \
@@ -86,7 +93,6 @@ RUST_LOG=info cargo run --release -- evolve \
 # Short test run
 RUST_LOG=info cargo run --release -- evolve \
   --dataset npc \
-  --path npc.fully_labeled.jsonl.zst \
   --population-size 50 \
   --generation-limit 10 \
   --stagnation-limit 100 \
@@ -98,7 +104,7 @@ RUST_LOG=info cargo run --release -- evolve \
 | Flag | Default | Description |
 |---|---|---|
 | `--dataset` | required | `npc` or `classyfire` |
-| `--path` | required | Path to data file |
+| `--path` | latest managed snapshot | Optional explicit path to a data file |
 | `--population-size` | 200 | Genomes per generation |
 | `--generation-limit` | 500 | Max generations per node |
 | `--stagnation-limit` | 50 | Stop if no improvement for N gens |
@@ -108,12 +114,11 @@ RUST_LOG=info cargo run --release -- evolve \
 
 ### Resume with new data
 
-As new labels arrive (~10k/day), append to the JSONL file and resume:
+As new weekly Zenodo releases arrive, rerun `evolve --resume` and the managed dataset will refresh before loading:
 
 ```bash
 RUST_LOG=info cargo run --release -- evolve \
   --dataset npc \
-  --path npc.fully_labeled.jsonl.zst \
   --checkpoint-dir checkpoints/npc \
   --resume
 ```
