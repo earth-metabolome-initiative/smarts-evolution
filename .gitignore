@@ -26,3 +26,5 @@ target
 /target
 .tmp
 *.jsonl
+*.jsonl.zst
+reports/
