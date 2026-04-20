@@ -1,14 +1,15 @@
 use genevo::genetic::Genotype;
+use smarts_parser::QueryMol;
+use std::str::FromStr;
 
 use super::display::tokens_to_smarts;
 use super::parser::{parse_and_validate_smarts, validate_smarts_tokens};
 use super::token::SmartsToken;
-use crate::data::rdkit_lock::with_rdkit_lock;
 
 /// A SMARTS pattern genome for evolutionary optimization.
 ///
 /// Maintains both a token representation (for genetic operators) and
-/// a cached string representation (for RDKit evaluation).
+/// a cached string representation (for matcher evaluation).
 #[derive(Clone, Debug)]
 pub struct SmartsGenome {
     pub tokens: Vec<SmartsToken>,
@@ -42,24 +43,24 @@ impl SmartsGenome {
     /// Validate this genome using only the local token-level checks.
     ///
     /// This is the hot-path validator for breeding. It rejects obviously bad
-    /// token sequences without calling into RDKit.
+    /// token sequences without reparsing against the full SMARTS matcher.
     #[inline]
     pub fn is_structurally_valid(&self) -> bool {
         !self.smarts_string.is_empty() && validate_smarts_tokens(&self.tokens).is_ok()
     }
 
-    /// Validate this genome structurally and with RDKit.
+    /// Validate this genome structurally and with the production SMARTS parser.
     ///
     /// Use this only on colder paths. Breeding should prefer
-    /// `is_structurally_valid()` to avoid reparsing SMARTS in RDKit for every
+    /// `is_structurally_valid()` to avoid reparsing SMARTS on every
     /// offspring candidate.
     #[inline]
-    pub fn is_valid_rdkit(&self) -> bool {
+    pub fn is_valid_matcher(&self) -> bool {
         if !self.is_structurally_valid() {
             return false;
         }
 
-        with_rdkit_lock(|| rdkit::RWMol::from_smarts(&self.smarts_string).is_ok())
+        QueryMol::from_str(&self.smarts_string).is_ok()
     }
 }
 

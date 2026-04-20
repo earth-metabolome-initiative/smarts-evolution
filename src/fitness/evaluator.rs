@@ -1,22 +1,28 @@
-use genevo::genetic::{Fitness, FitnessFunction};
+use std::str::FromStr;
+use std::time::Instant;
 
-use super::mcc::{ConfusionCounts, MccFitness, compute_fold_averaged_mcc};
+use genevo::genetic::{Fitness, FitnessFunction};
+use smarts_parser::QueryMol;
+use smarts_validator::{CompiledQuery, PreparedTarget, matches_compiled};
+
+use super::mcc::{ConfusionCounts, compute_fold_averaged_mcc};
+use super::objective::ObjectiveFitness;
 use crate::genome::genome::SmartsGenome;
 use crate::genome::parser::parse_and_validate_smarts;
-use crate::rdkit_substruct_library::{CompiledSmartsQuery, SubstructLibraryIndex};
 
 /// A single fold's data for MCC evaluation.
+#[derive(Clone, Debug)]
 pub struct FoldData {
-    /// Test-set SMILES in this fold.
-    pub smiles: Vec<String>,
+    /// Test-set prepared targets in this fold.
+    pub targets: Vec<PreparedTarget>,
     /// Whether each test molecule is a positive example.
     pub is_positive: Vec<bool>,
 }
 
-/// Evaluates SMARTS genomes using fold-averaged MCC only.
+/// Evaluates SMARTS genomes using fold-averaged MCC with a runtime penalty.
 #[derive(Clone)]
 pub struct SmartsEvaluator {
-    folds: std::rc::Rc<Vec<SubstructLibraryIndex>>,
+    folds: std::rc::Rc<Vec<FoldData>>,
 }
 
 impl std::fmt::Debug for SmartsEvaluator {
@@ -29,21 +35,14 @@ impl std::fmt::Debug for SmartsEvaluator {
 
 impl SmartsEvaluator {
     pub fn new(folds: Vec<FoldData>) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut libraries = Vec::with_capacity(folds.len());
-        for fold in folds {
-            if fold.smiles.len() != fold.is_positive.len() {
+        for fold in &folds {
+            if fold.targets.len() != fold.is_positive.len() {
                 return Err("local evaluator received inconsistent fold lengths".into());
             }
-
-            let mut library = SubstructLibraryIndex::new()?;
-            for (smiles, is_positive) in fold.smiles.into_iter().zip(fold.is_positive) {
-                library.add_smiles(&smiles, is_positive)?;
-            }
-            libraries.push(library);
         }
 
         Ok(Self {
-            folds: std::rc::Rc::new(libraries),
+            folds: std::rc::Rc::new(folds),
         })
     }
 
@@ -59,11 +58,12 @@ impl SmartsEvaluator {
         if parse_and_validate_smarts(smarts).is_err() {
             return None;
         }
-        let query = CompiledSmartsQuery::new(smarts)?;
+        let query = QueryMol::from_str(smarts).ok()?;
+        let compiled = CompiledQuery::new(query).ok()?;
 
         let mut fold_counts = Vec::with_capacity(self.folds.len());
-        for library in self.folds.iter() {
-            fold_counts.push(library.count_matches_compiled(&query, 1)?);
+        for fold in self.folds.iter() {
+            fold_counts.push(count_matches_in_fold(&compiled, fold));
         }
         Some(fold_counts)
     }
@@ -74,30 +74,66 @@ impl SmartsEvaluator {
             .map(|fold_counts| compute_fold_averaged_mcc(&fold_counts))
             .unwrap_or(-1.0)
     }
+
+    /// Evaluate the combined MCC + runtime objective for a genome.
+    pub fn objective_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
+        self.objective_for_smarts(&genome.smarts_string)
+    }
+
+    pub fn objective_for_smarts(&self, smarts: &str) -> ObjectiveFitness {
+        let started_at = Instant::now();
+        let Some(fold_counts) = self.fold_counts_for_smarts(smarts) else {
+            return ObjectiveFitness::invalid(started_at.elapsed());
+        };
+
+        let mcc = compute_fold_averaged_mcc(&fold_counts);
+        ObjectiveFitness::from_metrics(mcc, started_at.elapsed())
+    }
 }
 
-impl FitnessFunction<SmartsGenome, MccFitness> for SmartsEvaluator {
-    fn fitness_of(&self, genome: &SmartsGenome) -> MccFitness {
-        MccFitness::from_mcc(self.mcc_of(genome))
+impl FitnessFunction<SmartsGenome, ObjectiveFitness> for SmartsEvaluator {
+    fn fitness_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
+        self.objective_of(genome)
     }
 
-    fn average(&self, values: &[MccFitness]) -> MccFitness {
+    fn average(&self, values: &[ObjectiveFitness]) -> ObjectiveFitness {
         if values.is_empty() {
-            return MccFitness::zero();
+            return ObjectiveFitness::zero();
         }
-        let sum: i64 = values.iter().map(|v| v.score).sum();
-        MccFitness {
-            score: sum / values.len() as i64,
+        let average_mcc = values.iter().map(|value| value.mcc()).sum::<f64>() / values.len() as f64;
+        let average_elapsed_micros = values
+            .iter()
+            .map(|value| value.elapsed_micros as u128)
+            .sum::<u128>()
+            / values.len() as u128;
+
+        ObjectiveFitness::from_metrics(
+            average_mcc,
+            std::time::Duration::from_micros(average_elapsed_micros as u64),
+        )
+    }
+
+    fn highest_possible_fitness(&self) -> ObjectiveFitness {
+        ObjectiveFitness::from_metrics(1.0, std::time::Duration::ZERO)
+    }
+
+    fn lowest_possible_fitness(&self) -> ObjectiveFitness {
+        ObjectiveFitness::zero()
+    }
+}
+
+fn count_matches_in_fold(query: &CompiledQuery, fold: &FoldData) -> ConfusionCounts {
+    let mut counts = ConfusionCounts::default();
+
+    for (target, is_positive) in fold.targets.iter().zip(&fold.is_positive) {
+        let matched = matches_compiled(query, target);
+        match (matched, *is_positive) {
+            (true, true) => counts.tp += 1,
+            (true, false) => counts.fp += 1,
+            (false, true) => counts.fn_ += 1,
+            (false, false) => counts.tn += 1,
         }
     }
 
-    fn highest_possible_fitness(&self) -> MccFitness {
-        MccFitness {
-            score: MccFitness::max_score(),
-        }
-    }
-
-    fn lowest_possible_fitness(&self) -> MccFitness {
-        MccFitness::zero()
-    }
+    counts
 }

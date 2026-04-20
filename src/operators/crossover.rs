@@ -154,7 +154,7 @@ mod tests {
             let parents = vec![a, b];
             let children = crossover.crossover(parents, &mut rng);
             for child in &children {
-                if child.is_valid_rdkit() {
+                if child.is_valid_matcher() {
                     valid += 1;
                 }
             }

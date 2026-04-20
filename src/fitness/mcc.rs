@@ -1,7 +1,6 @@
 use genevo::genetic::Fitness;
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConfusionCounts {
     pub tp: u64,
     pub fp: u64,

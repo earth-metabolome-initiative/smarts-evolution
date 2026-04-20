@@ -147,7 +147,7 @@ pub fn parse_smarts(input: &str) -> Result<Vec<SmartsToken>, String> {
 }
 
 /// Parse a SMARTS string and reject obviously dangerous degenerate structures
-/// before handing it to `RDKit`.
+/// before handing it to the full SMARTS matcher.
 pub fn parse_and_validate_smarts(input: &str) -> Result<Vec<SmartsToken>, String> {
     let tokens = parse_smarts(input)?;
     validate_smarts_tokens(&tokens)?;

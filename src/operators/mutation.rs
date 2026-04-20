@@ -10,19 +10,18 @@ use super::primitives::*;
 
 /// SMARTS-aware mutation operator.
 ///
-/// Mutation types and their probabilities:
-/// - Toggle atom primitive (40%): add/remove/change a constraint in a bracketed atom
-/// - Generalize/specialize (20%): move up/down the generality ladder
-/// - Reset to seed fragment (10%): jump back to a known-good seed-like pattern
-/// - Add atom (15%): extend pattern with new atom+bond
-/// - Remove atom (10%): prune a terminal atom
-/// - Change bond (10%): replace a bond type
-/// - Toggle NOT (5%): add/remove `!` negation
+/// Mutation is intentionally aggressive now that matching is pure Rust and no
+/// longer gated by the old RDKit process-isolation workarounds. A single
+/// mutation event usually applies multiple edits before validating the
+/// offspring, which helps the search escape the timid local tweaks that used to
+/// dominate the population.
 #[derive(Clone, Debug)]
 pub struct SmartsMutation {
     pub mutation_rate: f64,
     reset_pool: Vec<SmartsGenome>,
     reset_probability: f64,
+    max_mutation_steps: usize,
+    attempt_budget: usize,
 }
 
 impl SmartsMutation {
@@ -30,7 +29,9 @@ impl SmartsMutation {
         Self {
             mutation_rate,
             reset_pool: Vec::new(),
-            reset_probability: 0.10,
+            reset_probability: 0.20,
+            max_mutation_steps: 6,
+            attempt_budget: 24,
         }
     }
 
@@ -38,7 +39,9 @@ impl SmartsMutation {
         Self {
             mutation_rate,
             reset_pool,
-            reset_probability: 0.10,
+            reset_probability: 0.20,
+            max_mutation_steps: 6,
+            attempt_budget: 24,
         }
     }
 }
@@ -62,24 +65,19 @@ impl MutationOp<SmartsGenome> for SmartsMutation {
             return self.reset_pool.choose(rng).cloned().unwrap_or(genome);
         }
 
-        // Try up to 5 times to produce a structurally valid mutation.
-        for _ in 0..5 {
+        for _ in 0..self.attempt_budget {
             let mut tokens = genome.tokens.clone();
-            let roll: f64 = rng.r#gen();
+            let mutation_steps = rng.gen_range(2..=self.max_mutation_steps.max(2));
+            let mut mutated = false;
 
-            let mutated = if roll < 0.40 {
-                toggle_atom_primitive(&mut tokens, rng)
-            } else if roll < 0.60 {
-                generalize_specialize(&mut tokens, rng)
-            } else if roll < 0.75 {
-                add_atom(&mut tokens, rng)
-            } else if roll < 0.85 {
-                remove_atom(&mut tokens, rng)
-            } else if roll < 0.95 {
-                change_bond(&mut tokens, rng)
-            } else {
-                toggle_not(&mut tokens, rng)
-            };
+            for _ in 0..mutation_steps {
+                mutated |= apply_random_mutation(&mut tokens, rng);
+
+                if tokens.len() > MAX_SMARTS_TOKENS {
+                    mutated = false;
+                    break;
+                }
+            }
 
             if mutated {
                 let candidate = SmartsGenome::from_tokens(tokens);
@@ -91,6 +89,26 @@ impl MutationOp<SmartsGenome> for SmartsMutation {
 
         // All attempts failed; return original
         genome
+    }
+}
+
+fn apply_random_mutation<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
+    let roll: f64 = rng.r#gen();
+
+    if roll < 0.18 {
+        toggle_atom_primitive(tokens, rng)
+    } else if roll < 0.33 {
+        generalize_specialize(tokens, rng)
+    } else if roll < 0.53 {
+        add_atom(tokens, rng)
+    } else if roll < 0.67 {
+        remove_atom(tokens, rng)
+    } else if roll < 0.79 {
+        rewrite_atom_group(tokens, rng)
+    } else if roll < 0.91 {
+        change_bond(tokens, rng)
+    } else {
+        toggle_not(tokens, rng)
     }
 }
 
@@ -259,6 +277,19 @@ fn add_atom<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
     true
 }
 
+/// Replace a random atom group with a fresh random bracketed atom.
+fn rewrite_atom_group<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
+    let atom_groups = find_atom_groups(tokens);
+    if atom_groups.is_empty() {
+        return false;
+    }
+
+    let &(start, end) = atom_groups.choose(rng).unwrap();
+    let replacement = random_bracketed_atom(rng);
+    tokens.splice(start..end, replacement);
+    true
+}
+
 /// Remove a terminal atom (last atom group or a branch).
 fn remove_atom<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
     let atom_groups = find_atom_groups(tokens);
@@ -354,15 +385,15 @@ mod tests {
             let seed = seeds[i % seeds.len()];
             let genome = SmartsGenome::from_smarts(seed).unwrap();
             let mutated = mutator.mutate(genome, &mut rng);
-            if mutated.is_valid_rdkit() {
+            if mutated.is_valid_matcher() {
                 valid += 1;
             }
         }
 
         let rate = valid as f64 / total as f64;
         assert!(
-            rate >= 0.80,
-            "Mutation validity rate {rate:.2} < 0.80 ({valid}/{total})"
+            rate >= 0.70,
+            "Mutation validity rate {rate:.2} < 0.70 ({valid}/{total})"
         );
     }
 
@@ -395,5 +426,26 @@ mod tests {
         }
 
         assert!(observed_reset);
+    }
+
+    #[test]
+    fn mutation_can_apply_multi_step_structural_changes() {
+        let mut rng = SmallRng::seed_from_u64(99);
+        let mutator = SmartsMutation::new(1.0);
+        let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+
+        let mut observed_large_change = false;
+        for _ in 0..128 {
+            let mutated = mutator.mutate(genome.clone(), &mut rng);
+            if mutated.is_valid_matcher()
+                && mutated.smarts_string != genome.smarts_string
+                && mutated.tokens.len().abs_diff(genome.tokens.len()) >= 2
+            {
+                observed_large_change = true;
+                break;
+            }
+        }
+
+        assert!(observed_large_change);
     }
 }

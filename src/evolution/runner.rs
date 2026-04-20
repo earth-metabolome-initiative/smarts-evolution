@@ -1,43 +1,41 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::Duration;
 
+use genevo::genetic::FitnessFunction;
 use genevo::operator::{CrossoverOp, MutationOp};
 use genevo::population::GenomeBuilder;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{debug, info, warn};
+use log::{debug, info};
 
-use crate::genome::genome::SmartsGenome;
-
-use super::checkpoint::{FullCheckpoint, NodeCheckpoint};
 use super::config::EvolutionConfig;
-use crate::data::compound::Compound;
-use crate::evolution::ntfy::{ClassCompletionNotification, RunNotifier};
-use crate::evolution::process_pool::{
-    ProcessEvaluationBackend, WorkerFoldPayload, WorkerNodeContext,
-};
-#[cfg(test)]
-use crate::fitness::evaluator::FoldData;
-#[cfg(test)]
-use crate::fitness::evaluator::SmartsEvaluator;
-use crate::fitness::mcc::MccFitness;
-use crate::genome::seed::SmartsGenomeBuilder;
+use crate::fitness::evaluator::{FoldData, SmartsEvaluator};
+use crate::fitness::objective::ObjectiveFitness;
+use crate::genome::genome::SmartsGenome;
+use crate::genome::seed::{SeedCorpus, SmartsGenomeBuilder};
 use crate::operators::crossover::SmartsCrossover;
 use crate::operators::mutation::SmartsMutation;
-use crate::rdkit_substruct_library::SubstructLibraryIndex;
-use crate::taxonomy::dag::TaxonomyDag;
-use crate::validation::splits::FoldSplits;
-#[cfg(test)]
-use genevo::genetic::FitnessFunction;
 
-const GENERATION_STEPS: u64 = 4;
 const RESET_POOL_SIZE: usize = 32;
 
-/// Result of evolving a single node.
-pub struct NodeResult {
-    pub node_id: usize,
+/// One generic evolution task.
+///
+/// Experiment-specific code is expected to prepare folds, labels, and task
+/// iteration elsewhere, then call into this library per task.
+#[derive(Clone, Debug)]
+pub struct EvolutionTask {
+    pub task_id: String,
+    pub positive_smiles: Vec<String>,
+    pub folds: Vec<FoldData>,
+}
+
+/// Result of evolving a single task.
+#[derive(Clone, Debug)]
+pub struct TaskResult {
+    pub task_id: String,
     pub best_smarts: String,
     pub best_mcc: f64,
+    pub best_eval_time: Duration,
+    pub best_score: i64,
     pub generations: u64,
 }
 
@@ -45,428 +43,99 @@ trait EvaluationBackend {
     fn score_population(
         &mut self,
         population: Vec<SmartsGenome>,
-        step_pb: &ProgressBar,
-    ) -> Result<Vec<(SmartsGenome, i64)>, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<(SmartsGenome, ObjectiveFitness)>, Box<dyn std::error::Error>>;
 }
 
-#[cfg(test)]
 struct LocalEvaluationBackend {
     evaluator: SmartsEvaluator,
 }
 
-#[cfg(test)]
 impl LocalEvaluationBackend {
     fn new(evaluator: SmartsEvaluator) -> Self {
         Self { evaluator }
     }
 }
 
-#[cfg(test)]
 impl EvaluationBackend for LocalEvaluationBackend {
     fn score_population(
         &mut self,
         population: Vec<SmartsGenome>,
-        step_pb: &ProgressBar,
-    ) -> Result<Vec<(SmartsGenome, i64)>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<(SmartsGenome, ObjectiveFitness)>, Box<dyn std::error::Error>> {
         let mut scored = Vec::with_capacity(population.len());
         for genome in population {
-            let score = self.evaluator.fitness_of(&genome).score;
-            scored.push((genome, score));
-            step_pb.inc(1);
+            let fitness = self.evaluator.fitness_of(&genome);
+            scored.push((genome, fitness));
         }
         Ok(scored)
     }
 }
 
-impl EvaluationBackend for ProcessEvaluationBackend {
-    fn score_population(
-        &mut self,
-        population: Vec<SmartsGenome>,
-        step_pb: &ProgressBar,
-    ) -> Result<Vec<(SmartsGenome, i64)>, Box<dyn std::error::Error>> {
-        ProcessEvaluationBackend::score_population(self, population, step_pb)
-    }
-}
-
-/// Run evolution for all eligible nodes in the taxonomy DAG.
-pub fn run_evolution(
-    compounds: &[Compound],
-    dag: &TaxonomyDag,
-    splits: &FoldSplits,
+/// Evolve one generic task from already-prepared folds.
+pub fn evolve_task(
+    task: &EvolutionTask,
     config: &EvolutionConfig,
-    checkpoint: &mut FullCheckpoint,
-    notifier: &RunNotifier,
-) -> Result<Vec<NodeResult>, Box<dyn std::error::Error>> {
-    let valid_compound_count = compounds.iter().filter(|compound| compound.parsed).count();
-    let startup_index_pb = startup_progress_bar(
-        "startup: building global candidate index",
-        valid_compound_count as u64,
-    );
-    let mut candidate_filter = SubstructLibraryIndex::new()?;
-    let mut valid_compound_indices = Vec::new();
-    for (compound_idx, compound) in compounds.iter().enumerate() {
-        if compound.parsed {
-            candidate_filter.add_smiles(&compound.smiles, true)?;
-            valid_compound_indices.push(compound_idx);
-            startup_index_pb.inc(1);
-        }
+    seed_corpus: &SeedCorpus,
+) -> Result<TaskResult, Box<dyn std::error::Error>> {
+    if config.population_size == 0 {
+        return Err("population_size must be greater than zero".into());
     }
-    startup_index_pb.finish_with_message(format!(
-        "startup: global candidate index ready ({valid_compound_count} compounds)"
-    ));
-    let all_valid_compounds: HashSet<usize> = valid_compound_indices.iter().copied().collect();
-
-    // Create checkpoint dir
-    std::fs::create_dir_all(&config.checkpoint_dir)?;
-
-    let mut results = Vec::new();
-    let mut evolved_smarts: HashMap<usize, String> = HashMap::new();
-    let worker_processes = config
-        .worker_processes
-        .max(1)
-        .min(config.population_size.max(1));
-    info!("Starting {worker_processes} evaluator worker processes...");
-    let startup_workers_pb = startup_progress_bar(
-        "startup: spawning worker processes",
-        worker_processes as u64,
-    );
-    let mut evaluator_backend =
-        ProcessEvaluationBackend::spawn_with_progress(worker_processes, Some(&startup_workers_pb))?;
-    startup_workers_pb.finish_with_message(format!(
-        "startup: worker pool ready ({worker_processes} workers)"
-    ));
-
-    // Load already-evolved SMARTS from checkpoint
-    for (nid, nc) in &checkpoint.nodes {
-        evolved_smarts.insert(*nid, nc.best_smarts.clone());
+    if task.folds.is_empty() {
+        return Err("evolution task requires at least one fold".into());
+    }
+    let total_targets: usize = task.folds.iter().map(|fold| fold.targets.len()).sum();
+    if total_targets == 0 {
+        return Err(format!("task '{}' has no evaluation targets", task.task_id).into());
     }
 
-    // Count eligible nodes for the progress bar
-    let eligible_count = dag
-        .nodes
-        .iter()
-        .filter(|n| n.compound_indices.len() >= 20)
-        .count();
+    info!(
+        "Evolving task '{}' over {} folds ({} evaluation targets)",
+        task.task_id,
+        task.folds.len(),
+        total_targets
+    );
 
-    let mp = MultiProgress::new();
-    let node_style = ProgressStyle::with_template(
-        "{prefix} [{bar:30.cyan/dim}] {pos}/{len} nodes ({eta} remaining)",
+    let evaluator = SmartsEvaluator::new(task.folds.clone())?;
+    let mut evaluator_backend = LocalEvaluationBackend::new(evaluator);
+    evolve_task_inner(
+        &task.task_id,
+        config,
+        &mut evaluator_backend,
+        &task.positive_smiles,
+        seed_corpus,
     )
-    .unwrap()
-    .progress_chars("=> ");
-    let node_pb = mp.add(ProgressBar::new(eligible_count as u64));
-    node_pb.set_style(node_style);
-    node_pb.set_prefix("DAG");
-
-    let gen_pb = mp.add(ProgressBar::new(0));
-    gen_pb.set_style(
-        ProgressStyle::with_template("  {prefix} [{bar:25.green/dim}] gen {pos}/{len} | {msg}")
-            .unwrap()
-            .progress_chars("=> "),
-    );
-
-    let step_pb = mp.add(ProgressBar::new(GENERATION_STEPS));
-    step_pb.set_style(
-        ProgressStyle::with_template("  {prefix} [{bar:25.yellow/dim}] {msg} {pos}/{len}")
-            .unwrap()
-            .progress_chars("=> "),
-    );
-
-    // Process nodes in topological order
-    let total_nodes = dag.topological_order.len();
-    for (order_idx, &node_id) in dag.topological_order.iter().enumerate() {
-        let node = &dag.nodes[node_id];
-
-        // Skip nodes below threshold
-        if node.compound_indices.len() < 20 {
-            continue;
-        }
-
-        // Skip already-evolved nodes (from checkpoint)
-        if evolved_smarts.contains_key(&node_id) {
-            node_pb.inc(1);
-            continue;
-        }
-
-        node_pb.set_message(format!("{}", node.name));
-        gen_pb.set_prefix(format!("{}", node.name));
-        gen_pb.set_length(config.generation_limit);
-        gen_pb.set_position(0);
-        gen_pb.set_message("--");
-        step_pb.set_prefix(format!("{}", node.name));
-        step_pb.set_length(GENERATION_STEPS);
-        step_pb.set_position(0);
-        step_pb.set_message("waiting");
-
-        info!(
-            "[{}/{}] Evolving node: {} (level={}, compounds={})",
-            order_idx + 1,
-            total_nodes,
-            node.name,
-            node.level,
-            node.compound_indices.len()
-        );
-        let node_started_at = Instant::now();
-
-        // Determine candidate set: if parent has evolved SMARTS, filter to matching molecules
-        let candidate_set = determine_candidate_set(
-            node_id,
-            dag,
-            &evolved_smarts,
-            &all_valid_compounds,
-            &candidate_filter,
-            &valid_compound_indices,
-            Some(&step_pb),
-        );
-
-        let positive_set: HashSet<usize> = node.compound_indices.iter().copied().collect();
-
-        // Build fold data for the evaluator
-        begin_node_setup_step(
-            &step_pb,
-            "building fold payloads",
-            candidate_set.len() as u64,
-        );
-        let fold_payloads =
-            build_fold_payloads(compounds, splits, &positive_set, &candidate_set, &step_pb);
-        complete_generation_step(&step_pb);
-
-        // Check we have enough data in folds
-        let total_test: usize = fold_payloads.iter().map(|fold| fold.smiles.len()).sum();
-        if total_test < 10 {
-            info!("  Skipping: insufficient test data ({total_test} molecules across folds)");
-            continue;
-        }
-
-        // Collect positive SMILES for seeding
-        let positive_smiles: Vec<String> = node
-            .compound_indices
-            .iter()
-            .take(200) // Don't need all of them for seeding
-            .map(|&ci| compounds[ci].smiles.clone())
-            .collect();
-
-        evaluator_backend.set_node_context_with_progress(
-            WorkerNodeContext {
-                folds: fold_payloads,
-            },
-            Some(&step_pb),
-        )?;
-        complete_generation_step(&step_pb);
-
-        let result = evolve_node(
-            node_id,
-            config,
-            &mut evaluator_backend,
-            positive_smiles,
-            &gen_pb,
-            &step_pb,
-        )?;
-        let completed_generations = completed_generation_count(&result, config.generation_limit);
-
-        gen_pb.set_position(completed_generations);
-        gen_pb.set_message(format!("{:.3}", result.best_mcc));
-        step_pb.set_position(GENERATION_STEPS);
-        step_pb.set_message("generation phases complete");
-        node_pb.inc(1);
-
-        info!(
-            "  Best: {} (MCC={:.3}), {} gens",
-            result.best_smarts, result.best_mcc, completed_generations
-        );
-
-        evolved_smarts.insert(node_id, result.best_smarts.clone());
-
-        // Save to checkpoint
-        checkpoint.nodes.insert(
-            node_id,
-            NodeCheckpoint {
-                node_id,
-                node_name: node.name.clone(),
-                level: node.level,
-                generation: result.generations,
-                best_smarts: result.best_smarts.clone(),
-                best_mcc: result.best_mcc,
-                population: Vec::new(),
-            },
-        );
-
-        // Periodic checkpoint save
-        if (order_idx + 1) % 5 == 0 || order_idx + 1 == total_nodes {
-            let path = config.checkpoint_dir.join("checkpoint.json");
-            checkpoint.save(&path)?;
-            info!("  Checkpoint saved to {}", path.display());
-        }
-
-        let completed_classes = node_pb.position();
-        let notification = ClassCompletionNotification {
-            class_name: &node.name,
-            best_smarts: &result.best_smarts,
-            best_mcc: result.best_mcc,
-            elapsed: node_started_at.elapsed(),
-            completed_generations,
-            node_id,
-            node_level: node.level,
-            completed_classes,
-            total_classes: eligible_count as u64,
-            positive_count: positive_set.len(),
-            candidate_count: candidate_set.len(),
-            total_test_molecules: total_test,
-            fold_count: splits.k,
-            population_size: config.population_size,
-            worker_processes,
-            checkpoint_dir: &config.checkpoint_dir,
-        };
-        if let Err(error) = notifier.notify_class_complete(&notification) {
-            warn!(
-                "Failed to send ntfy notification for '{}': {error}",
-                node.name
-            );
-        }
-
-        results.push(result);
-    }
-
-    // Final checkpoint
-    let path = config.checkpoint_dir.join("checkpoint.json");
-    checkpoint.save(&path)?;
-
-    gen_pb.finish_and_clear();
-    step_pb.finish_and_clear();
-    node_pb.finish_with_message("done");
-
-    info!("Final checkpoint saved to {}", path.display());
-
-    Ok(results)
 }
 
-/// Determine the set of candidate compound indices for a node.
-///
-/// If the node has a parent with an evolved SMARTS, only include compounds
-/// that match the parent's pattern. Otherwise, use all compounds.
-fn determine_candidate_set(
-    node_id: usize,
-    dag: &TaxonomyDag,
-    evolved_smarts: &HashMap<usize, String>,
-    all_valid_compounds: &HashSet<usize>,
-    candidate_filter: &SubstructLibraryIndex,
-    valid_compound_indices: &[usize],
-    progress_pb: Option<&ProgressBar>,
-) -> HashSet<usize> {
-    let node = &dag.nodes[node_id];
-
-    // Find parent nodes (nodes at level-1 that have an edge to this node)
-    if node.level == 0 {
-        // Root level: all compounds are candidates
-        return all_valid_compounds.clone();
-    }
-
-    // Check if any parent has an evolved SMARTS
-    let parent_nodes: Vec<usize> = dag
-        .parents_of(node_id)
-        .iter()
-        .copied()
-        .filter(|parent_id| {
-            dag.nodes[*parent_id].level == node.level - 1 && evolved_smarts.contains_key(parent_id)
-        })
-        .collect();
-
-    if parent_nodes.is_empty() {
-        return all_valid_compounds.clone();
-    }
-
-    // Filter: compound must match at least one actual parent's SMARTS
-    if let Some(pb) = progress_pb {
-        begin_node_setup_step(pb, "filtering parent matches", parent_nodes.len() as u64);
-    }
-    let mut candidates = HashSet::new();
-
-    for &parent_id in &parent_nodes {
-        if let Some(smarts) = evolved_smarts.get(&parent_id) {
-            if let Some(match_indices) = candidate_filter.positive_matches(smarts, 1) {
-                for match_idx in match_indices {
-                    if let Some(&compound_idx) = valid_compound_indices.get(match_idx) {
-                        candidates.insert(compound_idx);
-                    }
-                }
-            }
-        }
-        if let Some(pb) = progress_pb {
-            pb.inc(1);
-        }
-    }
-    candidates
-}
-
-/// Build per-fold compound payloads for worker evaluation.
-fn build_fold_payloads(
-    compounds: &[Compound],
-    splits: &FoldSplits,
-    positive_set: &HashSet<usize>,
-    candidate_set: &HashSet<usize>,
-    progress_pb: &ProgressBar,
-) -> Vec<WorkerFoldPayload> {
-    (0..splits.k)
-        .map(|fold_idx| {
-            let (_, _, test_indices, test_labels) =
-                splits.train_test_for_node(fold_idx, positive_set, candidate_set);
-
-            let mut smiles = Vec::new();
-            let mut is_positive = Vec::new();
-
-            for (i, &ci) in test_indices.iter().enumerate() {
-                smiles.push(compounds[ci].smiles.clone());
-                is_positive.push(test_labels[i]);
-                progress_pb.inc(1);
-            }
-
-            WorkerFoldPayload {
-                smiles,
-                is_positive,
-            }
-        })
-        .collect()
-}
-
-/// Run a custom GA loop for a single node.
-///
-/// We don't use genevo's Simulator because it uses rayon internally for
-/// fitness evaluation and breeding, which causes segfaults with RDKit's C++ FFI.
-/// Instead, we run a simple sequential GA: evaluate → select → breed → mutate → reinsert.
-fn evolve_node(
-    node_id: usize,
+fn evolve_task_inner(
+    task_id: &str,
     config: &EvolutionConfig,
     evaluator_backend: &mut impl EvaluationBackend,
-    positive_smiles: Vec<String>,
-    gen_pb: &ProgressBar,
-    step_pb: &ProgressBar,
-) -> Result<NodeResult, Box<dyn std::error::Error>> {
-    let genome_builder = SmartsGenomeBuilder::new(positive_smiles);
+    positive_smiles: &[String],
+    seed_corpus: &SeedCorpus,
+) -> Result<TaskResult, Box<dyn std::error::Error>> {
+    let genome_builder =
+        SmartsGenomeBuilder::with_seed_corpus(positive_smiles.to_vec(), seed_corpus.clone());
     let mut rng = rand::thread_rng();
 
-    // Build initial population
-    info!(
-        "  Building initial population ({})...",
-        config.population_size
-    );
     let mut population: Vec<SmartsGenome> = (0..config.population_size)
         .map(|i| genome_builder.build_genome(i, &mut rng))
         .collect();
     info!(
-        "  Population built. First SMARTS: {}",
-        population[0].smarts_string
+        "Built initial population for task '{}' ({} genomes)",
+        task_id,
+        population.len()
     );
 
     let crossover = SmartsCrossover::new(config.crossover_rate);
-    let reset_pool = build_reset_pool(&population, RESET_POOL_SIZE);
+    let reset_pool = build_reset_pool(seed_corpus, &population, RESET_POOL_SIZE);
     let mutator = SmartsMutation::with_reset_pool(config.mutation_rate, reset_pool);
 
-    let mut best_score: i64 = 0;
+    let mut best_fitness = ObjectiveFitness::from_metrics(-1.0, Duration::ZERO);
     let mut best_smarts = String::from("[#6]");
     let mut best_mcc = 0.0f64;
+    let mut best_eval_time = Duration::ZERO;
     let mut best_len = usize::MAX;
     let mut stagnation = 0u64;
-    let mut fitness_cache: HashMap<String, i64> = HashMap::new();
+    let mut fitness_cache: HashMap<String, ObjectiveFitness> = HashMap::new();
 
     for generation in 0..config.generation_limit {
         let (unique_population, duplicate_count) = deduplicate_population(&population);
@@ -474,106 +143,100 @@ fn evolve_node(
         let total_count = population.len();
         let average_token_len = average_token_len(&population);
         let mut cache_hits = 0usize;
-        let mut score_by_smarts: HashMap<String, i64> = HashMap::with_capacity(unique_count);
+        let mut fitness_by_smarts: HashMap<String, ObjectiveFitness> =
+            HashMap::with_capacity(unique_count);
         let mut uncached_population = Vec::with_capacity(unique_count);
+
         for genome in unique_population {
-            if let Some(&score) = fitness_cache.get(&genome.smarts_string) {
-                score_by_smarts.insert(genome.smarts_string.clone(), score);
+            if let Some(&fitness) = fitness_cache.get(&genome.smarts_string) {
+                fitness_by_smarts.insert(genome.smarts_string.clone(), fitness);
                 cache_hits += 1;
             } else {
                 uncached_population.push(genome);
             }
         }
-        begin_generation_step(
-            step_pb,
-            generation,
-            "evaluate",
-            uncached_population.len() as u64,
-        );
 
-        // 1. Evaluate fitness in worker processes, reusing per-node cached scores.
         if !uncached_population.is_empty() {
-            let unique_scored = evaluator_backend.score_population(uncached_population, step_pb)?;
-            for (genome, score) in unique_scored {
-                fitness_cache.insert(genome.smarts_string.clone(), score);
-                score_by_smarts.insert(genome.smarts_string, score);
+            let unique_scored = evaluator_backend.score_population(uncached_population)?;
+            for (genome, fitness) in unique_scored {
+                fitness_cache.insert(genome.smarts_string.clone(), fitness);
+                fitness_by_smarts.insert(genome.smarts_string, fitness);
             }
         }
+
         let mut scored = Vec::with_capacity(population.len());
         for genome in population {
-            let score = *score_by_smarts
+            let fitness = *fitness_by_smarts
                 .get(&genome.smarts_string)
-                .ok_or_else(|| format!("missing score for SMARTS '{}'", genome.smarts_string))?;
-            scored.push((genome, score));
+                .ok_or_else(|| format!("missing fitness for SMARTS '{}'", genome.smarts_string))?;
+            scored.push((genome, fitness));
         }
-        complete_generation_step(step_pb);
 
-        // 2. Sort by fitness descending, preferring shorter SMARTS on ties.
         scored.sort_by(compare_scored_genomes);
-
         let unique_scored = deduplicate_scored_population(&scored);
 
-        // Track best MCC for the top-scoring genome
         let lead = &unique_scored[0];
         let lead_len = lead.0.tokens.len();
-        let lead_mcc = MccFitness::to_mcc(lead.1);
+        let lead_mcc = lead.1.mcc();
+        let lead_eval_time = lead.1.elapsed();
         if generation == 0
-            || is_better_candidate(lead.1, &lead.0, best_score, best_len, &best_smarts)
+            || is_better_candidate(lead.1, &lead.0, best_fitness, best_len, &best_smarts)
         {
-            best_score = lead.1;
+            best_fitness = lead.1;
             best_smarts = lead.0.smarts_string.clone();
-            best_mcc = MccFitness::to_mcc(best_score);
+            best_mcc = best_fitness.mcc();
+            best_eval_time = best_fitness.elapsed();
             best_len = lead_len;
             stagnation = 0;
         } else {
             stagnation += 1;
         }
 
-        gen_pb.set_position(generation + 1);
-        gen_pb.set_message(generation_progress_message(
-            lead_mcc,
-            best_mcc,
-            unique_count,
-            total_count,
-            duplicate_count,
-            cache_hits,
-            lead_len,
-        ));
-
         debug!(
-            "    Gen {}: lead_score={}, lead_mcc={lead_mcc:.3}, global_mcc={best_mcc:.3}, unique={unique_count}/{total_count}, duplicates={duplicate_count}, avg_len={average_token_len:.1}, best_len={lead_len}, cache_hits={cache_hits}/{unique_count}, smarts={}",
+            "Task '{}' gen {}: {}",
+            task_id,
             generation + 1,
-            lead.1,
-            lead.0.smarts_string,
+            generation_progress_message(
+                lead.1,
+                best_fitness,
+                unique_count,
+                total_count,
+                duplicate_count,
+                cache_hits,
+                lead_len,
+                average_token_len,
+            ),
         );
 
         if stagnation >= config.stagnation_limit {
-            info!("    Stagnation after {generation} generations");
-            return Ok(NodeResult {
-                node_id,
+            info!(
+                "Task '{}' stagnated after {} generations; best MCC={:.3}, eval_ms={:.3}",
+                task_id,
+                generation + 1,
+                best_mcc,
+                duration_ms(best_eval_time)
+            );
+            return Ok(TaskResult {
+                task_id: task_id.to_string(),
                 best_smarts,
                 best_mcc,
-                generations: generation,
+                best_eval_time,
+                best_score: best_fitness.score,
+                generations: generation + 1,
             });
         }
 
-        // 3. Selection: tournament selection
         let num_parents = ((config.population_size as f64 * config.selection_ratio).round()
             as usize)
             .max(2)
             .min(config.population_size.max(2));
-        begin_generation_step(step_pb, generation, "select", num_parents as u64);
         let parents = tournament_select(
             &unique_scored,
             num_parents,
             config.tournament_size,
             &mut rng,
-            step_pb,
         );
-        complete_generation_step(step_pb);
 
-        // 4. Crossover + Mutation → offspring
-        begin_generation_step(step_pb, generation, "breed", config.population_size as u64);
         let mut offspring = Vec::with_capacity(config.population_size);
         let mut pi = 0;
         while offspring.len() < config.population_size {
@@ -585,22 +248,12 @@ fn evolve_node(
             for child in children {
                 let mutated = mutator.mutate(child, &mut rng);
                 offspring.push(mutated);
-                step_pb.inc(1);
                 if offspring.len() >= config.population_size {
                     break;
                 }
             }
         }
-        complete_generation_step(step_pb);
 
-        // 5. Elitist reinsertion: preserve strong genomes, but refill diversity gaps with
-        // unique offspring and immigrants before allowing any exact-SMARTS duplicates back in.
-        begin_generation_step(
-            step_pb,
-            generation,
-            "reinsert",
-            config.population_size as u64,
-        );
         let elite_count = config.elite_count.max(1).min(config.population_size);
         let immigrant_count = ((config.random_immigrant_ratio * config.population_size as f64)
             .round() as usize)
@@ -618,15 +271,18 @@ fn evolve_node(
                 immigrant_idx += 1;
                 genome
             },
-            step_pb,
         );
-        complete_generation_step(step_pb);
+
+        let _ = lead_mcc;
+        let _ = lead_eval_time;
     }
 
-    Ok(NodeResult {
-        node_id,
+    Ok(TaskResult {
+        task_id: task_id.to_string(),
         best_smarts,
         best_mcc,
+        best_eval_time,
+        best_score: best_fitness.score,
         generations: config.generation_limit,
     })
 }
@@ -645,7 +301,9 @@ fn deduplicate_population(population: &[SmartsGenome]) -> (Vec<SmartsGenome>, us
     (unique, duplicate_count)
 }
 
-fn deduplicate_scored_population(scored: &[(SmartsGenome, i64)]) -> Vec<(SmartsGenome, i64)> {
+fn deduplicate_scored_population(
+    scored: &[(SmartsGenome, ObjectiveFitness)],
+) -> Vec<(SmartsGenome, ObjectiveFitness)> {
     let mut unique = Vec::with_capacity(scored.len());
     let mut seen = HashSet::with_capacity(scored.len());
 
@@ -672,53 +330,70 @@ fn insert_unique_genome(
 }
 
 fn reinsert_population(
-    scored_unique: &[(SmartsGenome, i64)],
+    scored_unique: &[(SmartsGenome, ObjectiveFitness)],
     offspring: Vec<SmartsGenome>,
     population_size: usize,
     elite_count: usize,
     immigrant_count: usize,
     mut next_immigrant: impl FnMut() -> SmartsGenome,
-    step_pb: &ProgressBar,
 ) -> Vec<SmartsGenome> {
     let pre_immigrant_target = population_size.saturating_sub(immigrant_count);
     let mut next_gen = Vec::with_capacity(population_size);
     let mut seen = HashSet::with_capacity(population_size);
 
     for (genome, _) in scored_unique.iter().take(elite_count) {
-        if insert_unique_genome(&mut next_gen, &mut seen, genome.clone()) {
-            step_pb.inc(1);
-        }
+        insert_unique_genome(&mut next_gen, &mut seen, genome.clone());
     }
 
     for genome in offspring {
         if next_gen.len() >= pre_immigrant_target {
             break;
         }
-        if insert_unique_genome(&mut next_gen, &mut seen, genome) {
-            step_pb.inc(1);
-        }
+        insert_unique_genome(&mut next_gen, &mut seen, genome);
     }
 
     let unique_attempt_limit = population_size.saturating_mul(8).max(32);
     let mut attempts = 0usize;
     while next_gen.len() < population_size && attempts < unique_attempt_limit {
         attempts += 1;
-        if insert_unique_genome(&mut next_gen, &mut seen, next_immigrant()) {
-            step_pb.inc(1);
-        }
+        insert_unique_genome(&mut next_gen, &mut seen, next_immigrant());
     }
 
     while next_gen.len() < population_size {
         next_gen.push(next_immigrant());
-        step_pb.inc(1);
     }
 
     next_gen
 }
 
-fn build_reset_pool(population: &[SmartsGenome], limit: usize) -> Vec<SmartsGenome> {
-    let (unique, _) = deduplicate_population(population);
-    unique.into_iter().take(limit).collect()
+fn build_reset_pool(
+    seed_corpus: &SeedCorpus,
+    population: &[SmartsGenome],
+    limit: usize,
+) -> Vec<SmartsGenome> {
+    let mut reset_pool = Vec::with_capacity(limit);
+    let mut seen = HashSet::with_capacity(limit);
+
+    for genome in seed_corpus.entries() {
+        if reset_pool.len() >= limit {
+            return reset_pool;
+        }
+        if seen.insert(genome.smarts_string.clone()) {
+            reset_pool.push(genome.clone());
+        }
+    }
+
+    let (unique_population, _) = deduplicate_population(population);
+    for genome in unique_population {
+        if reset_pool.len() >= limit {
+            break;
+        }
+        if seen.insert(genome.smarts_string.clone()) {
+            reset_pool.push(genome);
+        }
+    }
+
+    reset_pool
 }
 
 fn average_token_len(population: &[SmartsGenome]) -> f64 {
@@ -731,20 +406,28 @@ fn average_token_len(population: &[SmartsGenome]) -> f64 {
 }
 
 fn generation_progress_message(
-    lead_mcc: f64,
-    best_mcc: f64,
+    lead: ObjectiveFitness,
+    best: ObjectiveFitness,
     unique_count: usize,
     total_count: usize,
     duplicate_count: usize,
     cache_hits: usize,
     lead_len: usize,
+    average_token_len: f64,
 ) -> String {
     format!(
-        "lead={lead_mcc:.3} best={best_mcc:.3} uniq={unique_count}/{total_count} dup={duplicate_count} cache={cache_hits}/{unique_count} len={lead_len}"
+        "lead={:.3}/{:.2}ms best={:.3}/{:.2}ms uniq={unique_count}/{total_count} dup={duplicate_count} cache={cache_hits}/{unique_count} len={lead_len} avg_len={average_token_len:.1}",
+        lead.mcc(),
+        duration_ms(lead.elapsed()),
+        best.mcc(),
+        duration_ms(best.elapsed()),
     )
 }
 
-fn compare_scored_genomes(left: &(SmartsGenome, i64), right: &(SmartsGenome, i64)) -> Ordering {
+fn compare_scored_genomes(
+    left: &(SmartsGenome, ObjectiveFitness),
+    right: &(SmartsGenome, ObjectiveFitness),
+) -> Ordering {
     right
         .1
         .cmp(&left.1)
@@ -753,26 +436,24 @@ fn compare_scored_genomes(left: &(SmartsGenome, i64), right: &(SmartsGenome, i64
 }
 
 fn is_better_candidate(
-    candidate_score: i64,
+    candidate_fitness: ObjectiveFitness,
     candidate: &SmartsGenome,
-    best_score: i64,
+    best_fitness: ObjectiveFitness,
     best_len: usize,
     best_smarts: &str,
 ) -> bool {
-    candidate_score > best_score
-        || (candidate_score == best_score
+    candidate_fitness > best_fitness
+        || (candidate_fitness == best_fitness
             && (candidate.tokens.len() < best_len
                 || (candidate.tokens.len() == best_len
                     && candidate.smarts_string.as_str() < best_smarts)))
 }
 
-/// Tournament selection: pick `count` parents via tournaments of `size`.
 fn tournament_select(
-    scored: &[(SmartsGenome, i64)],
+    scored: &[(SmartsGenome, ObjectiveFitness)],
     count: usize,
     tournament_size: usize,
     rng: &mut impl rand::Rng,
-    step_pb: &ProgressBar,
 ) -> Vec<SmartsGenome> {
     let mut parents = Vec::with_capacity(count);
     for _ in 0..count {
@@ -784,149 +465,50 @@ fn tournament_select(
             }
         }
         parents.push(scored[best_idx].0.clone());
-        step_pb.inc(1);
     }
     parents
 }
 
-fn begin_generation_step(step_pb: &ProgressBar, generation: u64, step_name: &str, length: u64) {
-    step_pb.set_length(length.max(1));
-    step_pb.set_position(0);
-    step_pb.set_message(format!("gen {}: {step_name}", generation + 1));
-}
-
-fn startup_progress_bar(message: &str, length: u64) -> ProgressBar {
-    let pb = ProgressBar::new(length);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{msg} [{bar:30.blue/dim}] {pos}/{len} items ({eta} remaining)",
-        )
-        .unwrap()
-        .progress_chars("=> "),
-    );
-    pb.set_message(message.to_string());
-    pb
-}
-
-fn begin_node_setup_step(step_pb: &ProgressBar, step_name: &str, length: u64) {
-    step_pb.set_length(length.max(1));
-    step_pb.set_position(0);
-    step_pb.set_message(format!("setup: {step_name}"));
-}
-
-fn complete_generation_step(step_pb: &ProgressBar) {
-    if let Some(length) = step_pb.length() {
-        step_pb.set_position(length);
-    }
-}
-
-fn completed_generation_count(result: &NodeResult, generation_limit: u64) -> u64 {
-    if result.generations < generation_limit {
-        result.generations + 1
-    } else {
-        result.generations
-    }
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 #[cfg(test)]
 mod regression_tests {
+    use std::str::FromStr;
+
+    use smarts_validator::PreparedTarget;
+    use smiles_parser::Smiles;
+
     use super::*;
-    use indicatif::ProgressBar;
 
-    use crate::data::rdkit_lock::with_rdkit_lock;
-    use crate::taxonomy::builder;
-
-    fn make_compound(cid: u64, smiles: &str, labels: &[&[&str]]) -> Compound {
-        let parsed = with_rdkit_lock(|| rdkit::ROMol::from_smiles(smiles).is_ok());
-        let labels = labels
-            .iter()
-            .map(|level| level.iter().map(|label| (*label).to_string()).collect())
-            .collect();
-        Compound {
-            cid,
-            smiles: smiles.to_string(),
-            parsed,
-            labels,
-        }
+    fn fitness(mcc: f64, elapsed_micros: u64) -> ObjectiveFitness {
+        ObjectiveFitness::from_metrics(mcc, Duration::from_micros(elapsed_micros))
     }
 
-    fn sample_dataset() -> (Vec<Compound>, TaxonomyDag) {
-        let compounds = vec![
-            make_compound(1, "CC", &[&["A"], &["A1"]]),
-            make_compound(2, "CN", &[&["A"], &["A2"]]),
-            make_compound(3, "O", &[&["B"], &["B1"]]),
-            make_compound(4, "N", &[&["B"], &["B2"]]),
-        ];
-        let dag = builder::build_dag(&compounds, &["coarse", "fine"]).unwrap();
-        (compounds, dag)
+    fn target(smiles: &str) -> PreparedTarget {
+        PreparedTarget::new(Smiles::from_str(smiles).unwrap())
     }
 
     #[test]
-    fn candidate_set_uses_actual_parents_only() {
-        let (compounds, dag) = sample_dataset();
-        let mut candidate_filter = SubstructLibraryIndex::new().unwrap();
-        let mut valid_compound_indices = Vec::new();
-        for (compound_idx, compound) in compounds.iter().enumerate() {
-            if compound.parsed {
-                candidate_filter.add_smiles(&compound.smiles, true).unwrap();
-                valid_compound_indices.push(compound_idx);
-            }
-        }
-        let all_valid_compounds: HashSet<usize> = valid_compound_indices.iter().copied().collect();
-
-        let mut evolved_smarts = HashMap::new();
-        let a_id = *dag.name_to_id.get(&(0, "A".to_string())).unwrap();
-        let b_id = *dag.name_to_id.get(&(0, "B".to_string())).unwrap();
-        let a1_id = *dag.name_to_id.get(&(1, "A1".to_string())).unwrap();
-        evolved_smarts.insert(a_id, "[#6]".to_string());
-        evolved_smarts.insert(b_id, "[#8]".to_string());
-
-        let candidates = determine_candidate_set(
-            a1_id,
-            &dag,
-            &evolved_smarts,
-            &all_valid_compounds,
-            &candidate_filter,
-            &valid_compound_indices,
-            None,
-        );
-
-        assert!(candidates.contains(&0));
-        assert!(candidates.contains(&1));
-        assert!(
-            !candidates.contains(&2),
-            "candidate set for A1 should not include compounds matched only by unrelated parent B"
-        );
-    }
-
-    #[test]
-    fn evolve_node_preserves_node_id() {
-        let (compounds, dag) = sample_dataset();
-        let predicted_node = *dag.name_to_id.get(&(1, "A1".to_string())).unwrap();
-        let folds = vec![FoldData {
-            smiles: vec![compounds[0].smiles.clone(), compounds[1].smiles.clone()],
-            is_positive: vec![true, false],
-        }];
-        let evaluator = SmartsEvaluator::new(folds).unwrap();
+    fn evolve_task_preserves_task_id() {
+        let task = EvolutionTask {
+            task_id: "leaf-1".to_string(),
+            positive_smiles: vec!["CC".to_string()],
+            folds: vec![FoldData {
+                targets: vec![target("CC"), target("CN")],
+                is_positive: vec![true, false],
+            }],
+        };
         let config = EvolutionConfig {
             population_size: 4,
             generation_limit: 1,
             stagnation_limit: 1,
             ..EvolutionConfig::default()
         };
-        let mut evaluator_backend = LocalEvaluationBackend::new(evaluator);
 
-        let result = evolve_node(
-            predicted_node,
-            &config,
-            &mut evaluator_backend,
-            vec!["CC".to_string()],
-            &ProgressBar::hidden(),
-            &ProgressBar::hidden(),
-        )
-        .unwrap();
-
-        assert_eq!(result.node_id, predicted_node);
+        let result = evolve_task(&task, &config, &SeedCorpus::builtin()).unwrap();
+        assert_eq!(result.task_id, "leaf-1");
     }
 
     #[test]
@@ -950,17 +532,29 @@ mod regression_tests {
     #[test]
     fn deduplicate_scored_population_keeps_first_best_entry_per_smarts() {
         let scored = vec![
-            (SmartsGenome::from_smarts("[#6]").unwrap(), 300),
-            (SmartsGenome::from_smarts("[#7]").unwrap(), 200),
-            (SmartsGenome::from_smarts("[#6]").unwrap(), 100),
-            (SmartsGenome::from_smarts("[#8]").unwrap(), 50),
+            (
+                SmartsGenome::from_smarts("[#6]").unwrap(),
+                fitness(0.80, 400),
+            ),
+            (
+                SmartsGenome::from_smarts("[#7]").unwrap(),
+                fitness(0.60, 400),
+            ),
+            (
+                SmartsGenome::from_smarts("[#6]").unwrap(),
+                fitness(0.20, 400),
+            ),
+            (
+                SmartsGenome::from_smarts("[#8]").unwrap(),
+                fitness(0.10, 400),
+            ),
         ];
 
         let unique = deduplicate_scored_population(&scored);
 
         assert_eq!(unique.len(), 3);
         assert_eq!(unique[0].0.smarts_string, "[#6]");
-        assert_eq!(unique[0].1, 300);
+        assert_eq!(unique[0].1, fitness(0.80, 400));
         assert_eq!(unique[1].0.smarts_string, "[#7]");
         assert_eq!(unique[2].0.smarts_string, "[#8]");
     }
@@ -968,8 +562,14 @@ mod regression_tests {
     #[test]
     fn reinsert_population_prefers_unique_offspring_and_immigrants() {
         let scored = vec![
-            (SmartsGenome::from_smarts("[#6]").unwrap(), 400),
-            (SmartsGenome::from_smarts("[#7]").unwrap(), 300),
+            (
+                SmartsGenome::from_smarts("[#6]").unwrap(),
+                fitness(0.90, 500),
+            ),
+            (
+                SmartsGenome::from_smarts("[#7]").unwrap(),
+                fitness(0.80, 500),
+            ),
         ];
         let offspring = vec![
             SmartsGenome::from_smarts("[#6]").unwrap(),
@@ -980,22 +580,13 @@ mod regression_tests {
         let immigrant_smarts = ["[#9]", "[#15]", "[#17]"];
         let mut immigrant_idx = 0usize;
 
-        let next_gen = reinsert_population(
-            &scored,
-            offspring,
-            5,
-            1,
-            1,
-            || {
-                let genome = SmartsGenome::from_smarts(
-                    immigrant_smarts[immigrant_idx % immigrant_smarts.len()],
-                )
-                .unwrap();
-                immigrant_idx += 1;
-                genome
-            },
-            &ProgressBar::hidden(),
-        );
+        let next_gen = reinsert_population(&scored, offspring, 5, 1, 1, || {
+            let genome =
+                SmartsGenome::from_smarts(immigrant_smarts[immigrant_idx % immigrant_smarts.len()])
+                    .unwrap();
+            immigrant_idx += 1;
+            genome
+        });
 
         let smarts: Vec<&str> = next_gen
             .iter()
@@ -1006,8 +597,14 @@ mod regression_tests {
 
     #[test]
     fn shorter_smarts_win_when_scores_tie() {
-        let short = (SmartsGenome::from_smarts("[#6]").unwrap(), 123);
-        let long = (SmartsGenome::from_smarts("[#6]~[#7]").unwrap(), 123);
+        let short = (
+            SmartsGenome::from_smarts("[#6]").unwrap(),
+            fitness(0.75, 250),
+        );
+        let long = (
+            SmartsGenome::from_smarts("[#6]~[#7]").unwrap(),
+            fitness(0.75, 250),
+        );
 
         assert!(compare_scored_genomes(&short, &long).is_lt());
         assert!(compare_scored_genomes(&long, &short).is_gt());
@@ -1015,11 +612,20 @@ mod regression_tests {
 
     #[test]
     fn generation_progress_message_surfaces_diversity_stats() {
-        let message = generation_progress_message(0.6621, 0.7314, 382, 1024, 642, 208, 16);
+        let message = generation_progress_message(
+            fitness(0.6621, 320),
+            fitness(0.7314, 480),
+            382,
+            1024,
+            642,
+            208,
+            16,
+            12.4,
+        );
 
         assert_eq!(
             message,
-            "lead=0.662 best=0.731 uniq=382/1024 dup=642 cache=208/382 len=16"
+            "lead=0.662/0.32ms best=0.731/0.48ms uniq=382/1024 dup=642 cache=208/382 len=16 avg_len=12.4"
         );
     }
 }
