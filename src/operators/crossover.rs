@@ -1,18 +1,17 @@
 use genevo::genetic::{Children, Parents};
 use genevo::operator::{CrossoverOp, GeneticOperator};
 use rand::Rng;
+use rand::seq::SliceRandom;
+use smarts_parser::QueryMol;
 
-use crate::genome::genome::SmartsGenome;
-use crate::genome::parser::MAX_CROSSOVER_CHILD_TOKENS;
-use crate::genome::token::SmartsToken;
+use crate::genome::SmartsGenome;
+use crate::genome::limits::MAX_CROSSOVER_CHILD_COMPLEXITY;
 
 /// SMARTS-aware crossover operator.
 ///
-/// Uses fragment exchange at atom-group boundaries:
-/// 1. Identify atom groups in each parent (bracketed atoms or bare atoms)
-/// 2. Pick a random crossover point in each parent at an atom-group boundary
-/// 3. Exchange suffixes
-/// 4. Validate both children structurally; replace invalid ones with parent clones
+/// Uses graph-level subtree exchange through `smarts-parser`'s editable query
+/// API. Each child is produced by replacing one chain-bond subtree in one
+/// parent with a subtree cloned from the other parent.
 #[derive(Clone, Debug)]
 pub struct SmartsCrossover {
     pub crossover_rate: f64,
@@ -46,89 +45,67 @@ impl CrossoverOp<SmartsGenome> for SmartsCrossover {
             return vec![parent_a.clone(), parent_b.clone()];
         }
 
-        // Find atom-group boundaries
-        let bounds_a = atom_group_boundaries(&parent_a.tokens);
-        let bounds_b = atom_group_boundaries(&parent_b.tokens);
+        let query_a = parent_a.query();
+        let query_b = parent_b.query();
 
-        if bounds_a.len() < 2 || bounds_b.len() < 2 {
+        let Some((anchor_a, child_a, subtree_a)) = choose_subtree_cut(query_a, rng) else {
             return vec![parent_a.clone(), parent_b.clone()];
-        }
-
-        // Pick crossover points (not at 0 or end)
-        let cut_a = bounds_a[rng.gen_range(1..bounds_a.len())];
-        let cut_b = bounds_b[rng.gen_range(1..bounds_b.len())];
-
-        // Child 1: prefix of A + suffix of B
-        let mut child1_tokens: Vec<SmartsToken> = parent_a.tokens[..cut_a].to_vec();
-        child1_tokens.extend_from_slice(&parent_b.tokens[cut_b..]);
-
-        // Child 2: prefix of B + suffix of A
-        let mut child2_tokens: Vec<SmartsToken> = parent_b.tokens[..cut_b].to_vec();
-        child2_tokens.extend_from_slice(&parent_a.tokens[cut_a..]);
-
-        if child1_tokens.len() > MAX_CROSSOVER_CHILD_TOKENS
-            || child2_tokens.len() > MAX_CROSSOVER_CHILD_TOKENS
-        {
+        };
+        let Some((anchor_b, child_b, subtree_b)) = choose_subtree_cut(query_b, rng) else {
             return vec![parent_a.clone(), parent_b.clone()];
-        }
-
-        let child1 = SmartsGenome::from_tokens(child1_tokens);
-        let child2 = SmartsGenome::from_tokens(child2_tokens);
-
-        // Validate and fall back to parents if invalid.
-        let c1 = if child1.is_structurally_valid() {
-            child1
-        } else {
-            parent_a.clone()
         };
-        let c2 = if child2.is_structurally_valid() {
-            child2
-        } else {
-            parent_b.clone()
-        };
+
+        let c1 = build_spliced_child(query_a, anchor_a, child_a, query_b, child_b, &subtree_b)
+            .unwrap_or_else(|| parent_a.clone());
+        let c2 = build_spliced_child(query_b, anchor_b, child_b, query_a, child_a, &subtree_a)
+            .unwrap_or_else(|| parent_b.clone());
 
         vec![c1, c2]
     }
 }
 
-/// Find token positions that are atom-group boundaries.
-///
-/// A boundary is a position between two atom groups — after a `]` or bare atom
-/// and before a bond, `(`, or `[`.
-fn atom_group_boundaries(tokens: &[SmartsToken]) -> Vec<usize> {
-    let mut boundaries = vec![0]; // Start is always a boundary
-    let mut i = 0;
+fn choose_subtree_cut<R: Rng>(query: &QueryMol, rng: &mut R) -> Option<(usize, usize, Vec<usize>)> {
+    let bond_ids = query.chain_bonds();
+    let &bond_id = bond_ids.choose(rng)?;
+    let bond = query.bond(bond_id)?;
+    let (anchor, child) = if rng.gen_bool(0.5) {
+        (bond.src, bond.dst)
+    } else {
+        (bond.dst, bond.src)
+    };
+    let subtree = query.rooted_subtree(child, Some(anchor));
+    (!subtree.is_empty()).then_some((anchor, child, subtree))
+}
 
-    while i < tokens.len() {
-        match &tokens[i] {
-            SmartsToken::OpenBracket => {
-                // Skip to closing bracket
-                while i < tokens.len() && !matches!(tokens[i], SmartsToken::CloseBracket) {
-                    i += 1;
-                }
-                i += 1; // past ']'
-                boundaries.push(i);
-            }
-            SmartsToken::Atom(_) => {
-                i += 1;
-                boundaries.push(i);
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
+fn build_spliced_child(
+    recipient: &QueryMol,
+    recipient_anchor: usize,
+    recipient_child: usize,
+    donor: &QueryMol,
+    donor_child: usize,
+    donor_subtree: &[usize],
+) -> Option<SmartsGenome> {
+    let fragment = donor.clone_subgraph(donor_subtree).ok()?;
+    let fragment_root = donor_subtree
+        .iter()
+        .position(|&atom_id| atom_id == donor_child)?;
 
-    boundaries.dedup();
-    // Only keep boundaries within range
-    boundaries.retain(|&b| b <= tokens.len());
-    boundaries
+    let mut editable = recipient.edit();
+    editable
+        .replace_subtree(recipient_anchor, recipient_child, &fragment, fragment_root)
+        .ok()?;
+    let query = editable.into_query_mol().ok()?;
+    genome_from_query(&query)
+}
+
+fn genome_from_query(query: &QueryMol) -> Option<SmartsGenome> {
+    let genome = SmartsGenome::from_query_mol(query);
+    (genome.complexity() <= MAX_CROSSOVER_CHILD_COMPLEXITY && genome.is_valid()).then_some(genome)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genome::parser::MAX_CROSSOVER_CHILD_TOKENS;
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
 
@@ -154,7 +131,7 @@ mod tests {
             let parents = vec![a, b];
             let children = crossover.crossover(parents, &mut rng);
             for child in &children {
-                if child.is_valid_matcher() {
+                if child.is_valid() {
                     valid += 1;
                 }
             }
@@ -169,24 +146,57 @@ mod tests {
     }
 
     #[test]
-    fn crossover_rejects_children_above_token_cap() {
-        let atom = vec![
-            SmartsToken::OpenBracket,
-            SmartsToken::Atom(crate::genome::token::AtomPrimitive::AtomicNumber(6)),
-            SmartsToken::CloseBracket,
-        ];
-        let mut long_tokens = Vec::new();
-        for _ in 0..(MAX_CROSSOVER_CHILD_TOKENS / 3 + 2) {
-            long_tokens.extend(atom.iter().cloned());
-        }
-        let parent_a = SmartsGenome::from_tokens(long_tokens.clone());
-        let parent_b = SmartsGenome::from_tokens(long_tokens);
+    fn crossover_name_and_disabled_rate_preserve_parents() {
+        let parent_a = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+        let parent_b = SmartsGenome::from_smarts("[#8]~[#6]").unwrap();
+        let mut rng = SmallRng::seed_from_u64(5);
+        let crossover = SmartsCrossover::new(0.0);
+
+        assert_eq!(SmartsCrossover::name(), "SmartsCrossover");
+        assert_eq!(
+            crossover.crossover(vec![parent_a.clone(), parent_b.clone()], &mut rng),
+            vec![parent_a, parent_b]
+        );
+    }
+
+    #[test]
+    fn crossover_with_single_parent_returns_input() {
+        let parent = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+        let mut rng = SmallRng::seed_from_u64(6);
+        let crossover = SmartsCrossover::new(1.0);
+
+        assert_eq!(
+            crossover.crossover(vec![parent.clone()], &mut rng),
+            vec![parent]
+        );
+    }
+
+    #[test]
+    fn crossover_returns_parents_without_swappable_subtrees() {
+        let parent_a = SmartsGenome::from_smarts("[#6]").unwrap();
+        let parent_b = SmartsGenome::from_smarts("[#7]").unwrap();
 
         let crossover = SmartsCrossover::new(1.0);
         let mut rng = SmallRng::seed_from_u64(123);
         let children = crossover.crossover(vec![parent_a.clone(), parent_b.clone()], &mut rng);
 
-        assert_eq!(children[0].smarts_string, parent_a.smarts_string);
-        assert_eq!(children[1].smarts_string, parent_b.smarts_string);
+        assert_eq!(children[0].smarts(), parent_a.smarts());
+        assert_eq!(children[1].smarts(), parent_b.smarts());
+    }
+
+    #[test]
+    fn crossover_can_swap_graph_subtrees() {
+        let parent_a = SmartsGenome::from_smarts("[#6]~[#7]~[#8]").unwrap();
+        let parent_b = SmartsGenome::from_smarts("[#6](~[#17])~[#35]").unwrap();
+
+        let crossover = SmartsCrossover::new(1.0);
+        let mut rng = SmallRng::seed_from_u64(9);
+        let children = crossover.crossover(vec![parent_a.clone(), parent_b.clone()], &mut rng);
+
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(SmartsGenome::is_valid));
+        assert!(
+            children[0].smarts() != parent_a.smarts() || children[1].smarts() != parent_b.smarts()
+        );
     }
 }

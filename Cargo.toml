@@ -6,7 +6,6 @@ edition = "2024"
 [features]
 default = ["std-io"]
 std-io = []
-wasm = ["genevo/wasm-bindgen"]
 
 [profile.release]
 opt-level = 3

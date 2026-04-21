@@ -160,7 +160,6 @@ dependencies = [
  "rand",
  "rand_xoshiro",
  "rayon",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -476,7 +475,7 @@ dependencies = [
 [[package]]
 name = "smarts-parser"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#884b183e5295f2b5e569c5aa98b8414e00271cb0"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#028d4d61cd8c96e6fdcd9ff8b442e6c8de5a8005"
 dependencies = [
  "elements_rs",
  "smiles-parser",
@@ -486,7 +485,7 @@ dependencies = [
 [[package]]
 name = "smarts-validator"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#884b183e5295f2b5e569c5aa98b8414e00271cb0"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#028d4d61cd8c96e6fdcd9ff8b442e6c8de5a8005"
 dependencies = [
  "elements_rs",
  "geometric-traits",

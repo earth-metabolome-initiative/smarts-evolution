@@ -1,5 +1,3 @@
-use genevo::genetic::Fitness;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConfusionCounts {
     pub tp: u64,
@@ -20,45 +18,6 @@ impl std::ops::AddAssign for ConfusionCounts {
         self.fp += rhs.fp;
         self.tn += rhs.tn;
         self.fn_ += rhs.fn_;
-    }
-}
-
-/// Fitness score derived only from MCC.
-///
-/// MCC is scaled from [-1, 1] into [0, 10000] so it can be ordered and used
-/// by the GA while preserving the same ranking as raw MCC.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct MccFitness {
-    pub score: i64,
-}
-
-impl MccFitness {
-    #[inline]
-    pub fn from_mcc(mcc: f64) -> Self {
-        let score = (((mcc + 1.0) / 2.0) * 10000.0).clamp(0.0, 10000.0) as i64;
-        Self { score }
-    }
-
-    #[inline]
-    pub fn to_mcc(score: i64) -> f64 {
-        let bounded = score.clamp(0, Self::max_score()) as f64;
-        ((bounded / Self::max_score() as f64) * 2.0) - 1.0
-    }
-
-    pub fn max_score() -> i64 {
-        10000
-    }
-}
-
-impl Fitness for MccFitness {
-    fn zero() -> Self {
-        Self { score: 0 }
-    }
-
-    fn abs_diff(&self, other: &Self) -> Self {
-        Self {
-            score: (self.score - other.score).abs(),
-        }
     }
 }
 
@@ -138,15 +97,44 @@ mod tests {
     }
 
     #[test]
-    fn mcc_fitness_scales_bounds() {
-        assert_eq!(MccFitness::from_mcc(-1.0).score, 0);
-        assert_eq!(MccFitness::from_mcc(1.0).score, MccFitness::max_score());
-    }
+    fn confusion_counts_add_assign_and_fold_average_skip_empty_folds() {
+        let mut total = ConfusionCounts {
+            tp: 1,
+            fp: 2,
+            tn: 3,
+            fn_: 4,
+        };
+        total += ConfusionCounts {
+            tp: 5,
+            fp: 6,
+            tn: 7,
+            fn_: 8,
+        };
 
-    #[test]
-    fn mcc_fitness_round_trip_is_close() {
-        let original = 0.5774;
-        let recovered = MccFitness::to_mcc(MccFitness::from_mcc(original).score);
-        assert!((recovered - original).abs() < 0.001, "MCC = {recovered}");
+        assert_eq!(
+            total,
+            ConfusionCounts {
+                tp: 6,
+                fp: 8,
+                tn: 10,
+                fn_: 12,
+            }
+        );
+
+        let mcc = compute_fold_averaged_mcc(&[
+            ConfusionCounts::default(),
+            ConfusionCounts {
+                tp: 5,
+                fp: 1,
+                tn: 7,
+                fn_: 1,
+            },
+        ]);
+        let expected = compute_mcc_from_counts(5, 1, 7, 1);
+        assert!((mcc - expected).abs() < 1e-12);
+        assert_eq!(
+            compute_fold_averaged_mcc(&[ConfusionCounts::default()]),
+            0.0
+        );
     }
 }

@@ -17,9 +17,9 @@ const TIME_PENALTY_LOG_SCALE: f64 = 64.0;
 /// but not so noisy that tiny runtime jitter dominates selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectiveFitness {
-    pub score: i64,
-    pub mcc_score: i64,
-    pub elapsed_micros: u64,
+    score: i64,
+    mcc_score: i64,
+    elapsed_micros: u64,
 }
 
 impl ObjectiveFitness {
@@ -64,6 +64,21 @@ impl ObjectiveFitness {
     #[inline]
     pub fn max_score() -> i64 {
         scale_mcc(1.0) * OBJECTIVE_MCC_WEIGHT
+    }
+
+    #[inline]
+    pub fn score(self) -> i64 {
+        self.score
+    }
+
+    #[inline]
+    pub fn mcc_score(self) -> i64 {
+        self.mcc_score
+    }
+
+    #[inline]
+    pub fn elapsed_micros(self) -> u64 {
+        self.elapsed_micros
     }
 }
 
@@ -140,5 +155,39 @@ mod tests {
     fn objective_round_trips_mcc() {
         let fitness = ObjectiveFitness::from_metrics(0.5774, Duration::from_micros(750));
         assert!((fitness.mcc() - 0.5774).abs() < 0.001);
+    }
+
+    #[test]
+    fn invalid_and_zero_objectives_use_negative_unit_mcc() {
+        let invalid = ObjectiveFitness::invalid(Duration::from_micros(25));
+        let zero = ObjectiveFitness::zero();
+
+        assert_eq!(invalid.mcc_score(), 0);
+        assert_eq!(invalid.elapsed(), Duration::from_micros(25));
+        assert_eq!(zero, ObjectiveFitness::from_metrics(-1.0, Duration::ZERO));
+    }
+
+    #[test]
+    fn time_penalty_and_max_score_are_exposed() {
+        let zero_elapsed = ObjectiveFitness::from_metrics(1.0, Duration::ZERO);
+        let nonzero_elapsed = ObjectiveFitness::from_metrics(1.0, Duration::from_micros(256));
+
+        assert_eq!(zero_elapsed.time_penalty(), 0);
+        assert!(nonzero_elapsed.time_penalty() > 0);
+        assert_eq!(ObjectiveFitness::max_score(), zero_elapsed.score());
+    }
+
+    #[test]
+    fn abs_diff_tracks_score_mcc_and_runtime_distance() {
+        let left = ObjectiveFitness::from_metrics(0.9, Duration::from_micros(900));
+        let right = ObjectiveFitness::from_metrics(0.4, Duration::from_micros(100));
+        let diff = left.abs_diff(&right);
+
+        assert_eq!(diff.score(), (left.score() - right.score()).abs());
+        assert_eq!(
+            diff.mcc_score(),
+            (left.mcc_score() - right.mcc_score()).abs()
+        );
+        assert_eq!(diff.elapsed_micros(), 800);
     }
 }

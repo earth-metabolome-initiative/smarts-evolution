@@ -9,13 +9,11 @@ use genevo::population::GenomeBuilder;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
-use super::genome::SmartsGenome;
-use super::token::*;
+use super::SmartsGenome;
 
-const STRATEGY_BUCKETS: usize = 20;
-const CORPUS_BUCKETS: usize = 9;
-const SMILES_BUCKETS: usize = 6;
-const PAP_BUCKETS: usize = 3;
+const STRATEGY_BUCKETS: usize = 12;
+const CORPUS_BUCKETS: usize = 8;
+const SIMPLE_BUILTIN_BUCKETS: usize = 2;
 
 const BUILTIN_SEED_SMARTS: &[&str] = &[
     "[#6]",
@@ -82,14 +80,33 @@ pub struct SeedCorpus {
 }
 
 impl SeedCorpus {
+    /// Build a corpus from the shipped built-in SMARTS fragments.
     pub fn builtin() -> Self {
         let mut corpus = Self::default();
-        corpus
-            .extend_from_smarts(BUILTIN_SEED_SMARTS.iter().copied())
-            .expect("built-in SMARTS seed corpus must stay valid");
+        let inserted = corpus.extend_from_smarts(BUILTIN_SEED_SMARTS.iter().copied());
+        debug_assert!(
+            inserted.is_ok(),
+            "built-in SMARTS seed corpus must stay valid"
+        );
         corpus
     }
 
+    /// Build a corpus from in-memory SMARTS strings.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use smarts_evolution::SeedCorpus;
+    ///
+    /// let corpus = SeedCorpus::from_smarts(vec![
+    ///     "[#6]".to_string(),
+    ///     "[#6]".to_string(),
+    ///     "[#7]".to_string(),
+    /// ])
+    /// .unwrap();
+    ///
+    /// assert_eq!(corpus.len(), 2);
+    /// ```
     pub fn from_smarts(smarts: Vec<String>) -> Result<Self, String> {
         let mut corpus = Self::default();
         corpus.extend_from_smarts(smarts)?;
@@ -97,6 +114,7 @@ impl SeedCorpus {
     }
 
     #[cfg(feature = "std-io")]
+    /// Build a corpus from a plain-text file containing one SMARTS per line.
     pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
@@ -137,14 +155,16 @@ impl SeedCorpus {
         self.seeds.choose(rng).cloned()
     }
 
+    /// Insert one SMARTS string if it is valid and not already present.
     pub fn insert_smarts(&mut self, smarts: &str) -> Result<bool, String> {
         let genome = SmartsGenome::from_smarts(smarts)?;
-        if !genome.is_valid_matcher() {
-            return Err(format!("matcher rejected SMARTS '{smarts}'"));
+        if !genome.is_valid() {
+            return Err(format!("SMARTS exceeds structural limits: '{smarts}'"));
         }
         Ok(self.insert_genome(genome))
     }
 
+    /// Extend this corpus with entries from another corpus.
     pub fn extend(&mut self, other: SeedCorpus) -> usize {
         let mut inserted = 0usize;
         for genome in other.seeds {
@@ -155,6 +175,7 @@ impl SeedCorpus {
         inserted
     }
 
+    /// Extend this corpus from an iterator of SMARTS-like strings.
     pub fn extend_from_smarts<I, S>(&mut self, smarts_iter: I) -> Result<usize, String>
     where
         I: IntoIterator<Item = S>,
@@ -173,7 +194,7 @@ impl SeedCorpus {
         if self
             .seeds
             .iter()
-            .any(|existing| existing.smarts_string == genome.smarts_string)
+            .any(|existing| existing.smarts() == genome.smarts())
         {
             return false;
         }
@@ -184,28 +205,22 @@ impl SeedCorpus {
 
 /// Builds initial SMARTS genomes for a population.
 ///
-/// Uses four strategies:
+/// Uses three strategies:
 /// - seed corpus: built-in, file-backed, or caller-provided SMARTS
-/// - SMILES-derived seeds: extract atom-environment patterns from positive example SMILES
-/// - PAP seeds: simple 1-3 atom SMARTS from a catalog of primitives
-/// - Random seeds: randomly assemble small SMARTS patterns
+/// - simple built-in seeds: small hand-written SMARTS fragments
+/// - random seeds: randomly assemble small SMARTS patterns
 pub struct SmartsGenomeBuilder {
-    /// SMILES strings from positive examples (for deriving seed patterns).
-    pub positive_smiles: Vec<String>,
     /// Curated and/or user-provided SMARTS corpus.
-    pub seed_corpus: SeedCorpus,
+    seed_corpus: SeedCorpus,
 }
 
 impl SmartsGenomeBuilder {
-    pub fn new(positive_smiles: Vec<String>) -> Self {
-        Self::with_seed_corpus(positive_smiles, SeedCorpus::builtin())
+    pub fn new(seed_corpus: SeedCorpus) -> Self {
+        Self { seed_corpus }
     }
 
-    pub fn with_seed_corpus(positive_smiles: Vec<String>, seed_corpus: SeedCorpus) -> Self {
-        Self {
-            positive_smiles,
-            seed_corpus,
-        }
+    pub fn seed_corpus(&self) -> &SeedCorpus {
+        &self.seed_corpus
     }
 }
 
@@ -215,147 +230,22 @@ impl GenomeBuilder<SmartsGenome> for SmartsGenomeBuilder {
         R: Rng + Sized,
     {
         let choice = index % STRATEGY_BUCKETS;
-        let genome = if choice < CORPUS_BUCKETS && !self.seed_corpus.is_empty() {
+        if choice < CORPUS_BUCKETS && !self.seed_corpus.is_empty() {
             corpus_seed(&self.seed_corpus, rng)
-        } else if choice < CORPUS_BUCKETS + SMILES_BUCKETS && !self.positive_smiles.is_empty() {
-            smiles_derived_seed(&self.positive_smiles, rng)
-        } else if choice < CORPUS_BUCKETS + SMILES_BUCKETS + PAP_BUCKETS {
-            pap_seed(rng)
+        } else if choice < CORPUS_BUCKETS + SIMPLE_BUILTIN_BUCKETS {
+            builtin_seed(rng)
         } else {
             random_seed(rng)
-        };
-
-        if genome.is_valid_matcher() {
-            genome
-        } else {
-            fallback_seed(rng)
         }
     }
 }
 
 fn corpus_seed<R: Rng>(seed_corpus: &SeedCorpus, rng: &mut R) -> SmartsGenome {
-    seed_corpus.sample(rng).unwrap_or_else(|| pap_seed(rng))
+    seed_corpus.sample(rng).unwrap_or_else(|| builtin_seed(rng))
 }
 
-/// Generate a SMARTS seed by converting a random positive SMILES to a basic atom pattern.
-///
-/// Takes a random SMILES, extracts 2-6 atoms with their bonds, and converts
-/// element symbols to SMARTS atom primitives (e.g., `C` → `[#6]`).
-fn smiles_derived_seed<R: Rng>(positive_smiles: &[String], rng: &mut R) -> SmartsGenome {
-    let smiles = &positive_smiles[rng.gen_range(0..positive_smiles.len())];
-
-    let atom_count = rng.gen_range(2..=6);
-    let smarts = smiles_prefix_to_smarts(smiles, atom_count);
-    if let Ok(g) = SmartsGenome::from_smarts(&smarts) {
-        if g.is_valid_matcher() {
-            return g;
-        }
-    }
-
-    pap_seed(rng)
-}
-
-/// Convert the first N atoms of a SMILES to a basic SMARTS pattern.
-fn smiles_prefix_to_smarts(smiles: &str, max_atoms: usize) -> String {
-    let mut out = String::new();
-    let mut atom_count = 0;
-    let chars: Vec<char> = smiles.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() && atom_count < max_atoms {
-        match chars[i] {
-            '[' => {
-                let start = i;
-                while i < chars.len() && chars[i] != ']' {
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1;
-                }
-                let bracket: String = chars[start..i].iter().collect();
-                out.push_str(&bracket);
-                atom_count += 1;
-            }
-            c @ ('C' | 'N' | 'O' | 'S' | 'P' | 'B' | 'F' | 'I') => {
-                let (num, skip) = match c {
-                    'C' if i + 1 < chars.len() && chars[i + 1] == 'l' => (17, 2),
-                    'B' if i + 1 < chars.len() && chars[i + 1] == 'r' => (35, 2),
-                    'C' => (6, 1),
-                    'N' => (7, 1),
-                    'O' => (8, 1),
-                    'S' => (16, 1),
-                    'P' => (15, 1),
-                    'B' => (5, 1),
-                    'F' => (9, 1),
-                    'I' => (53, 1),
-                    _ => unreachable!(),
-                };
-                out.push_str(&format!("[#{num}]"));
-                i += skip;
-                atom_count += 1;
-            }
-            c @ ('c' | 'n' | 'o' | 's' | 'p') => {
-                let num = match c {
-                    'c' => 6,
-                    'n' => 7,
-                    'o' => 8,
-                    's' => 16,
-                    'p' => 15,
-                    _ => unreachable!(),
-                };
-                out.push_str(&format!("[#{num}]"));
-                i += 1;
-                atom_count += 1;
-            }
-            '-' => {
-                out.push('~');
-                i += 1;
-            }
-            '=' => {
-                out.push('=');
-                i += 1;
-            }
-            '#' => {
-                out.push('#');
-                i += 1;
-            }
-            ':' => {
-                out.push('~');
-                i += 1;
-            }
-            '(' => {
-                out.push('(');
-                i += 1;
-            }
-            ')' => {
-                out.push(')');
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    let open_parens = out.chars().filter(|&c| c == '(').count();
-    let close_parens = out.chars().filter(|&c| c == ')').count();
-    if open_parens > close_parens {
-        for _ in 0..(open_parens - close_parens) {
-            if let Some(pos) = out.rfind('(') {
-                out.truncate(pos);
-            }
-        }
-    }
-
-    if out.is_empty() {
-        "[#6]".to_string()
-    } else {
-        out
-    }
-}
-
-/// Generate a simple Primitive Atom Pattern (PAP) seed.
-fn pap_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
+/// Generate one small built-in SMARTS seed.
+fn builtin_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
     let pat = BUILTIN_SEED_SMARTS.choose(rng).unwrap();
     SmartsGenome::from_smarts(pat).unwrap()
 }
@@ -364,41 +254,31 @@ fn pap_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
 fn random_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
     let atom_count = rng.gen_range(1..=4);
     let common_atoms: &[u8] = &[6, 7, 8, 16, 15, 9, 17, 35];
-
-    let mut tokens = Vec::new();
+    let mut smarts = String::new();
 
     for i in 0..atom_count {
         if i > 0 {
-            let bonds = &[BondToken::Single, BondToken::Double, BondToken::Any];
-            tokens.push(SmartsToken::Bond(bonds.choose(rng).unwrap().clone()));
+            smarts.push_str(random_seed_bond(rng));
         }
-
-        tokens.push(SmartsToken::OpenBracket);
         let elem = common_atoms.choose(rng).unwrap();
-        tokens.push(SmartsToken::Atom(AtomPrimitive::AtomicNumber(*elem)));
-
+        smarts.push_str(&format!("[#{elem}"));
         if rng.gen_bool(0.4) {
-            tokens.push(SmartsToken::Logic(LogicOp::AndLow));
-            let constraint = match rng.gen_range(0..4) {
-                0 => AtomPrimitive::RingMembership(None),
-                1 => AtomPrimitive::HCount(rng.gen_range(0..=3)),
-                2 => AtomPrimitive::Degree(rng.gen_range(1..=4)),
-                _ => AtomPrimitive::Aromatic,
+            let constraint = match rng.gen_range(0..3) {
+                0 => "R".to_string(),
+                1 => format!("H{}", rng.gen_range(0..=3)),
+                _ => format!("D{}", rng.gen_range(1..=4)),
             };
-            tokens.push(SmartsToken::Atom(constraint));
+            smarts.push(';');
+            smarts.push_str(&constraint);
         }
-
-        tokens.push(SmartsToken::CloseBracket);
+        smarts.push(']');
     }
 
-    SmartsGenome::from_tokens(tokens)
+    SmartsGenome::from_smarts(&smarts).unwrap()
 }
 
-/// A guaranteed-valid fallback pattern.
-fn fallback_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
-    let safe = &["[#6]", "[#7]", "[#8]", "[#6]~[#6]", "[#6]~[#7]"];
-    let pat = safe.choose(rng).unwrap();
-    SmartsGenome::from_smarts(pat).unwrap()
+fn random_seed_bond<R: Rng>(rng: &mut R) -> &'static str {
+    ["-", "=", "~"].choose(rng).unwrap()
 }
 
 #[cfg(test)]
@@ -408,26 +288,20 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::genome::limits::MAX_SMARTS_COMPLEXITY;
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
 
     #[test]
     fn test_seed_generation_all_valid() {
-        let smiles = vec![
-            "c1ccccc1".to_string(),
-            "CC(=O)O".to_string(),
-            "CCN".to_string(),
-            "c1ccncc1".to_string(),
-            "CC(C)C(=O)C(=O)O".to_string(),
-        ];
-        let builder = SmartsGenomeBuilder::new(smiles);
+        let builder = SmartsGenomeBuilder::new(SeedCorpus::builtin());
         let mut rng = SmallRng::seed_from_u64(42);
 
         let mut valid = 0;
         let total = 100;
         for i in 0..total {
             let genome = builder.build_genome(i, &mut rng);
-            if genome.is_valid_matcher() {
+            if genome.is_valid() {
                 valid += 1;
             }
         }
@@ -441,7 +315,7 @@ mod tests {
     fn builtin_seed_corpus_is_valid() {
         let corpus = SeedCorpus::builtin();
         assert!(corpus.len() >= BUILTIN_SEED_SMARTS.len());
-        assert!(corpus.entries().iter().all(SmartsGenome::is_valid_matcher));
+        assert!(corpus.entries().iter().all(SmartsGenome::is_valid));
     }
 
     #[test]
@@ -456,12 +330,34 @@ mod tests {
         let smarts: HashSet<_> = corpus
             .entries()
             .iter()
-            .map(|genome| genome.smarts_string.as_str())
+            .map(|genome| genome.smarts())
             .collect();
 
         assert_eq!(corpus.len(), 2);
         assert!(smarts.contains("[#6]"));
         assert!(smarts.contains("[#7]"));
+    }
+
+    #[test]
+    fn seed_corpus_sample_extend_and_invalid_insertions_behave() {
+        let mut corpus = SeedCorpus::default();
+        let too_large = std::iter::repeat_n("[#6]", MAX_SMARTS_COMPLEXITY + 1)
+            .collect::<Vec<_>>()
+            .join("~");
+
+        assert!(corpus.is_empty());
+        assert!(corpus.sample(&mut SmallRng::seed_from_u64(11)).is_none());
+        assert!(corpus.insert_smarts("not smarts").is_err());
+        assert!(corpus.insert_smarts(&too_large).is_err());
+
+        assert!(corpus.insert_smarts("[#6]").unwrap());
+        assert!(!corpus.is_empty());
+
+        let inserted = corpus
+            .extend(SeedCorpus::from_smarts(vec!["[#6]".to_string(), "[#7]".to_string()]).unwrap());
+        assert_eq!(inserted, 1);
+        assert_eq!(corpus.len(), 2);
+        assert!(corpus.sample(&mut SmallRng::seed_from_u64(12)).is_some());
     }
 
     #[cfg(feature = "std-io")]
@@ -474,7 +370,7 @@ mod tests {
         ));
         let mut file = std::fs::File::create(&path).unwrap();
         writeln!(file, "# comment").unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         writeln!(file, "[#6]").unwrap();
         writeln!(file, "[#7]").unwrap();
         writeln!(file, "[#6]").unwrap();
@@ -484,7 +380,7 @@ mod tests {
         let smarts: HashSet<_> = corpus
             .entries()
             .iter()
-            .map(|genome| genome.smarts_string.as_str())
+            .map(|genome| genome.smarts())
             .collect();
 
         assert_eq!(corpus.len(), 2);
@@ -494,20 +390,50 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "std-io")]
+    #[test]
+    fn seed_corpus_file_reports_invalid_line_numbers() {
+        let path = std::env::temp_dir().join(format!(
+            "smarts-seed-corpus-invalid-{}-{}.sma",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "[#6]").unwrap();
+        writeln!(file, "not smarts").unwrap();
+        drop(file);
+
+        let error = SeedCorpus::from_file(&path).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains(":2:"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn builder_can_draw_from_explicit_seed_corpus() {
-        let corpus = SeedCorpus::from_smarts(vec![
-            "[#6]~[#17]".to_string(),
-            "[#6]~[#35]".to_string(),
-        ])
-        .unwrap();
-        let builder = SmartsGenomeBuilder::with_seed_corpus(Vec::new(), corpus);
+        let corpus =
+            SeedCorpus::from_smarts(vec!["[#6]~[#17]".to_string(), "[#6]~[#35]".to_string()])
+                .unwrap();
+        let builder = SmartsGenomeBuilder::new(corpus);
         let mut rng = SmallRng::seed_from_u64(7);
 
         let observed: HashSet<_> = (0..16)
-            .map(|i| builder.build_genome(i, &mut rng).smarts_string)
+            .map(|i| builder.build_genome(i, &mut rng).smarts().to_string())
             .collect();
 
         assert!(observed.contains("[#6]~[#17]") || observed.contains("[#6]~[#35]"));
+    }
+
+    #[test]
+    fn builder_without_corpus_falls_back_to_builtin_and_random_seeds() {
+        let builder = SmartsGenomeBuilder::new(SeedCorpus::default());
+        let mut rng = SmallRng::seed_from_u64(19);
+
+        for i in 0..32 {
+            let genome = builder.build_genome(i, &mut rng);
+            assert!(genome.is_valid());
+            assert!(!genome.smarts().is_empty());
+        }
     }
 }

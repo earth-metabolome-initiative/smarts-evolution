@@ -1,20 +1,22 @@
 use genevo::operator::{GeneticOperator, MutationOp};
 use rand::Rng;
-use rand::seq::SliceRandom;
+use rand::seq::{IteratorRandom, SliceRandom};
+use smarts_parser::{
+    AtomExpr, AtomPrimitive, BondExpr, BondExprTree, BondPrimitive, BracketExpr, BracketExprTree,
+    EditableQueryMol, ExprPath, HydrogenKind, NumericQuery, QueryMol, add_atom_primitive,
+    remove_atom_primitive, replace_atom_primitive,
+};
+use smiles_parser::bond::Bond;
 
-use crate::genome::genome::SmartsGenome;
-use crate::genome::parser::MAX_SMARTS_TOKENS;
-use crate::genome::token::*;
+use crate::genome::SmartsGenome;
+use crate::genome::limits::{MAX_PRIMITIVES_PER_BRACKET, MAX_SMARTS_COMPLEXITY};
 
-use super::primitives::*;
+const COMMON_ATOMIC_NUMBERS: &[u16] = &[6, 7, 8, 9, 15, 16, 17, 35, 53];
 
 /// SMARTS-aware mutation operator.
 ///
-/// Mutation is intentionally aggressive now that matching is pure Rust and no
-/// longer gated by the old RDKit process-isolation workarounds. A single
-/// mutation event usually applies multiple edits before validating the
-/// offspring, which helps the search escape the timid local tweaks that used to
-/// dominate the population.
+/// Mutation uses `smarts-parser`'s editable query graph as the mutation
+/// surface and returns a fresh parsed genome after each successful edit.
 #[derive(Clone, Debug)]
 pub struct SmartsMutation {
     pub mutation_rate: f64,
@@ -62,306 +64,386 @@ impl MutationOp<SmartsGenome> for SmartsMutation {
         }
 
         if !self.reset_pool.is_empty() && rng.gen_bool(self.reset_probability) {
-            return self.reset_pool.choose(rng).cloned().unwrap_or(genome);
+            let reset_idx = rng.gen_range(0..self.reset_pool.len());
+            return self.reset_pool[reset_idx].clone();
         }
 
         for _ in 0..self.attempt_budget {
-            let mut tokens = genome.tokens.clone();
+            let mut editable = genome.query().edit();
             let mutation_steps = rng.gen_range(2..=self.max_mutation_steps.max(2));
             let mut mutated = false;
 
             for _ in 0..mutation_steps {
-                mutated |= apply_random_mutation(&mut tokens, rng);
-
-                if tokens.len() > MAX_SMARTS_TOKENS {
-                    mutated = false;
-                    break;
-                }
+                mutated |= apply_random_mutation(&mut editable, &self.reset_pool, rng);
             }
 
-            if mutated {
-                let candidate = SmartsGenome::from_tokens(tokens);
-                if candidate.is_structurally_valid() {
-                    return candidate;
-                }
+            if !mutated {
+                continue;
             }
+
+            let Ok(query) = editable.into_query_mol() else {
+                continue;
+            };
+            let Some(candidate) = genome_from_query(&query) else {
+                continue;
+            };
+            return candidate;
         }
 
-        // All attempts failed; return original
         genome
     }
 }
 
-fn apply_random_mutation<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
+fn genome_from_query(query: &QueryMol) -> Option<SmartsGenome> {
+    let genome = SmartsGenome::from_query_mol(query);
+    (genome.complexity() <= MAX_SMARTS_COMPLEXITY && genome.is_valid()).then_some(genome)
+}
+
+fn apply_random_mutation<R: Rng>(
+    editable: &mut EditableQueryMol,
+    reset_pool: &[SmartsGenome],
+    rng: &mut R,
+) -> bool {
     let roll: f64 = rng.r#gen();
 
     if roll < 0.18 {
-        toggle_atom_primitive(tokens, rng)
+        mutate_atom_constraints(editable, rng)
     } else if roll < 0.33 {
-        generalize_specialize(tokens, rng)
-    } else if roll < 0.53 {
-        add_atom(tokens, rng)
-    } else if roll < 0.67 {
-        remove_atom(tokens, rng)
-    } else if roll < 0.79 {
-        rewrite_atom_group(tokens, rng)
-    } else if roll < 0.91 {
-        change_bond(tokens, rng)
+        generalize_specialize_atom(editable, rng)
+    } else if roll < 0.50 {
+        attach_leaf_atom(editable, rng)
+    } else if roll < 0.62 {
+        insert_atom_on_bond(editable, rng)
+    } else if roll < 0.74 {
+        remove_leaf_atom(editable, rng)
+    } else if roll < 0.86 {
+        change_bond_expr(editable, rng)
+    } else if roll < 0.94 {
+        toggle_atom_not(editable, rng)
     } else {
-        toggle_not(tokens, rng)
+        graft_seed_fragment(editable, reset_pool, rng)
     }
 }
 
-/// Find indices of all atom primitives inside brackets.
-fn find_bracket_atom_indices(tokens: &[SmartsToken]) -> Vec<usize> {
-    let mut indices = Vec::new();
-    let mut in_bracket = false;
-    for (i, token) in tokens.iter().enumerate() {
-        match token {
-            SmartsToken::OpenBracket => in_bracket = true,
-            SmartsToken::CloseBracket => in_bracket = false,
-            SmartsToken::Atom(_) if in_bracket => indices.push(i),
-            _ => {}
-        }
-    }
-    indices
+fn random_atom<R: Rng>(editable: &EditableQueryMol, rng: &mut R) -> (usize, AtomExpr) {
+    let atoms = editable.as_query_mol().atoms();
+    debug_assert!(!atoms.is_empty());
+    let atom = &atoms[rng.gen_range(0..atoms.len())];
+    (atom.id, atom.expr.clone())
 }
 
-/// Find indices of all bond tokens.
-fn find_bond_indices(tokens: &[SmartsToken]) -> Vec<usize> {
-    tokens
+fn random_atom_id<R: Rng>(editable: &EditableQueryMol, rng: &mut R) -> usize {
+    let atoms = editable.as_query_mol().atoms();
+    debug_assert!(!atoms.is_empty());
+    atoms[rng.gen_range(0..atoms.len())].id
+}
+
+fn random_bond_id<R: Rng>(editable: &EditableQueryMol, rng: &mut R) -> Option<usize> {
+    editable
+        .as_query_mol()
+        .bonds()
         .iter()
-        .enumerate()
-        .filter_map(|(i, t)| matches!(t, SmartsToken::Bond(_)).then_some(i))
+        .choose(rng)
+        .map(|bond| bond.id)
+}
+
+fn random_bracket_atom<R: Rng>(
+    editable: &EditableQueryMol,
+    rng: &mut R,
+) -> Option<(usize, BracketExpr)> {
+    editable
+        .as_query_mol()
+        .atoms()
+        .iter()
+        .filter_map(|atom| match &atom.expr {
+            AtomExpr::Bracket(expr) => Some((atom.id, expr.clone())),
+            _ => None,
+        })
+        .choose(rng)
+}
+
+fn mutate_atom_constraints<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+    let (atom_id, atom_expr) = random_atom(editable, rng);
+
+    match atom_expr {
+        AtomExpr::Bracket(mut expr) => {
+            let primitive_paths = bracket_primitive_paths(&expr);
+            let mutated = match rng.gen_range(0..4) {
+                0 if primitive_paths.len() < MAX_PRIMITIVES_PER_BRACKET => {
+                    add_atom_primitive(&mut expr, random_atom_primitive(rng)).is_ok()
+                }
+                1 if !primitive_paths.is_empty() => {
+                    let path = primitive_paths.choose(rng).unwrap();
+                    replace_atom_primitive(&mut expr, path, random_atom_primitive(rng)).is_ok()
+                }
+                2 if primitive_paths.len() > 1 => {
+                    let path = primitive_paths.choose(rng).unwrap();
+                    remove_atom_primitive(&mut expr, path).is_ok()
+                }
+                _ => {
+                    expr = random_bracket_expr(rng);
+                    true
+                }
+            };
+
+            mutated
+                && editable
+                    .replace_atom_expr(atom_id, AtomExpr::Bracket(expr))
+                    .is_ok()
+        }
+        _ => editable
+            .replace_atom_expr(atom_id, random_atom_expr(rng))
+            .is_ok(),
+    }
+}
+
+fn generalize_specialize_atom<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+    let (atom_id, atom_expr) = random_atom(editable, rng);
+
+    let AtomExpr::Bracket(mut expr) = atom_expr else {
+        return editable
+            .replace_atom_expr(atom_id, random_atom_expr(rng))
+            .is_ok();
+    };
+    let primitive_paths = bracket_primitive_paths(&expr);
+    let Some(path) = primitive_paths.choose(rng) else {
+        return false;
+    };
+    let Some(BracketExprTree::Primitive(current)) = expr.tree.get(path) else {
+        return false;
+    };
+    let replacement = if rng.gen_bool(0.5) {
+        generalize_atom_primitive(current, rng)
+    } else {
+        specialize_atom_primitive(current, rng)
+    };
+
+    replace_atom_primitive(&mut expr, path, replacement).is_ok()
+        && editable
+            .replace_atom_expr(atom_id, AtomExpr::Bracket(expr))
+            .is_ok()
+}
+
+fn attach_leaf_atom<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+    let parent = random_atom_id(editable, rng);
+
+    editable
+        .attach_leaf(parent, random_bond_expr(rng), random_atom_expr(rng))
+        .is_ok()
+}
+
+fn insert_atom_on_bond<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+    let Some(bond_id) = random_bond_id(editable, rng) else {
+        return false;
+    };
+
+    editable
+        .insert_atom_on_bond(
+            bond_id,
+            random_bond_expr(rng),
+            random_atom_expr(rng),
+            random_bond_expr(rng),
+        )
+        .is_ok()
+}
+
+fn remove_leaf_atom<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+    if editable.as_query_mol().atom_count() <= 1 {
+        return false;
+    }
+
+    let leaves = editable.as_query_mol().leaf_atoms();
+    let Some(&leaf) = leaves.choose(rng) else {
+        return false;
+    };
+    editable.remove_leaf_atom(leaf).is_ok()
+}
+
+fn change_bond_expr<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+    let Some(bond_id) = random_bond_id(editable, rng) else {
+        return false;
+    };
+
+    editable
+        .replace_bond_expr(bond_id, random_bond_expr(rng))
+        .is_ok()
+}
+
+fn toggle_atom_not<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+    let Some((atom_id, mut expr)) = random_bracket_atom(editable, rng) else {
+        return false;
+    };
+
+    expr.tree = match expr.tree {
+        BracketExprTree::Not(inner) => *inner,
+        tree => BracketExprTree::Not(Box::new(tree)),
+    };
+    expr.normalize().is_ok()
+        && editable
+            .replace_atom_expr(atom_id, AtomExpr::Bracket(expr))
+            .is_ok()
+}
+
+fn graft_seed_fragment<R: Rng>(
+    editable: &mut EditableQueryMol,
+    reset_pool: &[SmartsGenome],
+    rng: &mut R,
+) -> bool {
+    if reset_pool.is_empty() {
+        return false;
+    }
+
+    let parent = random_atom_id(editable, rng);
+    let fragment_genome = &reset_pool[rng.gen_range(0..reset_pool.len())];
+
+    let fragment_root = fragment_genome
+        .query()
+        .leaf_atoms()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| fragment_genome.query().atoms()[0].id);
+
+    editable
+        .graft_subgraph(
+            parent,
+            random_bond_expr(rng),
+            fragment_genome.query(),
+            fragment_root,
+        )
+        .is_ok()
+}
+
+fn bracket_primitive_paths(expr: &BracketExpr) -> Vec<ExprPath> {
+    expr.tree
+        .enumerate_paths()
+        .into_iter()
+        .filter(|path| matches!(expr.tree.get(path), Some(BracketExprTree::Primitive(_))))
         .collect()
 }
 
-/// Find "atom groups" — ranges of tokens forming a single atom expression.
-/// Returns (start, end) pairs where tokens[start..end] is one atom.
-/// Bare atoms are single tokens; bracketed atoms span from `[` to `]`.
-fn find_atom_groups(tokens: &[SmartsToken]) -> Vec<(usize, usize)> {
-    let mut groups = Vec::new();
-    let mut i = 0;
-    while i < tokens.len() {
-        match &tokens[i] {
-            SmartsToken::OpenBracket => {
-                let start = i;
-                while i < tokens.len() && !matches!(tokens[i], SmartsToken::CloseBracket) {
-                    i += 1;
-                }
-                if i < tokens.len() {
-                    i += 1; // include ']'
-                }
-                groups.push((start, i));
-            }
-            SmartsToken::Atom(_) => {
-                groups.push((i, i + 1));
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    groups
+fn random_atom_expr<R: Rng>(rng: &mut R) -> AtomExpr {
+    AtomExpr::Bracket(random_bracket_expr(rng))
 }
 
-/// Toggle atom primitive: add, remove, or change a constraint inside a bracket.
-fn toggle_atom_primitive<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
-    let atom_indices = find_bracket_atom_indices(tokens);
-    if atom_indices.is_empty() {
-        return false;
-    }
-
-    let &idx = atom_indices.choose(rng).unwrap();
-
-    match rng.gen_range(0..3) {
-        0 => {
-            // Change: replace the primitive with a random one
-            tokens[idx] = SmartsToken::Atom(random_atom_primitive(rng));
-            true
-        }
-        1 => {
-            // Add: insert a new primitive after this one with `;` separator
-            let new_prim = random_atom_primitive(rng);
-            tokens.insert(idx + 1, SmartsToken::Atom(new_prim));
-            tokens.insert(idx + 1, SmartsToken::Logic(LogicOp::AndLow));
-            true
-        }
-        _ => {
-            // Remove: remove this primitive (and preceding logic op if any)
-            // Only if there are other primitives in this bracket
-            let bracket_atoms: usize = atom_indices
-                .iter()
-                .filter(|&&ai| {
-                    // Check same bracket
-                    let before_idx = tokens[..idx]
-                        .iter()
-                        .rposition(|t| matches!(t, SmartsToken::OpenBracket));
-                    let before_ai = tokens[..ai]
-                        .iter()
-                        .rposition(|t| matches!(t, SmartsToken::OpenBracket));
-                    before_idx == before_ai
-                })
-                .count();
-
-            if bracket_atoms > 1 {
-                // Remove preceding logic op if it exists
-                if idx > 0 && matches!(tokens[idx - 1], SmartsToken::Logic(_)) {
-                    tokens.remove(idx);
-                    tokens.remove(idx - 1);
-                } else if idx + 1 < tokens.len() && matches!(tokens[idx + 1], SmartsToken::Logic(_))
-                {
-                    tokens.remove(idx + 1);
-                    tokens.remove(idx);
-                } else {
-                    tokens.remove(idx);
-                }
-                true
-            } else {
-                // Only primitive in bracket — change instead of remove
-                tokens[idx] = SmartsToken::Atom(random_atom_primitive(rng));
-                true
-            }
-        }
-    }
-}
-
-/// Generalize or specialize a random atom primitive.
-fn generalize_specialize<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
-    let atom_indices = find_bracket_atom_indices(tokens);
-    if atom_indices.is_empty() {
-        return false;
-    }
-    let &idx = atom_indices.choose(rng).unwrap();
-
-    if let SmartsToken::Atom(prim) = &tokens[idx] {
-        let new_prim = if rng.gen_bool(0.5) {
-            generalize(prim, rng)
-        } else {
-            specialize(prim, rng)
-        };
-        tokens[idx] = SmartsToken::Atom(new_prim);
-        true
-    } else {
-        false
-    }
-}
-
-/// Add a new atom + bond at the end or as a branch.
-fn add_atom<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
-    let atom_groups = find_atom_groups(tokens);
-    if atom_groups.is_empty() || tokens.len() >= MAX_SMARTS_TOKENS {
-        return false;
-    }
-
-    let bond = SmartsToken::Bond(random_bond(rng));
-    let new_atom = random_bracketed_atom(rng);
-
-    if rng.gen_bool(0.6) {
-        // Append at the end
-        tokens.push(bond);
-        tokens.extend(new_atom);
-    } else {
-        // Insert as a branch after a random atom group
-        let &(_, end) = atom_groups.choose(rng).unwrap();
-        let insert_pos = end.min(tokens.len());
-        let mut branch = vec![SmartsToken::BranchOpen, bond];
-        branch.extend(new_atom);
-        branch.push(SmartsToken::BranchClose);
-        for (j, tok) in branch.into_iter().enumerate() {
-            tokens.insert(insert_pos + j, tok);
-        }
-    }
-
-    true
-}
-
-/// Replace a random atom group with a fresh random bracketed atom.
-fn rewrite_atom_group<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
-    let atom_groups = find_atom_groups(tokens);
-    if atom_groups.is_empty() {
-        return false;
-    }
-
-    let &(start, end) = atom_groups.choose(rng).unwrap();
-    let replacement = random_bracketed_atom(rng);
-    tokens.splice(start..end, replacement);
-    true
-}
-
-/// Remove a terminal atom (last atom group or a branch).
-fn remove_atom<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
-    let atom_groups = find_atom_groups(tokens);
-    if atom_groups.len() <= 1 {
-        return false; // Don't remove the only atom
-    }
-
-    // Try removing the last atom group + preceding bond
-    let &(start, end) = atom_groups.last().unwrap();
-
-    // Check if there's a preceding bond
-    let bond_start = if start > 0 && matches!(tokens[start - 1], SmartsToken::Bond(_)) {
-        start - 1
-    } else {
-        start
+fn random_bracket_expr<R: Rng>(rng: &mut R) -> BracketExpr {
+    let mut expr = BracketExpr {
+        tree: BracketExprTree::Primitive(random_atom_primitive(rng)),
+        atom_map: None,
     };
 
-    tokens.drain(bond_start..end);
-    prune_empty_branches(tokens);
-    let _ = rng; // used for selection in more complex cases
-    true
+    if rng.gen_bool(0.30) {
+        let _ = add_atom_primitive(&mut expr, random_atom_primitive(rng));
+    }
+
+    expr
 }
 
-fn prune_empty_branches(tokens: &mut Vec<SmartsToken>) {
-    let mut i = 0;
-    while i + 1 < tokens.len() {
-        if matches!(tokens[i], SmartsToken::BranchOpen)
-            && matches!(tokens[i + 1], SmartsToken::BranchClose)
-        {
-            tokens.drain(i..=i + 1);
-            i = i.saturating_sub(1);
+fn random_atom_primitive<R: Rng>(rng: &mut R) -> AtomPrimitive {
+    match rng.gen_range(0..11) {
+        0 => AtomPrimitive::Wildcard,
+        1 => AtomPrimitive::AliphaticAny,
+        2 => AtomPrimitive::AromaticAny,
+        3 => AtomPrimitive::AtomicNumber(random_atomic_number(rng)),
+        4 => AtomPrimitive::Degree(Some(NumericQuery::Exact(rng.gen_range(1..=4)))),
+        5 => AtomPrimitive::Connectivity(Some(NumericQuery::Exact(rng.gen_range(1..=4)))),
+        6 => AtomPrimitive::Hydrogen(
+            HydrogenKind::Total,
+            Some(NumericQuery::Exact(rng.gen_range(0..=3))),
+        ),
+        7 => AtomPrimitive::RingMembership(if rng.gen_bool(0.5) {
+            Some(NumericQuery::Exact(rng.gen_range(0..=3)))
         } else {
-            i += 1;
+            None
+        }),
+        8 => AtomPrimitive::RingSize(if rng.gen_bool(0.5) {
+            Some(NumericQuery::Exact(*[5, 6, 7].choose(rng).unwrap()))
+        } else {
+            None
+        }),
+        9 => AtomPrimitive::RingConnectivity(if rng.gen_bool(0.5) {
+            Some(NumericQuery::Exact(rng.gen_range(0..=3)))
+        } else {
+            None
+        }),
+        _ => AtomPrimitive::Charge(*[-1, 1, 2].choose(rng).unwrap()),
+    }
+}
+
+fn generalize_atom_primitive<R: Rng>(primitive: &AtomPrimitive, rng: &mut R) -> AtomPrimitive {
+    match primitive {
+        AtomPrimitive::AtomicNumber(_) => AtomPrimitive::Wildcard,
+        AtomPrimitive::Degree(Some(NumericQuery::Exact(value))) if *value > 1 => {
+            AtomPrimitive::Degree(Some(NumericQuery::Exact(value - 1)))
         }
+        AtomPrimitive::Connectivity(Some(NumericQuery::Exact(value))) if *value > 1 => {
+            AtomPrimitive::Connectivity(Some(NumericQuery::Exact(value - 1)))
+        }
+        AtomPrimitive::Hydrogen(kind, Some(NumericQuery::Exact(value))) if *value < 3 => {
+            AtomPrimitive::Hydrogen(*kind, Some(NumericQuery::Exact(value + 1)))
+        }
+        AtomPrimitive::RingMembership(Some(_)) => AtomPrimitive::RingMembership(None),
+        AtomPrimitive::RingSize(Some(_)) => AtomPrimitive::RingSize(None),
+        AtomPrimitive::RingConnectivity(Some(_)) => AtomPrimitive::RingConnectivity(None),
+        AtomPrimitive::Charge(_) => AtomPrimitive::Wildcard,
+        _ => random_atom_primitive(rng),
     }
 }
 
-/// Change a random bond type.
-fn change_bond<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
-    let bond_indices = find_bond_indices(tokens);
-    if bond_indices.is_empty() {
-        return false;
+fn specialize_atom_primitive<R: Rng>(primitive: &AtomPrimitive, rng: &mut R) -> AtomPrimitive {
+    match primitive {
+        AtomPrimitive::Wildcard | AtomPrimitive::AliphaticAny | AtomPrimitive::AromaticAny => {
+            AtomPrimitive::AtomicNumber(random_atomic_number(rng))
+        }
+        AtomPrimitive::RingMembership(None) => {
+            AtomPrimitive::RingMembership(Some(NumericQuery::Exact(rng.gen_range(1..=3))))
+        }
+        AtomPrimitive::RingSize(None) => {
+            AtomPrimitive::RingSize(Some(NumericQuery::Exact(*[5, 6, 7].choose(rng).unwrap())))
+        }
+        AtomPrimitive::RingConnectivity(None) => {
+            AtomPrimitive::RingConnectivity(Some(NumericQuery::Exact(rng.gen_range(1..=3))))
+        }
+        AtomPrimitive::Degree(Some(NumericQuery::Exact(value))) if *value < 4 => {
+            AtomPrimitive::Degree(Some(NumericQuery::Exact(value + 1)))
+        }
+        AtomPrimitive::Connectivity(Some(NumericQuery::Exact(value))) if *value < 4 => {
+            AtomPrimitive::Connectivity(Some(NumericQuery::Exact(value + 1)))
+        }
+        AtomPrimitive::Hydrogen(kind, Some(NumericQuery::Exact(value))) if *value > 0 => {
+            AtomPrimitive::Hydrogen(*kind, Some(NumericQuery::Exact(value - 1)))
+        }
+        _ => random_atom_primitive(rng),
     }
-    let &idx = bond_indices.choose(rng).unwrap();
-    tokens[idx] = SmartsToken::Bond(random_bond(rng));
-    true
 }
 
-/// Toggle NOT (`!`) on a random atom primitive inside a bracket.
-fn toggle_not<R: Rng>(tokens: &mut Vec<SmartsToken>, rng: &mut R) -> bool {
-    let atom_indices = find_bracket_atom_indices(tokens);
-    if atom_indices.is_empty() {
-        return false;
-    }
-    let &idx = atom_indices.choose(rng).unwrap();
-
-    // Check if preceded by NOT
-    if idx > 0 && matches!(tokens[idx - 1], SmartsToken::Logic(LogicOp::Not)) {
-        // Remove the NOT
-        tokens.remove(idx - 1);
+fn random_bond_expr<R: Rng>(rng: &mut R) -> BondExpr {
+    if rng.gen_bool(0.20) {
+        BondExpr::Elided
     } else {
-        // Insert NOT before the primitive
-        tokens.insert(idx, SmartsToken::Logic(LogicOp::Not));
+        BondExpr::Query(BondExprTree::Primitive(random_bond_primitive(rng)))
     }
-    let _ = rng;
-    true
+}
+
+fn random_bond_primitive<R: Rng>(rng: &mut R) -> BondPrimitive {
+    match rng.gen_range(0..6) {
+        0 => BondPrimitive::Bond(Bond::Single),
+        1 => BondPrimitive::Bond(Bond::Double),
+        2 => BondPrimitive::Bond(Bond::Triple),
+        3 => BondPrimitive::Bond(Bond::Aromatic),
+        4 => BondPrimitive::Any,
+        _ => BondPrimitive::Ring,
+    }
+}
+
+fn random_atomic_number<R: Rng>(rng: &mut R) -> u16 {
+    *COMMON_ATOMIC_NUMBERS.choose(rng).unwrap()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
-    use crate::genome::display::tokens_to_smarts;
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
 
@@ -376,7 +458,7 @@ mod tests {
         ];
 
         let mut rng = SmallRng::seed_from_u64(42);
-        let mutator = SmartsMutation::new(1.0); // Always mutate for testing
+        let mutator = SmartsMutation::new(1.0);
 
         let mut valid = 0;
         let total = 1000;
@@ -385,7 +467,7 @@ mod tests {
             let seed = seeds[i % seeds.len()];
             let genome = SmartsGenome::from_smarts(seed).unwrap();
             let mutated = mutator.mutate(genome, &mut rng);
-            if mutated.is_valid_matcher() {
+            if mutated.is_valid() {
                 valid += 1;
             }
         }
@@ -398,11 +480,102 @@ mod tests {
     }
 
     #[test]
-    fn remove_atom_prunes_empty_branch() {
+    fn mutation_name_and_zero_rate_leave_genome_unchanged() {
+        let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
         let mut rng = SmallRng::seed_from_u64(7);
-        let mut tokens = SmartsGenome::from_smarts("[#6](~[#7])").unwrap().tokens;
-        assert!(remove_atom(&mut tokens, &mut rng));
-        assert_eq!(tokens_to_smarts(&tokens), "[#6]");
+        let mutator = SmartsMutation::new(0.0);
+
+        assert_eq!(SmartsMutation::name(), "SmartsMutation");
+        assert_eq!(mutator.mutate(genome.clone(), &mut rng), genome);
+    }
+
+    #[test]
+    fn genome_from_query_rejects_overly_complex_queries() {
+        let over_limit = std::iter::repeat_n("[#6]", MAX_SMARTS_COMPLEXITY + 1)
+            .collect::<Vec<_>>()
+            .join("~");
+        let query = QueryMol::from_str(&over_limit).unwrap();
+
+        assert!(genome_from_query(&query).is_none());
+    }
+
+    #[test]
+    fn editable_remove_leaf_collapses_single_branch() {
+        let query = QueryMol::from_str("[#6](~[#7])").unwrap();
+        let leaf = query
+            .leaf_atoms()
+            .into_iter()
+            .find(|&atom_id| atom_id != 0)
+            .unwrap();
+        let mut editable = query.edit();
+        editable.remove_leaf_atom(leaf).unwrap();
+        let collapsed = editable.into_query_mol().unwrap();
+
+        assert_eq!(collapsed.to_string(), "[#6]");
+    }
+
+    #[test]
+    fn mutation_helpers_handle_non_bracket_and_missing_structure_cases() {
+        let query = QueryMol::from_str("C").unwrap();
+
+        let mut editable = query.edit();
+        assert!(mutate_atom_constraints(
+            &mut editable,
+            &mut SmallRng::seed_from_u64(3)
+        ));
+
+        let mut editable = query.edit();
+        assert!(generalize_specialize_atom(
+            &mut editable,
+            &mut SmallRng::seed_from_u64(4)
+        ));
+
+        let mut editable = query.edit();
+        assert!(!change_bond_expr(
+            &mut editable,
+            &mut SmallRng::seed_from_u64(5)
+        ));
+
+        let mut editable = query.edit();
+        assert!(!remove_leaf_atom(
+            &mut editable,
+            &mut SmallRng::seed_from_u64(6)
+        ));
+
+        let mut editable = query.edit();
+        assert!(!toggle_atom_not(
+            &mut editable,
+            &mut SmallRng::seed_from_u64(7)
+        ));
+
+        let mut editable = query.edit();
+        assert!(!graft_seed_fragment(
+            &mut editable,
+            &[],
+            &mut SmallRng::seed_from_u64(8)
+        ));
+    }
+
+    #[test]
+    fn specialize_atom_primitive_covers_ring_specific_cases() {
+        let mut rng = SmallRng::seed_from_u64(9);
+
+        assert!(matches!(
+            specialize_atom_primitive(&AtomPrimitive::Wildcard, &mut rng),
+            AtomPrimitive::AtomicNumber(_)
+        ));
+        assert!(matches!(
+            specialize_atom_primitive(&AtomPrimitive::RingMembership(None), &mut rng),
+            AtomPrimitive::RingMembership(Some(_))
+        ));
+        assert!(matches!(
+            specialize_atom_primitive(&AtomPrimitive::RingSize(None), &mut rng),
+            AtomPrimitive::RingSize(Some(_))
+        ));
+        assert!(matches!(
+            specialize_atom_primitive(&AtomPrimitive::RingConnectivity(None), &mut rng),
+            AtomPrimitive::RingConnectivity(Some(_))
+        ));
     }
 
     #[test]
@@ -419,7 +592,7 @@ mod tests {
         let mut observed_reset = false;
         for _ in 0..256 {
             let mutated = mutator.mutate(SmartsGenome::from_smarts("[#8]").unwrap(), &mut rng);
-            if mutated.smarts_string == "[#6]" || mutated.smarts_string == "[#7]" {
+            if mutated.smarts() == "[#6]" || mutated.smarts() == "[#7]" {
                 observed_reset = true;
                 break;
             }
@@ -437,9 +610,9 @@ mod tests {
         let mut observed_large_change = false;
         for _ in 0..128 {
             let mutated = mutator.mutate(genome.clone(), &mut rng);
-            if mutated.is_valid_matcher()
-                && mutated.smarts_string != genome.smarts_string
-                && mutated.tokens.len().abs_diff(genome.tokens.len()) >= 2
+            if mutated.is_valid()
+                && mutated.smarts() != genome.smarts()
+                && mutated.complexity().abs_diff(genome.complexity()) >= 2
             {
                 observed_large_change = true;
                 break;
