@@ -28,3 +28,5 @@ target
 *.jsonl
 *.jsonl.zst
 reports/
+apps/web/dist/
+apps/web/public/generated/
