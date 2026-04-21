@@ -1,88 +1,92 @@
 # smarts-evolution
 
-`smarts-evolution` is a Rust library for evolving SMARTS queries against a binary task.
+`smarts-evolution` is a Rust library for evolving one SMARTS query against one
+binary task.
 
-It is only the search engine. Data loading, label systems, taxonomy traversal, fold construction, experiment orchestration, and reporting belong in downstream code.
+This crate is only the search engine. Dataset loading, label systems, fold
+construction, experiment orchestration, and reporting belong in downstream
+code.
 
-## What You Use It For
+## Scope
 
 Use this crate when you already have:
 
-- a binary problem such as `class A` vs `everything else`
-- molecules prepared as `PreparedTarget`
-- one or more evaluation folds
-- a seed corpus, positive SMILES, or both
+- prepared molecules as `PreparedTarget`
+- one or more labeled evaluation folds
+- a binary objective such as `class A` vs `everything else`
+- a SMARTS seed corpus, or willingness to start from built-in seeds
 
-The crate then searches for a SMARTS query that scores well on those folds.
+What the crate does:
 
-## What The Library Does
-
-- evolves SMARTS with aggressive mutation and crossover
-- seeds the population from a real corpus instead of only random generation
+- evolves SMARTS with mutation and crossover
+- seeds the population from a corpus plus built-in fragments
 - scores candidates with fold-averaged MCC
-- penalizes slow SMARTS so cheap queries are preferred over equally accurate expensive ones
-- returns the best SMARTS found for one task
+- penalizes slower SMARTS when MCC is otherwise similar
 
-## What It Does Not Do
+What the crate does not do:
 
 - read datasets
 - build folds for you
-- know about NPClassifier, ClassyFire, or any other label system
-- traverse DAGs or taxonomies
+- know about any taxonomy or label hierarchy
 - run experiment batches
 - generate reports
 
-## Main Entry Point
+## Quick Start
 
 ```rust
-pub fn evolve_task(
-    task: &EvolutionTask,
-    config: &EvolutionConfig,
-    seed_corpus: &SeedCorpus,
-) -> Result<TaskResult, Box<dyn std::error::Error>>
+use std::str::FromStr;
+
+use smiles_parser::Smiles;
+use smarts_evolution::{
+    EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, evolve_task,
+};
+use smarts_validator::PreparedTarget;
+
+fn prepared(smiles: &str) -> PreparedTarget {
+    PreparedTarget::new(Smiles::from_str(smiles).unwrap())
+}
+
+let task = EvolutionTask::new(
+    "amide-vs-rest",
+    vec![FoldData::new(vec![
+        FoldSample::positive(prepared("CC(=O)N")),
+        FoldSample::positive(prepared("NC(=O)C")),
+        FoldSample::negative(prepared("CCO")),
+        FoldSample::negative(prepared("c1ccccc1")),
+    ])],
+);
+
+let config = EvolutionConfig::builder()
+    .population_size(8)
+    .generation_limit(2)
+    .stagnation_limit(2)
+    .build()?;
+
+let seed_corpus = SeedCorpus::from_smarts(vec![
+    "[#6](=[#8])[#7]".to_string(),
+    "[#6]~[#7]".to_string(),
+])?;
+
+let result = evolve_task(&task, &config, &seed_corpus)?;
+assert!(!result.best_smarts().is_empty());
+assert!(result.best_mcc().is_finite());
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-You pass in:
+The main entry point is:
 
-- `EvolutionTask`
-- `EvolutionConfig`
-- `SeedCorpus`
+- `evolve_task(task, config, seed_corpus)`
 
-`EvolutionTask` contains:
-
-- `task_id`
-- `positive_smiles`
-- `folds: Vec<FoldData>`
-
-Each `FoldData` contains:
-
-- `targets: Vec<PreparedTarget>`
-- `is_positive: Vec<bool>`
-
-The result contains:
-
-- `best_smarts`
-- `best_mcc`
-- `best_eval_time`
-- `best_score`
-- `generations`
-
-## Scoring
-
-The objective is:
-
-- higher fold-averaged MCC is better
-- slower compile and match time is worse
-
-This keeps the search from drifting toward bloated SMARTS that only win by being expensive.
+You provide prepared labeled folds and a seed corpus. The result contains the
+best SMARTS found, its MCC, its evaluation time, and the number of generations
+run.
 
 ## Seeding
 
-The initial population is mixed from several sources:
+The initial population is mixed from:
 
-- a curated SMARTS seed corpus
-- fragments derived from positive-example SMILES
-- small hand-written primitive patterns
+- a curated `SeedCorpus`
+- built-in SMARTS fragments
 - random genomes
 
 `SeedCorpus` supports:
@@ -92,7 +96,7 @@ The initial population is mixed from several sources:
 - `insert_smarts(...)`
 - `extend_from_smarts(...)`
 
-When the `std-io` feature is enabled, it also supports:
+With the default `std-io` feature, it also supports:
 
 - `SeedCorpus::from_file(...)`
 
@@ -102,51 +106,15 @@ File-backed corpora are plain text:
 - blank lines ignored
 - lines starting with `#` ignored
 
-In-memory corpora can be built directly from `Vec<String>`.
+## Objective
 
-## Minimal Example
+The search objective is:
 
-```rust
-use std::str::FromStr;
+- maximize fold-averaged MCC
+- prefer lower compile-and-match time as a tiebreaking pressure
 
-use smiles_parser::Smiles;
-use smarts_evolution::evolution::config::EvolutionConfig;
-use smarts_evolution::evolution::runner::{EvolutionTask, evolve_task};
-use smarts_evolution::fitness::evaluator::FoldData;
-use smarts_evolution::genome::seed::SeedCorpus;
-use smarts_validator::PreparedTarget;
-
-fn prepared(smiles: &str) -> PreparedTarget {
-    PreparedTarget::new(Smiles::from_str(smiles).unwrap())
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let task = EvolutionTask {
-        task_id: "amide-vs-rest".to_string(),
-        positive_smiles: vec!["CC(=O)N".to_string(), "NC(=O)C".to_string()],
-        folds: vec![FoldData {
-            targets: vec![
-                prepared("CC(=O)N"),
-                prepared("NC(=O)C"),
-                prepared("CCO"),
-                prepared("c1ccccc1"),
-            ],
-            is_positive: vec![true, true, false, false],
-        }],
-    };
-
-    let seed_corpus = SeedCorpus::from_smarts(vec![
-        "[#6](=[#8])[#7]".to_string(),
-        "[#6]~[#7]".to_string(),
-    ])?;
-
-    let result = evolve_task(&task, &EvolutionConfig::default(), &seed_corpus)?;
-
-    println!("{}", result.best_smarts);
-    println!("{}", result.best_mcc);
-    Ok(())
-}
-```
+That keeps the search from drifting toward bloated SMARTS that are only
+competitive because they are expensive.
 
 ## Add To `Cargo.toml`
 
@@ -163,23 +131,16 @@ smarts-validator = { git = "https://github.com/earth-metabolome-initiative/smart
 
 - `std-io`
   Enabled by default. Adds `SeedCorpus::from_file(...)`.
-- `wasm`
-  Enables `genevo`'s `wasm-bindgen` support for `wasm32` targets.
 
-For wasm builds, use:
+For wasm builds:
 
 ```bash
-cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
+cargo check --target wasm32-unknown-unknown --no-default-features
 ```
 
-## Build
+## Build And Test
 
 ```bash
 cargo build
-```
-
-## Test
-
-```bash
 cargo test
 ```
