@@ -1,0 +1,11 @@
+[application]
+name = "smarts-evolution-web"
+default_platform = "web"
+out_dir = "dist"
+
+[web.app]
+title = "SMARTS Evolution"
+base_path = "/"
+
+[web.watcher]
+watch_path = ["src", "public/style.css", "public/favicon.svg"]
