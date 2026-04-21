@@ -48,37 +48,3 @@ let result = evolve_task(&task, &config, &seed_corpus).unwrap();
 assert!(!result.best_smarts().is_empty());
 assert!(result.best_mcc().is_finite());
 ```
-
-## Search Objective
-
-1. maximize fold-averaged MCC
-2. if MCC ties, prefer shorter SMARTS
-3. if both still tie, use lexical order for determinism
-
-## Seed Corpus
-
-`SeedCorpus` supports:
-
-- `SeedCorpus::builtin()`
-- `SeedCorpus::from_smarts(Vec<String>)`
-- `insert_smarts(...)`
-- `extend_from_smarts(...)`
-
-## no_std
-
-```bash
-cargo check --target wasm32-unknown-unknown
-```
-
-## Development
-
-```bash
-cargo fmt
-cargo clippy --all-targets --all-features
-cargo test
-cargo bench --bench evolution -- --noplot
-```
-
-## License
-
-[MIT](LICENSE)
