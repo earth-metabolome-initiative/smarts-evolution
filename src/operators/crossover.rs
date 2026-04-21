@@ -1,5 +1,6 @@
-use genevo::genetic::{Children, Parents};
-use genevo::operator::{CrossoverOp, GeneticOperator};
+use alloc::vec;
+use alloc::vec::Vec;
+
 use rand::Rng;
 use rand::seq::SliceRandom;
 use smarts_parser::QueryMol;
@@ -14,23 +15,46 @@ use crate::genome::limits::MAX_CROSSOVER_CHILD_COMPLEXITY;
 /// parent with a subtree cloned from the other parent.
 #[derive(Clone, Debug)]
 pub struct SmartsCrossover {
-    pub crossover_rate: f64,
+    crossover_rate: f64,
 }
 
 impl SmartsCrossover {
     pub fn new(crossover_rate: f64) -> Self {
         Self { crossover_rate }
     }
-}
 
-impl GeneticOperator for SmartsCrossover {
-    fn name() -> String {
-        "SmartsCrossover".to_string()
+    pub fn crossover_pair<R>(
+        &self,
+        parent_a: &SmartsGenome,
+        parent_b: &SmartsGenome,
+        rng: &mut R,
+    ) -> (SmartsGenome, SmartsGenome)
+    where
+        R: Rng + Sized,
+    {
+        if !rng.gen_bool(self.crossover_rate) {
+            return (parent_a.clone(), parent_b.clone());
+        }
+
+        let query_a = parent_a.query();
+        let query_b = parent_b.query();
+
+        let Some((anchor_a, child_a, subtree_a)) = choose_subtree_cut(query_a, rng) else {
+            return (parent_a.clone(), parent_b.clone());
+        };
+        let Some((anchor_b, child_b, subtree_b)) = choose_subtree_cut(query_b, rng) else {
+            return (parent_a.clone(), parent_b.clone());
+        };
+
+        let c1 = build_spliced_child(query_a, anchor_a, child_a, query_b, child_b, &subtree_b)
+            .unwrap_or_else(|| parent_a.clone());
+        let c2 = build_spliced_child(query_b, anchor_b, child_b, query_a, child_a, &subtree_a)
+            .unwrap_or_else(|| parent_b.clone());
+
+        (c1, c2)
     }
-}
 
-impl CrossoverOp<SmartsGenome> for SmartsCrossover {
-    fn crossover<R>(&self, parents: Parents<SmartsGenome>, rng: &mut R) -> Children<SmartsGenome>
+    pub fn crossover<R>(&self, parents: Vec<SmartsGenome>, rng: &mut R) -> Vec<SmartsGenome>
     where
         R: Rng + Sized,
     {
@@ -40,27 +64,8 @@ impl CrossoverOp<SmartsGenome> for SmartsCrossover {
 
         let parent_a = &parents[0];
         let parent_b = &parents[1];
-
-        if !rng.gen_bool(self.crossover_rate) {
-            return vec![parent_a.clone(), parent_b.clone()];
-        }
-
-        let query_a = parent_a.query();
-        let query_b = parent_b.query();
-
-        let Some((anchor_a, child_a, subtree_a)) = choose_subtree_cut(query_a, rng) else {
-            return vec![parent_a.clone(), parent_b.clone()];
-        };
-        let Some((anchor_b, child_b, subtree_b)) = choose_subtree_cut(query_b, rng) else {
-            return vec![parent_a.clone(), parent_b.clone()];
-        };
-
-        let c1 = build_spliced_child(query_a, anchor_a, child_a, query_b, child_b, &subtree_b)
-            .unwrap_or_else(|| parent_a.clone());
-        let c2 = build_spliced_child(query_b, anchor_b, child_b, query_a, child_a, &subtree_a)
-            .unwrap_or_else(|| parent_b.clone());
-
-        vec![c1, c2]
+        let (child_a, child_b) = self.crossover_pair(parent_a, parent_b, rng);
+        vec![child_a, child_b]
     }
 }
 
@@ -146,13 +151,12 @@ mod tests {
     }
 
     #[test]
-    fn crossover_name_and_disabled_rate_preserve_parents() {
+    fn disabled_crossover_preserves_parents() {
         let parent_a = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
         let parent_b = SmartsGenome::from_smarts("[#8]~[#6]").unwrap();
         let mut rng = SmallRng::seed_from_u64(5);
         let crossover = SmartsCrossover::new(0.0);
 
-        assert_eq!(SmartsCrossover::name(), "SmartsCrossover");
         assert_eq!(
             crossover.crossover(vec![parent_a.clone(), parent_b.clone()], &mut rng),
             vec![parent_a, parent_b]

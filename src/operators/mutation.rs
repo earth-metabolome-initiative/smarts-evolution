@@ -1,4 +1,6 @@
-use genevo::operator::{GeneticOperator, MutationOp};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use rand::Rng;
 use rand::seq::{IteratorRandom, SliceRandom};
 use smarts_parser::{
@@ -19,7 +21,7 @@ const COMMON_ATOMIC_NUMBERS: &[u16] = &[6, 7, 8, 9, 15, 16, 17, 35, 53];
 /// surface and returns a fresh parsed genome after each successful edit.
 #[derive(Clone, Debug)]
 pub struct SmartsMutation {
-    pub mutation_rate: f64,
+    mutation_rate: f64,
     reset_pool: Vec<SmartsGenome>,
     reset_probability: f64,
     max_mutation_steps: usize,
@@ -46,16 +48,8 @@ impl SmartsMutation {
             attempt_budget: 24,
         }
     }
-}
 
-impl GeneticOperator for SmartsMutation {
-    fn name() -> String {
-        "SmartsMutation".to_string()
-    }
-}
-
-impl MutationOp<SmartsGenome> for SmartsMutation {
-    fn mutate<R>(&self, genome: SmartsGenome, rng: &mut R) -> SmartsGenome
+    pub fn mutate<R>(&self, genome: SmartsGenome, rng: &mut R) -> SmartsGenome
     where
         R: Rng + Sized,
     {
@@ -442,6 +436,8 @@ fn random_atomic_number<R: Rng>(rng: &mut R) -> u16 {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::string::ToString;
+    use std::vec;
 
     use super::*;
     use rand::SeedableRng;
@@ -480,12 +476,11 @@ mod tests {
     }
 
     #[test]
-    fn mutation_name_and_zero_rate_leave_genome_unchanged() {
+    fn zero_rate_mutation_leaves_genome_unchanged() {
         let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
         let mut rng = SmallRng::seed_from_u64(7);
         let mutator = SmartsMutation::new(0.0);
 
-        assert_eq!(SmartsMutation::name(), "SmartsMutation");
         assert_eq!(mutator.mutate(genome.clone(), &mut rng), genome);
     }
 

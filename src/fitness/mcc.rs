@@ -1,18 +1,31 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConfusionCounts {
-    pub tp: u64,
-    pub fp: u64,
-    pub tn: u64,
-    pub fn_: u64,
+    tp: u64,
+    fp: u64,
+    tn: u64,
+    fn_: u64,
 }
 
 impl ConfusionCounts {
+    pub fn new(tp: u64, fp: u64, tn: u64, fn_: u64) -> Self {
+        Self { tp, fp, tn, fn_ }
+    }
+
     pub fn total(self) -> u64 {
         self.tp + self.fp + self.tn + self.fn_
     }
+
+    pub fn record_match(&mut self, matched: bool, is_positive: bool) {
+        match (matched, is_positive) {
+            (true, true) => self.tp += 1,
+            (true, false) => self.fp += 1,
+            (false, true) => self.fn_ += 1,
+            (false, false) => self.tn += 1,
+        }
+    }
 }
 
-impl std::ops::AddAssign for ConfusionCounts {
+impl core::ops::AddAssign for ConfusionCounts {
     fn add_assign(&mut self, rhs: Self) {
         self.tp += rhs.tp;
         self.fp += rhs.fp;
@@ -98,37 +111,14 @@ mod tests {
 
     #[test]
     fn confusion_counts_add_assign_and_fold_average_skip_empty_folds() {
-        let mut total = ConfusionCounts {
-            tp: 1,
-            fp: 2,
-            tn: 3,
-            fn_: 4,
-        };
-        total += ConfusionCounts {
-            tp: 5,
-            fp: 6,
-            tn: 7,
-            fn_: 8,
-        };
+        let mut total = ConfusionCounts::new(1, 2, 3, 4);
+        total += ConfusionCounts::new(5, 6, 7, 8);
 
-        assert_eq!(
-            total,
-            ConfusionCounts {
-                tp: 6,
-                fp: 8,
-                tn: 10,
-                fn_: 12,
-            }
-        );
+        assert_eq!(total, ConfusionCounts::new(6, 8, 10, 12));
 
         let mcc = compute_fold_averaged_mcc(&[
             ConfusionCounts::default(),
-            ConfusionCounts {
-                tp: 5,
-                fp: 1,
-                tn: 7,
-                fn_: 1,
-            },
+            ConfusionCounts::new(5, 1, 7, 1),
         ]);
         let expected = compute_mcc_from_counts(5, 1, 7, 1);
         assert!((mcc - expected).abs() < 1e-12);

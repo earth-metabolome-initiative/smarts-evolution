@@ -3,22 +3,26 @@ name = "smarts-evolution"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = ["std-io"]
-std-io = []
-
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 
 [dependencies]
-genevo = "0.7"
 smarts-parser = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-parser" }
 smarts-validator = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-validator" }
 smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main" }
-rand = "0.8"
-log = "0.4"
+rand = { version = "0.8", default-features = false, features = ["alloc", "small_rng"] }
+getrandom = { version = "0.2.17", features = ["js"] }
+log = { version = "0.4", default-features = false }
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "evolution"
+harness = false
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

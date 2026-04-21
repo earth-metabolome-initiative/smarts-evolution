@@ -1,6 +1,8 @@
-use genevo::genetic::Genotype;
+use alloc::rc::Rc;
+use alloc::string::{String, ToString};
+use core::fmt;
+use core::str::FromStr;
 use smarts_parser::QueryMol;
-use std::str::FromStr;
 
 use super::limits::MAX_SMARTS_COMPLEXITY;
 
@@ -10,7 +12,7 @@ use super::limits::MAX_SMARTS_COMPLEXITY;
 #[derive(Clone, Debug)]
 pub struct SmartsGenome {
     query: QueryMol,
-    smarts_string: String,
+    smarts_string: Rc<str>,
     complexity: usize,
 }
 
@@ -37,7 +39,7 @@ impl SmartsGenome {
     }
 
     fn from_query(query: QueryMol) -> Self {
-        let smarts_string = query.to_string();
+        let smarts_string: Rc<str> = query.to_string().into();
         Self {
             complexity: query.atom_count() + query.bonds().len(),
             query,
@@ -47,8 +49,8 @@ impl SmartsGenome {
 
     /// Returns one cheap structural size metric.
     ///
-    /// This is intentionally coarse. It is used only for search tie-breaking
-    /// and size limits, not as a canonical measure of SMARTS semantics.
+    /// This is intentionally coarse. It is used for size limits and progress
+    /// reporting, not as a canonical measure of SMARTS semantics.
     #[inline]
     pub fn complexity(&self) -> usize {
         self.complexity
@@ -61,6 +63,11 @@ impl SmartsGenome {
 
     #[inline]
     pub fn smarts(&self) -> &str {
+        &self.smarts_string
+    }
+
+    #[inline]
+    pub(crate) fn smarts_shared(&self) -> &Rc<str> {
         &self.smarts_string
     }
 
@@ -77,12 +84,8 @@ impl PartialEq for SmartsGenome {
     }
 }
 
-impl Genotype for SmartsGenome {
-    type Dna = char;
-}
-
-impl std::fmt::Display for SmartsGenome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SmartsGenome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.smarts_string)
     }
 }
@@ -90,6 +93,7 @@ impl std::fmt::Display for SmartsGenome {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::vec::Vec;
 
     use super::*;
 

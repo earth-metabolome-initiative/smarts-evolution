@@ -1,3 +1,5 @@
+use alloc::string::String;
+
 const DEFAULT_POPULATION_SIZE: usize = 200;
 const DEFAULT_GENERATION_LIMIT: u64 = 500;
 const DEFAULT_MUTATION_RATE: f64 = 0.85;
@@ -7,6 +9,7 @@ const DEFAULT_TOURNAMENT_SIZE: usize = 3;
 const DEFAULT_ELITE_COUNT: usize = 4;
 const DEFAULT_RANDOM_IMMIGRANT_RATIO: f64 = 0.10;
 const DEFAULT_STAGNATION_LIMIT: u64 = 50;
+const DEFAULT_FITNESS_CACHE_CAPACITY: usize = 100_000;
 
 /// Configuration for the evolutionary algorithm.
 #[derive(Clone, Debug)]
@@ -20,6 +23,8 @@ pub struct EvolutionConfig {
     elite_count: usize,
     random_immigrant_ratio: f64,
     stagnation_limit: u64,
+    rng_seed: Option<u64>,
+    fitness_cache_capacity: usize,
 }
 
 /// Fluent builder for [`EvolutionConfig`].
@@ -34,6 +39,8 @@ pub struct EvolutionConfigBuilder {
     elite_count: usize,
     random_immigrant_ratio: f64,
     stagnation_limit: u64,
+    rng_seed: Option<u64>,
+    fitness_cache_capacity: usize,
 }
 
 impl Default for EvolutionConfig {
@@ -54,6 +61,8 @@ impl Default for EvolutionConfigBuilder {
             elite_count: DEFAULT_ELITE_COUNT,
             random_immigrant_ratio: DEFAULT_RANDOM_IMMIGRANT_RATIO,
             stagnation_limit: DEFAULT_STAGNATION_LIMIT,
+            rng_seed: None,
+            fitness_cache_capacity: DEFAULT_FITNESS_CACHE_CAPACITY,
         }
     }
 }
@@ -147,6 +156,14 @@ impl EvolutionConfig {
     pub fn stagnation_limit(&self) -> u64 {
         self.stagnation_limit
     }
+
+    pub fn rng_seed(&self) -> Option<u64> {
+        self.rng_seed
+    }
+
+    pub fn fitness_cache_capacity(&self) -> usize {
+        self.fitness_cache_capacity
+    }
 }
 
 impl EvolutionConfigBuilder {
@@ -195,6 +212,16 @@ impl EvolutionConfigBuilder {
         self
     }
 
+    pub fn rng_seed(mut self, rng_seed: u64) -> Self {
+        self.rng_seed = Some(rng_seed);
+        self
+    }
+
+    pub fn fitness_cache_capacity(mut self, fitness_cache_capacity: usize) -> Self {
+        self.fitness_cache_capacity = fitness_cache_capacity;
+        self
+    }
+
     pub fn build(self) -> Result<EvolutionConfig, String> {
         let config = self.finish();
         config.validate()?;
@@ -212,6 +239,8 @@ impl EvolutionConfigBuilder {
             elite_count: self.elite_count,
             random_immigrant_ratio: self.random_immigrant_ratio,
             stagnation_limit: self.stagnation_limit,
+            rng_seed: self.rng_seed,
+            fitness_cache_capacity: self.fitness_cache_capacity,
         }
     }
 }
@@ -288,5 +317,17 @@ mod tests {
         for (config, expected) in invalid_cases {
             assert_eq!(config.unwrap_err(), expected);
         }
+    }
+
+    #[test]
+    fn builder_round_trips_seed_and_cache_capacity() {
+        let config = EvolutionConfig::builder()
+            .rng_seed(7)
+            .fitness_cache_capacity(1234)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.rng_seed(), Some(7));
+        assert_eq!(config.fitness_cache_capacity(), 1234);
     }
 }

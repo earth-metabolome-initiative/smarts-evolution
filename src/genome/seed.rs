@@ -1,11 +1,7 @@
-#[cfg(feature = "std-io")]
-use std::fs::File;
-#[cfg(feature = "std-io")]
-use std::io::{BufRead, BufReader};
-#[cfg(feature = "std-io")]
-use std::path::Path;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
-use genevo::population::GenomeBuilder;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
@@ -72,8 +68,7 @@ const BUILTIN_SEED_SMARTS: &[&str] = &[
 /// A curated corpus of known-reasonable SMARTS seeds.
 ///
 /// This is a first-class fuzzing-style seed corpus, not just an incidental
-/// hardcoded fallback list. The corpus can be built from shipped expert seeds,
-/// user-provided files, prior evolved SMARTS, or any mixture of those sources.
+/// hardcoded fallback list.
 #[derive(Clone, Debug, Default)]
 pub struct SeedCorpus {
     seeds: Vec<SmartsGenome>,
@@ -110,32 +105,6 @@ impl SeedCorpus {
     pub fn from_smarts(smarts: Vec<String>) -> Result<Self, String> {
         let mut corpus = Self::default();
         corpus.extend_from_smarts(smarts)?;
-        Ok(corpus)
-    }
-
-    #[cfg(feature = "std-io")]
-    /// Build a corpus from a plain-text file containing one SMARTS per line.
-    pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut corpus = Self::default();
-
-        for (line_idx, line) in reader.lines().enumerate() {
-            let raw_line = line?;
-            let smarts = raw_line.trim();
-            if smarts.is_empty() || smarts.starts_with('#') {
-                continue;
-            }
-
-            corpus.insert_smarts(smarts).map_err(|error| {
-                format!(
-                    "invalid SMARTS seed at {}:{}: {error}",
-                    path.display(),
-                    line_idx + 1
-                )
-            })?;
-        }
-
         Ok(corpus)
     }
 
@@ -204,11 +173,6 @@ impl SeedCorpus {
 }
 
 /// Builds initial SMARTS genomes for a population.
-///
-/// Uses three strategies:
-/// - seed corpus: built-in, file-backed, or caller-provided SMARTS
-/// - simple built-in seeds: small hand-written SMARTS fragments
-/// - random seeds: randomly assemble small SMARTS patterns
 pub struct SmartsGenomeBuilder {
     /// Curated and/or user-provided SMARTS corpus.
     seed_corpus: SeedCorpus,
@@ -219,13 +183,7 @@ impl SmartsGenomeBuilder {
         Self { seed_corpus }
     }
 
-    pub fn seed_corpus(&self) -> &SeedCorpus {
-        &self.seed_corpus
-    }
-}
-
-impl GenomeBuilder<SmartsGenome> for SmartsGenomeBuilder {
-    fn build_genome<R>(&self, index: usize, rng: &mut R) -> SmartsGenome
+    pub fn build_genome<R>(&self, index: usize, rng: &mut R) -> SmartsGenome
     where
         R: Rng + Sized,
     {
@@ -284,8 +242,7 @@ fn random_seed_bond<R: Rng>(rng: &mut R) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    #[cfg(feature = "std-io")]
-    use std::io::Write;
+    use std::vec;
 
     use super::*;
     use crate::genome::limits::MAX_SMARTS_COMPLEXITY;
@@ -358,56 +315,6 @@ mod tests {
         assert_eq!(inserted, 1);
         assert_eq!(corpus.len(), 2);
         assert!(corpus.sample(&mut SmallRng::seed_from_u64(12)).is_some());
-    }
-
-    #[cfg(feature = "std-io")]
-    #[test]
-    fn seed_corpus_file_ignores_comments_and_deduplicates() {
-        let path = std::env::temp_dir().join(format!(
-            "smarts-seed-corpus-{}-{}.sma",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, "# comment").unwrap();
-        writeln!(file).unwrap();
-        writeln!(file, "[#6]").unwrap();
-        writeln!(file, "[#7]").unwrap();
-        writeln!(file, "[#6]").unwrap();
-        drop(file);
-
-        let corpus = SeedCorpus::from_file(&path).unwrap();
-        let smarts: HashSet<_> = corpus
-            .entries()
-            .iter()
-            .map(|genome| genome.smarts())
-            .collect();
-
-        assert_eq!(corpus.len(), 2);
-        assert!(smarts.contains("[#6]"));
-        assert!(smarts.contains("[#7]"));
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(feature = "std-io")]
-    #[test]
-    fn seed_corpus_file_reports_invalid_line_numbers() {
-        let path = std::env::temp_dir().join(format!(
-            "smarts-seed-corpus-invalid-{}-{}.sma",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, "[#6]").unwrap();
-        writeln!(file, "not smarts").unwrap();
-        drop(file);
-
-        let error = SeedCorpus::from_file(&path).unwrap_err().to_string();
-        assert!(error.contains(&path.display().to_string()));
-        assert!(error.contains(":2:"));
-
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -1,6 +1,6 @@
-use std::time::Instant;
+use alloc::vec::Vec;
+use core::fmt;
 
-use genevo::genetic::{Fitness, FitnessFunction};
 use smarts_validator::{CompiledQuery, PreparedTarget, matches_compiled};
 
 use super::mcc::{ConfusionCounts, compute_fold_averaged_mcc};
@@ -66,14 +66,14 @@ impl FoldData {
     }
 }
 
-/// Evaluates SMARTS genomes using fold-averaged MCC with a runtime penalty.
+/// Evaluates SMARTS genomes using fold-averaged MCC.
 #[derive(Clone)]
 pub struct SmartsEvaluator {
     folds: Vec<FoldData>,
 }
 
-impl std::fmt::Debug for SmartsEvaluator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SmartsEvaluator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SmartsEvaluator")
             .field("num_folds", &self.folds.len())
             .finish()
@@ -91,53 +91,29 @@ impl SmartsEvaluator {
         query: &smarts_parser::QueryMol,
     ) -> Option<Vec<ConfusionCounts>> {
         let compiled = CompiledQuery::new(query.clone()).ok()?;
-        let mut fold_counts = Vec::with_capacity(self.folds.len());
-        for fold in &self.folds {
-            fold_counts.push(count_matches_in_fold(&compiled, fold));
-        }
-        Some(fold_counts)
+        Some(self.fold_counts_for_compiled(&compiled))
     }
 
-    /// Evaluate the combined MCC + runtime objective for a genome.
+    // Keep fold aggregation localized so future evaluator changes stay local.
+    fn fold_counts_for_compiled(&self, compiled: &CompiledQuery) -> Vec<ConfusionCounts> {
+        self.folds
+            .iter()
+            .map(|fold| count_matches_in_fold(compiled, fold))
+            .collect()
+    }
+
+    /// Evaluate the MCC objective for a genome.
     pub fn objective_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
-        let started_at = Instant::now();
         let Some(fold_counts) = self.fold_counts_for_query(genome.query()) else {
-            return ObjectiveFitness::invalid(started_at.elapsed());
+            return ObjectiveFitness::invalid();
         };
 
         let mcc = compute_fold_averaged_mcc(&fold_counts);
-        ObjectiveFitness::from_metrics(mcc, started_at.elapsed())
+        ObjectiveFitness::from_mcc(mcc)
     }
-}
 
-impl FitnessFunction<SmartsGenome, ObjectiveFitness> for SmartsEvaluator {
-    fn fitness_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
+    pub fn fitness_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
         self.objective_of(genome)
-    }
-
-    fn average(&self, values: &[ObjectiveFitness]) -> ObjectiveFitness {
-        if values.is_empty() {
-            return ObjectiveFitness::zero();
-        }
-        let average_mcc = values.iter().map(|value| value.mcc()).sum::<f64>() / values.len() as f64;
-        let average_elapsed_micros = values
-            .iter()
-            .map(|value| value.elapsed_micros() as u128)
-            .sum::<u128>()
-            / values.len() as u128;
-
-        ObjectiveFitness::from_metrics(
-            average_mcc,
-            std::time::Duration::from_micros(average_elapsed_micros as u64),
-        )
-    }
-
-    fn highest_possible_fitness(&self) -> ObjectiveFitness {
-        ObjectiveFitness::from_metrics(1.0, std::time::Duration::ZERO)
-    }
-
-    fn lowest_possible_fitness(&self) -> ObjectiveFitness {
-        ObjectiveFitness::zero()
     }
 }
 
@@ -145,23 +121,26 @@ fn count_matches_in_fold(query: &CompiledQuery, fold: &FoldData) -> ConfusionCou
     let mut counts = ConfusionCounts::default();
 
     for sample in fold.samples() {
-        let matched = matches_compiled(query, sample.target());
-        match (matched, sample.is_positive()) {
-            (true, true) => counts.tp += 1,
-            (true, false) => counts.fp += 1,
-            (false, true) => counts.fn_ += 1,
-            (false, false) => counts.tn += 1,
-        }
+        counts += count_match_for_sample(query, sample);
     }
 
+    counts
+}
+
+fn count_match_for_sample(query: &CompiledQuery, sample: &FoldSample) -> ConfusionCounts {
+    let mut counts = ConfusionCounts::default();
+    counts.record_match(
+        matches_compiled(query, sample.target()),
+        sample.is_positive(),
+    );
     counts
 }
 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::{format, vec};
 
-    use genevo::genetic::FitnessFunction;
     use smiles_parser::Smiles;
 
     use super::*;
@@ -195,15 +174,7 @@ mod tests {
 
         let counts = count_matches_in_fold(&compiled, &fold);
 
-        assert_eq!(
-            counts,
-            ConfusionCounts {
-                tp: 1,
-                fp: 1,
-                tn: 1,
-                fn_: 1,
-            }
-        );
+        assert_eq!(counts, ConfusionCounts::new(1, 1, 1, 1));
     }
 
     #[test]
@@ -220,29 +191,11 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_average_and_bounds_cover_empty_and_non_empty_inputs() {
+    fn fitness_of_matches_objective_of() {
         let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![sample("CN", true)])]);
-        let low = ObjectiveFitness::from_metrics(0.25, std::time::Duration::from_micros(100));
-        let high = ObjectiveFitness::from_metrics(0.75, std::time::Duration::from_micros(300));
-
-        assert_eq!(evaluator.average(&[]), ObjectiveFitness::zero());
-
-        let average = evaluator.average(&[low, high]);
-        assert!((average.mcc() - 0.5).abs() < 0.01);
-        assert_eq!(average.elapsed(), std::time::Duration::from_micros(200));
-        assert_eq!(
-            evaluator.highest_possible_fitness(),
-            ObjectiveFitness::from_metrics(1.0, std::time::Duration::ZERO)
-        );
-        assert_eq!(
-            evaluator.lowest_possible_fitness(),
-            ObjectiveFitness::zero()
-        );
         let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
         let via_trait = evaluator.fitness_of(&genome);
         let direct = evaluator.objective_of(&genome);
         assert!((via_trait.mcc() - direct.mcc()).abs() < 1e-12);
-        assert!(via_trait.elapsed() > std::time::Duration::ZERO);
-        assert!(direct.elapsed() > std::time::Duration::ZERO);
     }
 }
