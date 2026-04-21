@@ -4,7 +4,7 @@
 [![codecov](https://codecov.io/gh/LucaCappelletti94/smarts-evolution/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/smarts-evolution)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`smarts-evolution` is a Rust library for evolving one SMARTS pattern against one binary classification task.
+Evolving SMARTS patterns against a binary classification task.
 
 ## Quick Start
 
