@@ -2,9 +2,6 @@ use std::hint::black_box;
 use std::str::FromStr;
 use std::time::Duration;
 
-#[path = "../experiments/example_support.rs"]
-mod example_support;
-
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -17,12 +14,6 @@ use smarts_evolution::{
 };
 use smarts_validator::{CompiledQuery, PreparedTarget, matches_compiled};
 use smiles_parser::Smiles;
-
-use example_support::{
-    EXAMPLE_BENCH_GENERATION_LIMIT, EXAMPLE_BENCH_POPULATION_SIZE, EXAMPLE_BENCH_SEED,
-    EXAMPLE_DATASETS, EXAMPLE_EVALUATOR_QUERY, SeedStrategy, build_example_config,
-    build_example_task, run_example_strategy,
-};
 
 const POSITIVE_SMILES: &[&str] = &[
     "CC(=O)N",
@@ -44,6 +35,59 @@ const SEED_SMARTS: &[&str] = &[
     "[#6]~[#7]",
     "[#7]~[#6](=[#8])",
     "[#6](=[#8])[#6]",
+];
+
+const EXAMPLE_BENCH_POPULATION_SIZE: usize = 64;
+const EXAMPLE_BENCH_GENERATION_LIMIT: u64 = 20;
+const EXAMPLE_BENCH_STAGNATION_LIMIT: u64 = 10;
+const EXAMPLE_BENCH_SEED: u64 = 17;
+const EXAMPLE_EVALUATOR_QUERY: &str = "[#6](~[#6])~[#6]";
+
+#[derive(Clone, Copy)]
+struct ExampleDataset {
+    name: &'static str,
+    positive_smiles: &'static str,
+    negative_smiles: &'static str,
+}
+
+const EXAMPLE_DATASETS: [ExampleDataset; 5] = [
+    ExampleDataset {
+        name: "amphetamines",
+        positive_smiles: include_str!(
+            "../apps/web/examples/amphetamines_and_derivatives_positive.smiles"
+        ),
+        negative_smiles: include_str!(
+            "../apps/web/examples/amphetamines_and_derivatives_negative.smiles"
+        ),
+    },
+    ExampleDataset {
+        name: "flavonoids",
+        positive_smiles: include_str!("../apps/web/examples/flavonoids_positive.smiles"),
+        negative_smiles: include_str!("../apps/web/examples/flavonoids_negative.smiles"),
+    },
+    ExampleDataset {
+        name: "fatty-acids",
+        positive_smiles: include_str!(
+            "../apps/web/examples/fatty_acids_and_conjugates_positive.smiles"
+        ),
+        negative_smiles: include_str!(
+            "../apps/web/examples/fatty_acids_and_conjugates_negative.smiles"
+        ),
+    },
+    ExampleDataset {
+        name: "penicillins",
+        positive_smiles: include_str!("../apps/web/examples/penicillins_positive.smiles"),
+        negative_smiles: include_str!("../apps/web/examples/penicillins_negative.smiles"),
+    },
+    ExampleDataset {
+        name: "steroids",
+        positive_smiles: include_str!(
+            "../apps/web/examples/steroids_and_steroid_derivatives_positive.smiles"
+        ),
+        negative_smiles: include_str!(
+            "../apps/web/examples/steroids_and_steroid_derivatives_negative.smiles"
+        ),
+    },
 ];
 
 fn prepared(smiles: &str) -> PreparedTarget {
@@ -70,6 +114,38 @@ fn build_task(sample_count_per_class: usize) -> EvolutionTask {
 
 fn build_seed_corpus() -> SeedCorpus {
     SeedCorpus::try_from(SEED_SMARTS.to_vec()).unwrap()
+}
+
+fn parse_smiles_block(input: &str) -> Vec<PreparedTarget> {
+    input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(prepared)
+        .collect()
+}
+
+fn build_example_task(dataset: &ExampleDataset) -> EvolutionTask {
+    let positives = parse_smiles_block(dataset.positive_smiles)
+        .into_iter()
+        .map(FoldSample::positive);
+    let negatives = parse_smiles_block(dataset.negative_smiles)
+        .into_iter()
+        .map(FoldSample::negative);
+    EvolutionTask::new(
+        format!("example-{}", dataset.name),
+        vec![FoldData::new(positives.chain(negatives).collect())],
+    )
+}
+
+fn build_example_config(seed: u64) -> EvolutionConfig {
+    EvolutionConfig::builder()
+        .population_size(EXAMPLE_BENCH_POPULATION_SIZE)
+        .generation_limit(EXAMPLE_BENCH_GENERATION_LIMIT)
+        .stagnation_limit(EXAMPLE_BENCH_STAGNATION_LIMIT)
+        .rng_seed(seed)
+        .build()
+        .unwrap()
 }
 
 fn evaluator_benches(c: &mut Criterion) {
@@ -181,7 +257,7 @@ fn example_evaluator_benches(c: &mut Criterion) {
     let genome = SmartsGenome::from_smarts(EXAMPLE_EVALUATOR_QUERY).unwrap();
 
     for dataset in EXAMPLE_DATASETS {
-        let task = build_example_task(dataset);
+        let task = build_example_task(&dataset);
         let evaluator = SmartsEvaluator::new(task.folds().to_vec());
         group.bench_with_input(
             BenchmarkId::new("objective_of", dataset.name),
@@ -205,7 +281,7 @@ fn example_evolution_benches(c: &mut Criterion) {
     let seed_corpus = SeedCorpus::builtin();
 
     for dataset in EXAMPLE_DATASETS {
-        let task = build_example_task(dataset);
+        let task = build_example_task(&dataset);
         group.bench_with_input(
             BenchmarkId::new(
                 "evolve_task",
@@ -227,36 +303,6 @@ fn example_evolution_benches(c: &mut Criterion) {
                 });
             },
         );
-    }
-
-    group.finish();
-}
-
-fn example_strategy_total_benches(c: &mut Criterion) {
-    let mut group = c.benchmark_group("example_strategy_total");
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(8));
-    group.sample_size(10);
-
-    for strategy in [SeedStrategy::Builtin, SeedStrategy::DiscriminativePaths] {
-        for dataset in EXAMPLE_DATASETS {
-            group.bench_with_input(
-                BenchmarkId::new(
-                    strategy.name(),
-                    format!(
-                        "{}_pop{}_gen{}",
-                        dataset.name, EXAMPLE_BENCH_POPULATION_SIZE, EXAMPLE_BENCH_GENERATION_LIMIT
-                    ),
-                ),
-                &dataset.name,
-                |b, _| {
-                    b.iter(|| {
-                        let result = run_example_strategy(dataset, strategy, EXAMPLE_BENCH_SEED);
-                        black_box(result.best_mcc());
-                    });
-                },
-            );
-        }
     }
 
     group.finish();
@@ -312,7 +358,6 @@ criterion_group!(
     evolution_benches,
     example_evaluator_benches,
     example_evolution_benches,
-    example_strategy_total_benches,
     operator_benches
 );
 criterion_main!(benches);
