@@ -2,7 +2,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use rand::Rng;
-use rand::seq::SliceRandom;
+use rand::RngExt;
+use rand::prelude::IndexedRandom;
 use smarts_parser::QueryMol;
 
 use crate::genome::SmartsGenome;
@@ -32,7 +33,7 @@ impl SmartsCrossover {
     where
         R: Rng + Sized,
     {
-        if !rng.gen_bool(self.crossover_rate) {
+        if !rng.random_bool(self.crossover_rate) {
             return (parent_a.clone(), parent_b.clone());
         }
 
@@ -73,7 +74,7 @@ fn choose_subtree_cut<R: Rng>(query: &QueryMol, rng: &mut R) -> Option<(usize, u
     let bond_ids = query.chain_bonds();
     let &bond_id = bond_ids.choose(rng)?;
     let bond = query.bond(bond_id)?;
-    let (anchor, child) = if rng.gen_bool(0.5) {
+    let (anchor, child) = if rng.random_bool(0.5) {
         (bond.src, bond.dst)
     } else {
         (bond.dst, bond.src)

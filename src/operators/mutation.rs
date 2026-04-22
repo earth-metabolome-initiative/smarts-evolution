@@ -1,8 +1,10 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use rand::prelude::IndexedRandom;
 use rand::Rng;
-use rand::seq::{IteratorRandom, SliceRandom};
+use rand::RngExt;
+use rand::seq::IteratorRandom;
 use smarts_parser::{
     AtomExpr, AtomPrimitive, BondExpr, BondExprTree, BondPrimitive, BracketExpr, BracketExprTree,
     EditableQueryMol, ExprPath, HydrogenKind, NumericQuery, QueryMol, add_atom_primitive,
@@ -53,18 +55,18 @@ impl SmartsMutation {
     where
         R: Rng + Sized,
     {
-        if !rng.gen_bool(self.mutation_rate) {
+        if !rng.random_bool(self.mutation_rate) {
             return genome;
         }
 
-        if !self.reset_pool.is_empty() && rng.gen_bool(self.reset_probability) {
-            let reset_idx = rng.gen_range(0..self.reset_pool.len());
+        if !self.reset_pool.is_empty() && rng.random_bool(self.reset_probability) {
+            let reset_idx = rng.random_range(0..self.reset_pool.len());
             return self.reset_pool[reset_idx].clone();
         }
 
         for _ in 0..self.attempt_budget {
             let mut editable = genome.query().edit();
-            let mutation_steps = rng.gen_range(2..=self.max_mutation_steps.max(2));
+            let mutation_steps = rng.random_range(2..=self.max_mutation_steps.max(2));
             let mut mutated = false;
 
             for _ in 0..mutation_steps {
@@ -98,7 +100,7 @@ fn apply_random_mutation<R: Rng>(
     reset_pool: &[SmartsGenome],
     rng: &mut R,
 ) -> bool {
-    let roll: f64 = rng.r#gen();
+    let roll: f64 = rng.random();
 
     if roll < 0.18 {
         mutate_atom_constraints(editable, rng)
@@ -122,14 +124,14 @@ fn apply_random_mutation<R: Rng>(
 fn random_atom<R: Rng>(editable: &EditableQueryMol, rng: &mut R) -> (usize, AtomExpr) {
     let atoms = editable.as_query_mol().atoms();
     debug_assert!(!atoms.is_empty());
-    let atom = &atoms[rng.gen_range(0..atoms.len())];
+    let atom = &atoms[rng.random_range(0..atoms.len())];
     (atom.id, atom.expr.clone())
 }
 
 fn random_atom_id<R: Rng>(editable: &EditableQueryMol, rng: &mut R) -> usize {
     let atoms = editable.as_query_mol().atoms();
     debug_assert!(!atoms.is_empty());
-    atoms[rng.gen_range(0..atoms.len())].id
+    atoms[rng.random_range(0..atoms.len())].id
 }
 
 fn random_bond_id<R: Rng>(editable: &EditableQueryMol, rng: &mut R) -> Option<usize> {
@@ -162,7 +164,7 @@ fn mutate_atom_constraints<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R)
     match atom_expr {
         AtomExpr::Bracket(mut expr) => {
             let primitive_paths = bracket_primitive_paths(&expr);
-            let mutated = match rng.gen_range(0..4) {
+            let mutated = match rng.random_range(0..4) {
                 0 if primitive_paths.len() < MAX_PRIMITIVES_PER_BRACKET => {
                     add_atom_primitive(&mut expr, random_atom_primitive(rng)).is_ok()
                 }
@@ -206,7 +208,7 @@ fn generalize_specialize_atom<R: Rng>(editable: &mut EditableQueryMol, rng: &mut
     let Some(BracketExprTree::Primitive(current)) = expr.tree.get(path) else {
         return false;
     };
-    let replacement = if rng.gen_bool(0.5) {
+    let replacement = if rng.random_bool(0.5) {
         generalize_atom_primitive(current, rng)
     } else {
         specialize_atom_primitive(current, rng)
@@ -288,7 +290,7 @@ fn graft_seed_fragment<R: Rng>(
     }
 
     let parent = random_atom_id(editable, rng);
-    let fragment_genome = &reset_pool[rng.gen_range(0..reset_pool.len())];
+    let fragment_genome = &reset_pool[rng.random_range(0..reset_pool.len())];
 
     let fragment_root = fragment_genome
         .query()
@@ -325,7 +327,7 @@ fn random_bracket_expr<R: Rng>(rng: &mut R) -> BracketExpr {
         atom_map: None,
     };
 
-    if rng.gen_bool(0.30) {
+    if rng.random_bool(0.30) {
         let _ = add_atom_primitive(&mut expr, random_atom_primitive(rng));
     }
 
@@ -333,29 +335,29 @@ fn random_bracket_expr<R: Rng>(rng: &mut R) -> BracketExpr {
 }
 
 fn random_atom_primitive<R: Rng>(rng: &mut R) -> AtomPrimitive {
-    match rng.gen_range(0..11) {
+    match rng.random_range(0..11) {
         0 => AtomPrimitive::Wildcard,
         1 => AtomPrimitive::AliphaticAny,
         2 => AtomPrimitive::AromaticAny,
         3 => AtomPrimitive::AtomicNumber(random_atomic_number(rng)),
-        4 => AtomPrimitive::Degree(Some(NumericQuery::Exact(rng.gen_range(1..=4)))),
-        5 => AtomPrimitive::Connectivity(Some(NumericQuery::Exact(rng.gen_range(1..=4)))),
+        4 => AtomPrimitive::Degree(Some(NumericQuery::Exact(rng.random_range(1..=4)))),
+        5 => AtomPrimitive::Connectivity(Some(NumericQuery::Exact(rng.random_range(1..=4)))),
         6 => AtomPrimitive::Hydrogen(
             HydrogenKind::Total,
-            Some(NumericQuery::Exact(rng.gen_range(0..=3))),
+            Some(NumericQuery::Exact(rng.random_range(0..=3))),
         ),
-        7 => AtomPrimitive::RingMembership(if rng.gen_bool(0.5) {
-            Some(NumericQuery::Exact(rng.gen_range(0..=3)))
+        7 => AtomPrimitive::RingMembership(if rng.random_bool(0.5) {
+            Some(NumericQuery::Exact(rng.random_range(0..=3)))
         } else {
             None
         }),
-        8 => AtomPrimitive::RingSize(if rng.gen_bool(0.5) {
+        8 => AtomPrimitive::RingSize(if rng.random_bool(0.5) {
             Some(NumericQuery::Exact(*[5, 6, 7].choose(rng).unwrap()))
         } else {
             None
         }),
-        9 => AtomPrimitive::RingConnectivity(if rng.gen_bool(0.5) {
-            Some(NumericQuery::Exact(rng.gen_range(0..=3)))
+        9 => AtomPrimitive::RingConnectivity(if rng.random_bool(0.5) {
+            Some(NumericQuery::Exact(rng.random_range(0..=3)))
         } else {
             None
         }),
@@ -389,13 +391,13 @@ fn specialize_atom_primitive<R: Rng>(primitive: &AtomPrimitive, rng: &mut R) -> 
             AtomPrimitive::AtomicNumber(random_atomic_number(rng))
         }
         AtomPrimitive::RingMembership(None) => {
-            AtomPrimitive::RingMembership(Some(NumericQuery::Exact(rng.gen_range(1..=3))))
+            AtomPrimitive::RingMembership(Some(NumericQuery::Exact(rng.random_range(1..=3))))
         }
         AtomPrimitive::RingSize(None) => {
             AtomPrimitive::RingSize(Some(NumericQuery::Exact(*[5, 6, 7].choose(rng).unwrap())))
         }
         AtomPrimitive::RingConnectivity(None) => {
-            AtomPrimitive::RingConnectivity(Some(NumericQuery::Exact(rng.gen_range(1..=3))))
+            AtomPrimitive::RingConnectivity(Some(NumericQuery::Exact(rng.random_range(1..=3))))
         }
         AtomPrimitive::Degree(Some(NumericQuery::Exact(value))) if *value < 4 => {
             AtomPrimitive::Degree(Some(NumericQuery::Exact(value + 1)))
@@ -411,7 +413,7 @@ fn specialize_atom_primitive<R: Rng>(primitive: &AtomPrimitive, rng: &mut R) -> 
 }
 
 fn random_bond_expr<R: Rng>(rng: &mut R) -> BondExpr {
-    if rng.gen_bool(0.20) {
+    if rng.random_bool(0.20) {
         BondExpr::Elided
     } else {
         BondExpr::Query(BondExprTree::Primitive(random_bond_primitive(rng)))
@@ -419,7 +421,7 @@ fn random_bond_expr<R: Rng>(rng: &mut R) -> BondExpr {
 }
 
 fn random_bond_primitive<R: Rng>(rng: &mut R) -> BondPrimitive {
-    match rng.gen_range(0..6) {
+    match rng.random_range(0..6) {
         0 => BondPrimitive::Bond(Bond::Single),
         1 => BondPrimitive::Bond(Bond::Double),
         2 => BondPrimitive::Bond(Bond::Triple),

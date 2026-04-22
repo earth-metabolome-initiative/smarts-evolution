@@ -16,14 +16,14 @@ codegen-units = 1
 smarts-parser = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-parser" }
 smarts-validator = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-validator" }
 smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main" }
-rand = { version = "0.8", default-features = false, features = ["alloc", "small_rng"] }
-getrandom = { version = "0.2.17", features = ["js"] }
-log = { version = "0.4", default-features = false }
-hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
-rayon = { version = "1.11", optional = true }
+rand = { version = "0.10.1", default-features = false, features = ["alloc", "std_rng"] }
+getrandom = { version = "0.4.2", features = ["wasm_js"] }
+log = { version = "0.4.29", default-features = false }
+hashbrown = { version = "0.17.0", default-features = false, features = ["default-hasher"] }
+rayon = { version = "1.12.0", optional = true }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8.2"
 
 [[bench]]
 name = "evolution"

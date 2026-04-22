@@ -8,6 +8,7 @@ use core::fmt;
 
 use hashbrown::{HashMap, HashSet};
 use log::{debug, info};
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
@@ -771,7 +772,7 @@ fn build_rng(config: &EvolutionConfig) -> SmallRng {
         Some(seed) => SmallRng::seed_from_u64(seed),
         None => {
             let mut seed = <SmallRng as SeedableRng>::Seed::default();
-            if getrandom::getrandom(seed.as_mut()).is_ok() {
+            if getrandom::fill(seed.as_mut()).is_ok() {
                 SmallRng::from_seed(seed)
             } else {
                 SmallRng::seed_from_u64(0x5EED_5EED_5EED_5EED)
@@ -831,9 +832,9 @@ fn tournament_select(
 ) -> Vec<SmartsGenome> {
     let mut parents = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut best_idx = rng.gen_range(0..scored.len());
+        let mut best_idx = rng.random_range(0..scored.len());
         for _ in 1..tournament_size {
-            let idx = rng.gen_range(0..scored.len());
+            let idx = rng.random_range(0..scored.len());
             if compare_scored_genomes(&scored[idx], &scored[best_idx]).is_lt() {
                 best_idx = idx;
             }

@@ -3,7 +3,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use rand::Rng;
-use rand::seq::SliceRandom;
+use rand::RngExt;
+use rand::prelude::IndexedRandom;
 
 use super::SmartsGenome;
 
@@ -233,7 +234,7 @@ fn corpus_seed<R: Rng>(seed_corpus: &SeedCorpus, rng: &mut R) -> SmartsGenome {
 /// Generate one small built-in SMARTS seed.
 fn builtin_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
     let total = GENERIC_BUILTIN_SEED_SMARTS.len() + CURATED_BUILTIN_SEED_SMARTS.len();
-    let idx = rng.gen_range(0..total);
+    let idx = rng.random_range(0..total);
     let pat = if idx < GENERIC_BUILTIN_SEED_SMARTS.len() {
         GENERIC_BUILTIN_SEED_SMARTS[idx]
     } else {
@@ -244,7 +245,7 @@ fn builtin_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
 
 /// Generate a random small SMARTS pattern.
 fn random_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
-    let atom_count = rng.gen_range(1..=4);
+    let atom_count = rng.random_range(1..=4);
     let common_atoms: &[u8] = &[6, 7, 8, 16, 15, 9, 17, 35];
     let mut smarts = String::new();
 
@@ -254,11 +255,11 @@ fn random_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
         }
         let elem = common_atoms.choose(rng).unwrap();
         smarts.push_str(&format!("[#{elem}"));
-        if rng.gen_bool(0.4) {
-            let constraint = match rng.gen_range(0..3) {
+        if rng.random_bool(0.4) {
+            let constraint = match rng.random_range(0..3) {
                 0 => "R".to_string(),
-                1 => format!("H{}", rng.gen_range(0..=3)),
-                _ => format!("D{}", rng.gen_range(1..=4)),
+                1 => format!("H{}", rng.random_range(0..=3)),
+                _ => format!("D{}", rng.random_range(1..=4)),
             };
             smarts.push(';');
             smarts.push_str(&constraint);
