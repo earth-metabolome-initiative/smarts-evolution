@@ -1,11 +1,12 @@
 //! Dedicated worker for browser-side SMARTS evolution runs.
 
+use std::cell::RefCell;
 use std::str::FromStr;
 
 use js_sys::global;
 use smarts_evolution::{
     EvolutionConfig, EvolutionProgress, EvolutionStatus, EvolutionTask, FoldData, FoldSample,
-    RankedSmarts, SeedCorpus, TaskResult, evolve_task_with_progress,
+    EvolutionSession, RankedSmarts, SeedCorpus, TaskResult,
 };
 use smarts_evolution_web_protocol::{
     CompletedRun, EvolutionConfigInput, FatalResponse, ProgressUpdate, RankedCandidate, RunRequest,
@@ -17,6 +18,22 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 const STARTUP_PROGRESS_BATCH: usize = 16;
+
+thread_local! {
+    static WORKER_STATE: RefCell<WorkerState> = RefCell::new(WorkerState::default());
+}
+
+#[derive(Default)]
+struct WorkerState {
+    active_run: Option<ActiveRun>,
+}
+
+struct ActiveRun {
+    run_id: u64,
+    session: EvolutionSession,
+    paused: bool,
+    scheduled: bool,
+}
 
 /// Starts the dedicated evolution worker.
 #[wasm_bindgen(start)]
@@ -36,10 +53,19 @@ pub fn start() -> Result<(), JsValue> {
 
         match request {
             WorkerRequest::Run(request) => {
-                if let Err(message) = run_request(request.clone()) {
+                clear_active_run();
+                if let Err(message) = start_run(request.clone()) {
                     let _ = post_response(&WorkerResponse::Fatal(FatalResponse::new(
                         request.run_id(),
                         message,
+                    )));
+                }
+            }
+            WorkerRequest::Stop { run_id } => pause_active_run(run_id),
+            WorkerRequest::Resume { run_id } => {
+                if let Err(message) = resume_active_run(run_id) {
+                    let _ = post_response(&WorkerResponse::Fatal(FatalResponse::new(
+                        run_id, message,
                     )));
                 }
             }
@@ -52,7 +78,7 @@ pub fn start() -> Result<(), JsValue> {
     Ok(())
 }
 
-fn run_request(request: RunRequest) -> Result<(), String> {
+fn start_run(request: RunRequest) -> Result<(), String> {
     let run_id = request.run_id();
     let mut startup = StartupReporter::new(run_id, startup_total(&request));
     startup.post_initial("Queued run")?;
@@ -63,19 +89,19 @@ fn run_request(request: RunRequest) -> Result<(), String> {
     startup.advance(1, "Preparing evaluation fold")?;
     startup.advance(1, "Starting genetic search")?;
     let leaderboard_size = request.top_k().max(1);
+    let session =
+        EvolutionSession::new(&task, &config, &seed_corpus, leaderboard_size)
+            .map_err(|error| error.to_string())?;
 
-    let result =
-        evolve_task_with_progress(&task, &config, &seed_corpus, leaderboard_size, |snapshot| {
-            let response =
-                WorkerResponse::Progress(progress_update_from_snapshot(run_id, &snapshot));
-            let _ = post_response(&response);
-        })
-        .map_err(|error| error.to_string())?;
-
-    post_response(&WorkerResponse::Complete(completed_run_from_result(
-        run_id, &result,
-    )))
-    .map_err(js_error)
+    WORKER_STATE.with(|state| {
+        state.borrow_mut().active_run = Some(ActiveRun {
+            run_id,
+            session,
+            paused: false,
+            scheduled: false,
+        });
+    });
+    schedule_active_run()
 }
 
 fn build_config(input: &EvolutionConfigInput) -> Result<EvolutionConfig, String> {
@@ -222,6 +248,122 @@ fn completed_run_from_result(run_id: u64, result: &TaskResult) -> CompletedRun {
         result.leaders().iter().map(ranked_candidate).collect(),
         result.generations(),
     )
+}
+
+fn clear_active_run() {
+    WORKER_STATE.with(|state| {
+        state.borrow_mut().active_run = None;
+    });
+}
+
+fn pause_active_run(run_id: u64) {
+    WORKER_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(active_run) = state.active_run.as_mut()
+            && active_run.run_id == run_id
+        {
+            active_run.paused = true;
+        }
+    });
+}
+
+fn resume_active_run(run_id: u64) -> Result<(), String> {
+    let should_schedule = WORKER_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(active_run) = state.active_run.as_mut() else {
+            return false;
+        };
+        if active_run.run_id != run_id {
+            return false;
+        }
+        active_run.paused = false;
+        !active_run.scheduled
+    });
+
+    if should_schedule {
+        schedule_active_run()?;
+    }
+    Ok(())
+}
+
+fn schedule_active_run() -> Result<(), String> {
+    let should_schedule = WORKER_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(active_run) = state.active_run.as_mut() else {
+            return false;
+        };
+        if active_run.paused || active_run.scheduled {
+            return false;
+        }
+        active_run.scheduled = true;
+        true
+    });
+
+    if !should_schedule {
+        return Ok(());
+    }
+
+    let callback = Closure::once_into_js(drive_active_run);
+    worker_scope()
+        .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
+        .map_err(js_error)?;
+    Ok(())
+}
+
+fn drive_active_run() {
+    enum StepOutcome {
+        Idle,
+        Advanced {
+            progress: ProgressUpdate,
+            result: Option<CompletedRun>,
+        },
+        Fatal(FatalResponse),
+    }
+
+    let outcome = WORKER_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(mut active_run) = state.active_run.take() else {
+            return StepOutcome::Idle;
+        };
+        active_run.scheduled = false;
+
+        if active_run.paused {
+            state.active_run = Some(active_run);
+            return StepOutcome::Idle;
+        }
+
+        let Some(progress) = active_run.session.step() else {
+            return StepOutcome::Fatal(FatalResponse::new(
+                active_run.run_id,
+                "paused evolution session ended unexpectedly",
+            ));
+        };
+
+        let progress = progress_update_from_snapshot(active_run.run_id, &progress);
+        let result = active_run
+            .session
+            .take_result()
+            .map(|result| completed_run_from_result(active_run.run_id, &result));
+        if result.is_none() {
+            state.active_run = Some(active_run);
+        }
+        StepOutcome::Advanced { progress, result }
+    });
+
+    match outcome {
+        StepOutcome::Idle => {}
+        StepOutcome::Advanced { progress, result } => {
+            let _ = post_response(&WorkerResponse::Progress(progress));
+            if let Some(result) = result {
+                let _ = post_response(&WorkerResponse::Complete(result));
+            } else {
+                let _ = schedule_active_run();
+            }
+        }
+        StepOutcome::Fatal(error) => {
+            let _ = post_response(&WorkerResponse::Fatal(error));
+        }
+    }
 }
 
 fn ranked_candidate(candidate: &RankedSmarts) -> RankedCandidate {

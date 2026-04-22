@@ -365,6 +365,303 @@ impl EvolutionProgress {
     }
 }
 
+/// One incremental evolution session that can be paused and resumed between
+/// generations.
+pub struct EvolutionSession {
+    task_id: String,
+    config: EvolutionConfig,
+    evaluator: SmartsEvaluator,
+    genome_builder: SmartsGenomeBuilder,
+    population: Vec<SmartsGenome>,
+    crossover: SmartsCrossover,
+    mutator: SmartsMutation,
+    rng: SmallRng,
+    best_fitness: ObjectiveFitness,
+    best_smarts: String,
+    best_text_len: usize,
+    stagnation: u64,
+    fitness_cache: FitnessCache,
+    last_leaders: Vec<RankedSmarts>,
+    generation: u64,
+    leaderboard_size: usize,
+    finished_result: Option<TaskResult>,
+}
+
+impl EvolutionSession {
+    /// Build one resumable evolution session for a task.
+    pub fn new(
+        task: &EvolutionTask,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+        leaderboard_size: usize,
+    ) -> Result<Self, EvolutionError> {
+        config.validate().map_err(EvolutionError::InvalidConfig)?;
+        if task.folds().is_empty() {
+            return Err(EvolutionError::EmptyFolds);
+        }
+        let total_targets: usize = task.folds().iter().map(FoldData::len).sum();
+        if total_targets == 0 {
+            return Err(EvolutionError::NoEvaluationTargets(
+                task.task_id().to_string(),
+            ));
+        }
+
+        info!(
+            "Evolving task '{}' over {} folds ({} evaluation targets)",
+            task.task_id(),
+            task.folds().len(),
+            total_targets
+        );
+
+        let evaluator = SmartsEvaluator::new(task.folds().to_vec());
+        let genome_builder = SmartsGenomeBuilder::new(seed_corpus.clone());
+        let mut rng = build_rng(config);
+        let population: Vec<SmartsGenome> = (0..config.population_size())
+            .map(|i| genome_builder.build_genome(i, &mut rng))
+            .collect();
+        info!(
+            "Built initial population for task '{}' ({} genomes)",
+            task.task_id(),
+            population.len(),
+        );
+
+        let crossover = SmartsCrossover::new(config.crossover_rate());
+        let reset_pool = build_reset_pool(seed_corpus, &population, RESET_POOL_SIZE);
+        let mutator = SmartsMutation::with_reset_pool(config.mutation_rate(), reset_pool);
+
+        Ok(Self {
+            task_id: task.task_id().to_string(),
+            config: config.clone(),
+            evaluator,
+            genome_builder,
+            population,
+            crossover,
+            mutator,
+            rng,
+            best_fitness: ObjectiveFitness::invalid(),
+            best_smarts: String::from("[#6]"),
+            best_text_len: usize::MAX,
+            stagnation: 0,
+            fitness_cache: FitnessCache::new(config.fitness_cache_capacity()),
+            last_leaders: Vec::new(),
+            generation: 0,
+            leaderboard_size: leaderboard_size.max(1),
+            finished_result: None,
+        })
+    }
+
+    /// Advance the search by one scored generation.
+    pub fn step(&mut self) -> Option<EvolutionProgress> {
+        if self.finished_result.is_some() || self.generation >= self.config.generation_limit() {
+            return None;
+        }
+
+        let generation = self.generation;
+        let total_count = self.population.len();
+        let average_complexity = average_complexity(&self.population);
+        let mut seen_population = HashSet::with_capacity(total_count);
+        let mut duplicate_count = 0usize;
+        let mut cache_hits = 0usize;
+        let mut unique_population = Vec::with_capacity(total_count);
+
+        for genome in self.population.drain(..) {
+            let smarts = genome.smarts_shared().clone();
+            if !seen_population.insert(smarts.clone()) {
+                duplicate_count += 1;
+                continue;
+            }
+
+            unique_population.push(genome);
+        }
+        let unique_count = seen_population.len();
+        let mut unique_scored = Vec::with_capacity(unique_count);
+        let mut uncached_genomes = Vec::new();
+
+        for genome in unique_population {
+            let smarts = genome.smarts_shared().clone();
+            if let Some((fitness, phenotype)) = self.fitness_cache.get(&smarts) {
+                cache_hits += 1;
+                unique_scored.push(ScoredGenome {
+                    genome,
+                    fitness,
+                    phenotype,
+                });
+            } else {
+                uncached_genomes.push(genome);
+            }
+        }
+
+        let freshly_scored = self.evaluator.evaluate_many(uncached_genomes);
+        for (genome, evaluation) in freshly_scored {
+            unique_scored.push(build_scored_genome(
+                &mut self.fitness_cache,
+                genome,
+                evaluation,
+            ));
+        }
+
+        unique_scored = phenotypically_deduplicate(unique_scored);
+        unique_scored.sort_by(compare_scored_genomes);
+        let leaders = leaderboard_from_scored(&unique_scored, self.leaderboard_size);
+
+        let lead = &unique_scored[0];
+        let lead_complexity = lead.genome.complexity();
+        if generation == 0
+            || is_better_candidate(
+                lead.fitness,
+                &lead.genome,
+                self.best_fitness,
+                self.best_text_len,
+                &self.best_smarts,
+            )
+        {
+            self.best_fitness = lead.fitness;
+            self.best_smarts = lead.genome.smarts().to_string();
+            self.best_text_len = lead.genome.smarts().len();
+            self.stagnation = 0;
+        } else {
+            self.stagnation += 1;
+        }
+
+        let stats = GenerationStats {
+            unique_count,
+            total_count,
+            duplicate_count,
+            cache_hits,
+            lead_complexity,
+            average_complexity,
+        };
+
+        debug!(
+            "Task '{}' gen {}: {}",
+            self.task_id,
+            generation + 1,
+            generation_progress_message(&stats, lead.fitness, self.best_fitness,),
+        );
+
+        let generations = generation + 1;
+        let status = if self.stagnation >= self.config.stagnation_limit() {
+            EvolutionStatus::Stagnated
+        } else if generations == self.config.generation_limit() {
+            EvolutionStatus::Completed
+        } else {
+            EvolutionStatus::Running
+        };
+
+        self.last_leaders = leaders.clone();
+        let progress = EvolutionProgress::from_snapshot(ProgressSnapshot {
+            task_id: &self.task_id,
+            generation: generations,
+            generation_limit: self.config.generation_limit(),
+            status,
+            best: RankedSmarts::new(&lead.genome, lead.fitness),
+            leaders,
+            stats: &stats,
+            stagnation: self.stagnation,
+        });
+
+        self.generation = generations;
+
+        if status == EvolutionStatus::Stagnated {
+            info!(
+                "Task '{}' stagnated after {} generations; best MCC={:.3}",
+                self.task_id,
+                generations,
+                self.best_fitness.mcc(),
+            );
+            self.finished_result = Some(build_task_result(
+                &self.task_id,
+                self.best_smarts.clone(),
+                self.best_fitness,
+                generations,
+                self.last_leaders.clone(),
+            ));
+            return Some(progress);
+        }
+
+        if status == EvolutionStatus::Completed {
+            info!(
+                "Task '{}' completed after {} generations; best MCC={:.3}",
+                self.task_id,
+                generations,
+                self.best_fitness.mcc(),
+            );
+            self.finished_result = Some(build_task_result(
+                &self.task_id,
+                self.best_smarts.clone(),
+                self.best_fitness,
+                generations,
+                self.last_leaders.clone(),
+            ));
+            return Some(progress);
+        }
+
+        let num_parents = ((self.config.population_size() as f64 * self.config.selection_ratio())
+            .round() as usize)
+            .max(2)
+            .min(self.config.population_size().max(2));
+        let parents = tournament_select(
+            &unique_scored,
+            num_parents,
+            self.config.tournament_size(),
+            &mut self.rng,
+        );
+
+        let mut offspring = Vec::with_capacity(self.config.population_size());
+        let mut pi = 0;
+        while offspring.len() < self.config.population_size() {
+            let p1 = &parents[pi % parents.len()];
+            let p2 = &parents[(pi + 1) % parents.len()];
+            pi += 2;
+
+            let (child_a, child_b) = self.crossover.crossover_pair(p1, p2, &mut self.rng);
+            offspring.push(self.mutator.mutate(child_a, &mut self.rng));
+            if offspring.len() >= self.config.population_size() {
+                break;
+            }
+            offspring.push(self.mutator.mutate(child_b, &mut self.rng));
+        }
+
+        let elite_count = self
+            .config
+            .elite_count()
+            .max(1)
+            .min(self.config.population_size());
+        let immigrant_count = ((self.config.random_immigrant_ratio()
+            * self.config.population_size() as f64)
+            .round() as usize)
+            .min(self.config.population_size().saturating_sub(elite_count));
+        let immigrant_base = generation as usize * self.config.population_size();
+        let mut immigrant_idx = 0usize;
+        self.population = reinsert_population(
+            &unique_scored,
+            offspring,
+            self.config.population_size(),
+            elite_count,
+            immigrant_count,
+            || {
+                let genome = self
+                    .genome_builder
+                    .build_genome(immigrant_base + immigrant_idx, &mut self.rng);
+                immigrant_idx += 1;
+                genome
+            },
+        );
+
+        Some(progress)
+    }
+
+    /// Returns true once the session has reached a terminal state.
+    pub fn is_finished(&self) -> bool {
+        self.finished_result.is_some()
+    }
+
+    /// Takes the terminal task result once the session has finished.
+    pub fn take_result(&mut self) -> Option<TaskResult> {
+        self.finished_result.take()
+    }
+}
+
 /// Evolve one binary task from already-prepared folds.
 ///
 /// This is the main library entry point.
@@ -426,251 +723,22 @@ pub fn evolve_task_with_progress(
     leaderboard_size: usize,
     mut on_progress: impl FnMut(EvolutionProgress),
 ) -> Result<TaskResult, EvolutionError> {
-    config.validate().map_err(EvolutionError::InvalidConfig)?;
-    if task.folds().is_empty() {
-        return Err(EvolutionError::EmptyFolds);
-    }
-    let total_targets: usize = task.folds().iter().map(FoldData::len).sum();
-    if total_targets == 0 {
-        return Err(EvolutionError::NoEvaluationTargets(
-            task.task_id().to_string(),
-        ));
-    }
-
-    info!(
-        "Evolving task '{}' over {} folds ({} evaluation targets)",
-        task.task_id(),
-        task.folds().len(),
-        total_targets
-    );
-
-    let evaluator = SmartsEvaluator::new(task.folds().to_vec());
-    evolve_task_inner(
-        task.task_id(),
-        config,
-        &evaluator,
-        seed_corpus,
-        leaderboard_size.max(1),
-        &mut on_progress,
-    )
-}
-
-fn evolve_task_inner(
-    task_id: &str,
-    config: &EvolutionConfig,
-    evaluator: &SmartsEvaluator,
-    seed_corpus: &SeedCorpus,
-    leaderboard_size: usize,
-    on_progress: &mut impl FnMut(EvolutionProgress),
-) -> Result<TaskResult, EvolutionError> {
-    let genome_builder = SmartsGenomeBuilder::new(seed_corpus.clone());
-    let mut rng = build_rng(config);
-
-    let mut population: Vec<SmartsGenome> = (0..config.population_size())
-        .map(|i| genome_builder.build_genome(i, &mut rng))
-        .collect();
-    info!(
-        "Built initial population for task '{}' ({} genomes)",
-        task_id,
-        population.len(),
-    );
-
-    let crossover = SmartsCrossover::new(config.crossover_rate());
-    let reset_pool = build_reset_pool(seed_corpus, &population, RESET_POOL_SIZE);
-    let mutator = SmartsMutation::with_reset_pool(config.mutation_rate(), reset_pool);
-
-    let mut best_fitness = ObjectiveFitness::invalid();
-    let mut best_smarts = String::from("[#6]");
-    let mut best_text_len = usize::MAX;
-    let mut stagnation = 0u64;
-    let mut fitness_cache = FitnessCache::new(config.fitness_cache_capacity());
-    let mut last_leaders = Vec::new();
-
-    for generation in 0..config.generation_limit() {
-        let total_count = population.len();
-        let average_complexity = average_complexity(&population);
-        let mut seen_population = HashSet::with_capacity(total_count);
-        let mut duplicate_count = 0usize;
-        let mut cache_hits = 0usize;
-        let mut unique_population = Vec::with_capacity(total_count);
-
-        for genome in population.drain(..) {
-            let smarts = genome.smarts_shared().clone();
-            if !seen_population.insert(smarts.clone()) {
-                duplicate_count += 1;
-                continue;
+    let mut session = EvolutionSession::new(task, config, seed_corpus, leaderboard_size)?;
+    while let Some(progress) = session.step() {
+        on_progress(progress);
+        if session.is_finished() {
+            if let Some(result) = session.take_result() {
+                return Ok(result);
             }
-
-            unique_population.push(genome);
-        }
-        let unique_count = seen_population.len();
-        let mut unique_scored = Vec::with_capacity(unique_count);
-        let mut uncached_genomes = Vec::new();
-
-        for genome in unique_population {
-            let smarts = genome.smarts_shared().clone();
-            if let Some((fitness, phenotype)) = fitness_cache.get(&smarts) {
-                cache_hits += 1;
-                unique_scored.push(ScoredGenome {
-                    genome,
-                    fitness,
-                    phenotype,
-                });
-            } else {
-                uncached_genomes.push(genome);
-            }
-        }
-
-        let freshly_scored = evaluator.evaluate_many(uncached_genomes);
-        for (genome, evaluation) in freshly_scored {
-            unique_scored.push(build_scored_genome(&mut fitness_cache, genome, evaluation));
-        }
-
-        unique_scored = phenotypically_deduplicate(unique_scored);
-        unique_scored.sort_by(compare_scored_genomes);
-        let leaders = leaderboard_from_scored(&unique_scored, leaderboard_size);
-
-        let lead = &unique_scored[0];
-        let lead_complexity = lead.genome.complexity();
-        if generation == 0
-            || is_better_candidate(
-                lead.fitness,
-                &lead.genome,
-                best_fitness,
-                best_text_len,
-                &best_smarts,
-            )
-        {
-            best_fitness = lead.fitness;
-            best_smarts = lead.genome.smarts().to_string();
-            best_text_len = lead.genome.smarts().len();
-            stagnation = 0;
-        } else {
-            stagnation += 1;
-        }
-
-        let stats = GenerationStats {
-            unique_count,
-            total_count,
-            duplicate_count,
-            cache_hits,
-            lead_complexity,
-            average_complexity,
-        };
-
-        debug!(
-            "Task '{}' gen {}: {}",
-            task_id,
-            generation + 1,
-            generation_progress_message(&stats, lead.fitness, best_fitness,),
-        );
-
-        let generations = generation + 1;
-        let status = if stagnation >= config.stagnation_limit() {
-            EvolutionStatus::Stagnated
-        } else if generations == config.generation_limit() {
-            EvolutionStatus::Completed
-        } else {
-            EvolutionStatus::Running
-        };
-
-        last_leaders = leaders.clone();
-        on_progress(EvolutionProgress::from_snapshot(ProgressSnapshot {
-            task_id,
-            generation: generations,
-            generation_limit: config.generation_limit(),
-            status,
-            best: RankedSmarts::new(&lead.genome, lead.fitness),
-            leaders,
-            stats: &stats,
-            stagnation,
-        }));
-
-        if status == EvolutionStatus::Stagnated {
-            info!(
-                "Task '{}' stagnated after {} generations; best MCC={:.3}",
-                task_id,
-                generations,
-                best_fitness.mcc(),
-            );
-            return Ok(build_task_result(
-                task_id,
-                best_smarts,
-                best_fitness,
-                generations,
-                last_leaders,
+            return Err(EvolutionError::InvalidConfig(
+                "finished evolution session did not expose a terminal result".into(),
             ));
         }
-
-        if status == EvolutionStatus::Completed {
-            info!(
-                "Task '{}' completed after {} generations; best MCC={:.3}",
-                task_id,
-                generations,
-                best_fitness.mcc(),
-            );
-            return Ok(build_task_result(
-                task_id,
-                best_smarts,
-                best_fitness,
-                generations,
-                last_leaders,
-            ));
-        }
-
-        let num_parents = ((config.population_size() as f64 * config.selection_ratio()).round()
-            as usize)
-            .max(2)
-            .min(config.population_size().max(2));
-        let parents = tournament_select(
-            &unique_scored,
-            num_parents,
-            config.tournament_size(),
-            &mut rng,
-        );
-
-        let mut offspring = Vec::with_capacity(config.population_size());
-        let mut pi = 0;
-        while offspring.len() < config.population_size() {
-            let p1 = &parents[pi % parents.len()];
-            let p2 = &parents[(pi + 1) % parents.len()];
-            pi += 2;
-
-            let (child_a, child_b) = crossover.crossover_pair(p1, p2, &mut rng);
-            offspring.push(mutator.mutate(child_a, &mut rng));
-            if offspring.len() >= config.population_size() {
-                break;
-            }
-            offspring.push(mutator.mutate(child_b, &mut rng));
-        }
-
-        let elite_count = config.elite_count().max(1).min(config.population_size());
-        let immigrant_count = ((config.random_immigrant_ratio() * config.population_size() as f64)
-            .round() as usize)
-            .min(config.population_size().saturating_sub(elite_count));
-        let immigrant_base = generation as usize * config.population_size();
-        let mut immigrant_idx = 0usize;
-        population = reinsert_population(
-            &unique_scored,
-            offspring,
-            config.population_size(),
-            elite_count,
-            immigrant_count,
-            || {
-                let genome = genome_builder.build_genome(immigrant_base + immigrant_idx, &mut rng);
-                immigrant_idx += 1;
-                genome
-            },
-        );
     }
 
-    Ok(build_task_result(
-        task_id,
-        best_smarts,
-        best_fitness,
-        config.generation_limit(),
-        last_leaders,
-    ))
+    session
+        .take_result()
+        .ok_or_else(|| EvolutionError::InvalidConfig("evolution session ended unexpectedly".into()))
 }
 
 fn build_task_result(

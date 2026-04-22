@@ -416,12 +416,15 @@ impl FatalResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerRequest {
     Run(RunRequest),
+    Stop { run_id: u64 },
+    Resume { run_id: u64 },
 }
 
 impl WorkerRequest {
     pub fn run_id(&self) -> u64 {
         match self {
             Self::Run(request) => request.run_id(),
+            Self::Stop { run_id } | Self::Resume { run_id } => *run_id,
         }
     }
 }

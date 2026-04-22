@@ -9,6 +9,7 @@ use icons::{AppIcon, app_icon};
 use smiles_parser::Smiles;
 use smarts_evolution_web_protocol::{
     CompletedRun, EvolutionConfigInput, ProgressUpdate, RankedCandidate, RunRequest, StartupUpdate,
+    WorkerRequest,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -19,7 +20,7 @@ use web_sys::{
     WorkerOptions, WorkerType,
 };
 #[cfg(target_arch = "wasm32")]
-use smarts_evolution_web_protocol::{WorkerRequest, WorkerResponse};
+use smarts_evolution_web_protocol::WorkerResponse;
 
 #[cfg(target_arch = "wasm32")]
 const WORKER_SCRIPT: &str = "/generated/evolution-worker.js";
@@ -294,20 +295,29 @@ impl RunView {
     }
 
     fn apply_startup(&mut self, startup: StartupUpdate) {
-        self.phase = RunPhase::Running;
+        if self.phase != RunPhase::Stopped {
+            self.phase = RunPhase::Running;
+            self.message = None;
+        }
         self.startup = Some(startup);
         self.progress = None;
         self.result = None;
-        self.message = None;
     }
 
     fn apply_progress(&mut self, progress: ProgressUpdate) {
-        self.phase = RunPhase::Running;
+        let was_stopped = self.phase == RunPhase::Stopped;
+        if !was_stopped {
+            self.phase = RunPhase::Running;
+        }
         self.startup = None;
         self.push_progress_point(&progress);
         self.progress = Some(progress);
         self.result = None;
-        self.message = None;
+        self.message = if was_stopped {
+            Some("Evolution paused. Resume continues from the last completed generation.".to_string())
+        } else {
+            None
+        };
     }
 
     fn finish(&mut self, result: CompletedRun) {
@@ -325,8 +335,16 @@ impl RunView {
 
     fn stop(&mut self) {
         self.phase = RunPhase::Stopped;
-        self.startup = None;
-        self.message = Some("Execution stopped by the user.".to_string());
+        self.message = Some(if self.progress.is_some() {
+            "Pausing after the current generation.".to_string()
+        } else {
+            "Run paused by the user.".to_string()
+        });
+    }
+
+    fn resume(&mut self) {
+        self.phase = RunPhase::Running;
+        self.message = Some("Evolution run resumed.".to_string());
     }
 
     fn push_progress_point(&mut self, progress: &ProgressUpdate) {
@@ -430,6 +448,14 @@ impl EvolutionWorker {
     fn terminate(&self) {
         self.worker.terminate();
     }
+
+    fn post_request(&self, request: &WorkerRequest) -> Result<(), String> {
+        let payload = serde_wasm_bindgen::to_value(request)
+            .map_err(|error| format!("failed to encode worker request: {error}"))?;
+        self.worker
+            .post_message(&payload)
+            .map_err(|error| format!("failed to post worker request: {}", js_error(error)))
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -452,6 +478,9 @@ impl EvolutionWorker {
         Err("the web app must run on wasm32".to_string())
     }
     fn terminate(&self) {}
+    fn post_request(&self, _: &WorkerRequest) -> Result<(), String> {
+        Err("the web app must run on wasm32".to_string())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -465,6 +494,7 @@ struct EvolutionWorkerController {
     worker_slot: Rc<RefCell<Option<EvolutionWorker>>>,
     active_run_id: Rc<Cell<u64>>,
     pending_request: Rc<RefCell<Option<RunRequest>>>,
+    last_request: Rc<RefCell<Option<RunRequest>>>,
 }
 
 impl EvolutionWorkerController {
@@ -476,6 +506,7 @@ impl EvolutionWorkerController {
         let run_id = request.run_id();
         self.active_run_id.set(run_id);
         self.terminate();
+        *self.last_request.borrow_mut() = Some(request.clone());
         *self.pending_request.borrow_mut() = Some(request);
 
         let worker = EvolutionWorker::new(
@@ -491,10 +522,49 @@ impl EvolutionWorkerController {
     }
 
     fn stop(&self) {
-        self.terminate();
-        *self.pending_request.borrow_mut() = None;
+        let should_pause_in_place = {
+            let run_view = (self.run_view)();
+            run_view.phase == RunPhase::Running && run_view.progress.is_some()
+        };
+
+        if should_pause_in_place {
+            let stop_result = self
+                .worker_slot
+                .borrow()
+                .as_ref()
+                .map(|worker| {
+                    worker.post_request(&WorkerRequest::Stop {
+                        run_id: self.active_run_id.get(),
+                    })
+                })
+                .unwrap_or_else(|| Err("no active worker".to_string()));
+            if stop_result.is_err() {
+                self.terminate();
+                *self.pending_request.borrow_mut() = None;
+            }
+        } else {
+            self.terminate();
+            *self.pending_request.borrow_mut() = None;
+        }
         let mut run_view = self.run_view;
         run_view.write().stop();
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        let run_id = self.active_run_id.get();
+        if let Some(worker) = self.worker_slot.borrow().as_ref() {
+            worker.post_request(&WorkerRequest::Resume { run_id })?;
+            let mut run_view = self.run_view;
+            run_view.write().resume();
+            return Ok(());
+        }
+
+        let request = self
+            .last_request
+            .borrow()
+            .clone()
+            .ok_or_else(|| "no stopped run is available to resume".to_string())?;
+        self.start(request)
     }
 
     fn terminate(&self) {
@@ -510,6 +580,7 @@ fn use_evolution_worker(run_view: Signal<RunView>) -> EvolutionWorkerController 
         worker_slot: Rc::new(RefCell::new(None::<EvolutionWorker>)),
         active_run_id: Rc::new(Cell::new(0_u64)),
         pending_request: Rc::new(RefCell::new(None::<RunRequest>)),
+        last_request: Rc::new(RefCell::new(None::<RunRequest>)),
     })
 }
 
@@ -520,7 +591,7 @@ fn main() {
 #[component]
 fn App() -> Element {
     let mut draft = use_signal(RunDraft::default);
-    let run_view = use_signal(RunView::default);
+    let mut run_view = use_signal(RunView::default);
     let setup_visible = use_signal(|| true);
     let worker_controller = use_evolution_worker(run_view);
     let leaderboard_page_size = use_signal(|| PAGE_SIZE_OPTIONS[0]);
@@ -583,6 +654,7 @@ fn App() -> Element {
     let mut reset_leaderboard_page = leaderboard_page;
 
     let stop_worker = worker_controller.clone();
+    let resume_worker = worker_controller.clone();
     let mut reopen_setup = setup_visible;
     let mut set_leaderboard_page_size = leaderboard_page_size;
     let mut set_leaderboard_page = leaderboard_page;
@@ -799,7 +871,26 @@ fn App() -> Element {
                                                 stop_worker.stop();
                                             },
                                             {app_icon(AppIcon::Stop)}
-                                            span { "Stop" }
+                                            span { "Pause" }
+                                        }
+                                    } else if phase == RunPhase::Stopped {
+                                        button {
+                                            class: "button button-primary",
+                                            onclick: move |_| {
+                                                if let Err(message) = resume_worker.resume() {
+                                                    run_view.write().fail(message);
+                                                }
+                                            },
+                                            {app_icon(AppIcon::Play)}
+                                            span { "Resume" }
+                                        }
+                                        button {
+                                            class: "button button-secondary",
+                                            onclick: move |_| {
+                                                reopen_setup.set(true);
+                                            },
+                                            {app_icon(AppIcon::Sliders)}
+                                            span { "Edit Setup" }
                                         }
                                     } else if !setup_is_visible {
                                         button {
