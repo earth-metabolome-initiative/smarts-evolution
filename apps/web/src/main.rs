@@ -1594,9 +1594,13 @@ fn normalize_smiles_lines(label: &str, value: &str) -> Result<String, String> {
             continue;
         }
 
-        let parsed = Smiles::from_str(smiles)
-            .map_err(|error| format!("{label} has invalid SMILES at line {}: {error}", line_idx + 1))?;
-        normalized.push(parsed.to_string());
+        let parsed = Smiles::from_str(smiles).map_err(|error| {
+            format!(
+                "{label} has invalid SMILES at line {}: {error}",
+                line_idx + 1
+            )
+        })?;
+        normalized.push(parsed.canonicalize().to_string());
     }
 
     if normalized.is_empty() {

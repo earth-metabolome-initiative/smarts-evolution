@@ -131,8 +131,7 @@ fn parse_samples(
         }
 
         seen += 1;
-        let parsed = Smiles::from_str(smiles)
-            .map_err(|error| format!("invalid {label} SMILES at line {}: {error}", line_idx + 1))?;
+        let parsed = parse_worker_smiles(smiles, label, line_idx + 1)?;
         let target = PreparedTarget::new(parsed);
         samples.push(if is_positive {
             FoldSample::positive(target)
@@ -149,6 +148,12 @@ fn parse_samples(
         }
     }
     Ok(samples)
+}
+
+fn parse_worker_smiles(smiles: &str, label: &str, line_number: usize) -> Result<Smiles, String> {
+    Smiles::from_str(smiles)
+        .map(|parsed| parsed.canonicalize())
+        .map_err(|error| format!("invalid {label} SMILES at line {line_number}: {error}"))
 }
 
 fn build_seed_corpus(input: &str, startup: &mut StartupReporter) -> Result<SeedCorpus, String> {
@@ -316,7 +321,7 @@ impl StartupReporter {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_seed_units, should_report_progress, startup_total};
+    use super::{count_seed_units, parse_worker_smiles, should_report_progress, startup_total};
     use smarts_evolution_web_protocol::{EvolutionConfigInput, RunRequest};
 
     #[test]
@@ -347,5 +352,12 @@ mod tests {
         );
 
         assert_eq!(startup_total(&request), 8);
+    }
+
+    #[test]
+    fn worker_canonicalizes_smiles_before_target_preparation() {
+        let parsed = parse_worker_smiles("OC", "positive", 1).unwrap();
+        assert_eq!(parsed.to_string(), "CO");
+        assert!(parsed.is_canonical());
     }
 }
