@@ -35,14 +35,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install Dioxus CLI
-        run: cargo install dioxus-cli --locked --version 0.7.6 --root "${{ runner.temp }}/dioxus-cli"
+        run: |
+          cargo install dioxus-cli --locked --version 0.7.6 --root "${{ runner.temp }}/dioxus-cli"
 
       - name: Verify Dioxus CLI
-        run: "${{ runner.temp }}/dioxus-cli/bin/dx" --version
+        run: |
+          "${{ runner.temp }}/dioxus-cli/bin/dx" --version
 
       - name: Build production web app
         working-directory: apps/web
-        run: "${{ runner.temp }}/dioxus-cli/bin/dx" build --platform web --release --debug-symbols false
+        run: |
+          "${{ runner.temp }}/dioxus-cli/bin/dx" build --platform web --release --debug-symbols false
 
       - name: Prepare Pages artifact
         run: touch apps/web/target/dx/smarts-evolution-web/release/web/public/.nojekyll
