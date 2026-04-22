@@ -456,7 +456,7 @@ fn evolve_task_inner(
     info!(
         "Built initial population for task '{}' ({} genomes)",
         task_id,
-        population.len()
+        population.len(),
     );
 
     let crossover = SmartsCrossover::new(config.crossover_rate());

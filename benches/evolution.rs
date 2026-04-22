@@ -37,6 +37,58 @@ const SEED_SMARTS: &[&str] = &[
     "[#6](=[#8])[#6]",
 ];
 
+struct ExampleDataset {
+    name: &'static str,
+    positive_smiles: &'static str,
+    negative_smiles: &'static str,
+}
+
+const EXAMPLE_DATASETS: &[ExampleDataset] = &[
+    ExampleDataset {
+        name: "amphetamines",
+        positive_smiles: include_str!(
+            "../apps/web/examples/amphetamines_and_derivatives_positive.smiles"
+        ),
+        negative_smiles: include_str!(
+            "../apps/web/examples/amphetamines_and_derivatives_negative.smiles"
+        ),
+    },
+    ExampleDataset {
+        name: "benzodiazepines",
+        positive_smiles: include_str!("../apps/web/examples/benzodiazepines_positive.smiles"),
+        negative_smiles: include_str!("../apps/web/examples/benzodiazepines_negative.smiles"),
+    },
+    ExampleDataset {
+        name: "fatty-acids",
+        positive_smiles: include_str!(
+            "../apps/web/examples/fatty_acids_and_conjugates_positive.smiles"
+        ),
+        negative_smiles: include_str!(
+            "../apps/web/examples/fatty_acids_and_conjugates_negative.smiles"
+        ),
+    },
+    ExampleDataset {
+        name: "penicillins",
+        positive_smiles: include_str!("../apps/web/examples/penicillins_positive.smiles"),
+        negative_smiles: include_str!("../apps/web/examples/penicillins_negative.smiles"),
+    },
+    ExampleDataset {
+        name: "steroids",
+        positive_smiles: include_str!(
+            "../apps/web/examples/steroids_and_steroid_derivatives_positive.smiles"
+        ),
+        negative_smiles: include_str!(
+            "../apps/web/examples/steroids_and_steroid_derivatives_negative.smiles"
+        ),
+    },
+];
+
+const EXAMPLE_BENCH_POPULATION_SIZE: usize = 64;
+const EXAMPLE_BENCH_GENERATION_LIMIT: u64 = 20;
+const EXAMPLE_BENCH_STAGNATION_LIMIT: u64 = 10;
+const EXAMPLE_BENCH_SEED: u64 = 17;
+const EXAMPLE_EVALUATOR_QUERY: &str = "[#6](~[#6])~[#6]";
+
 fn prepared(smiles: &str) -> PreparedTarget {
     PreparedTarget::new(Smiles::from_str(smiles).unwrap())
 }
@@ -67,6 +119,41 @@ fn build_seed_corpus() -> SeedCorpus {
             .collect(),
     )
     .unwrap()
+}
+
+fn parse_dataset_samples(smiles_block: &str, is_positive: bool) -> Vec<FoldSample> {
+    smiles_block
+        .lines()
+        .map(str::trim)
+        .filter(|smiles| !smiles.is_empty())
+        .map(|smiles| {
+            let target = prepared(smiles);
+            if is_positive {
+                FoldSample::positive(target)
+            } else {
+                FoldSample::negative(target)
+            }
+        })
+        .collect()
+}
+
+fn build_example_task(dataset: &ExampleDataset) -> EvolutionTask {
+    let mut samples = parse_dataset_samples(dataset.positive_smiles, true);
+    samples.extend(parse_dataset_samples(dataset.negative_smiles, false));
+    EvolutionTask::new(
+        format!("example-{}", dataset.name),
+        vec![FoldData::new(samples)],
+    )
+}
+
+fn build_example_config() -> EvolutionConfig {
+    EvolutionConfig::builder()
+        .population_size(EXAMPLE_BENCH_POPULATION_SIZE)
+        .generation_limit(EXAMPLE_BENCH_GENERATION_LIMIT)
+        .stagnation_limit(EXAMPLE_BENCH_STAGNATION_LIMIT)
+        .rng_seed(EXAMPLE_BENCH_SEED)
+        .build()
+        .unwrap()
 }
 
 fn evaluator_benches(c: &mut Criterion) {
@@ -169,6 +256,66 @@ fn evolution_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn example_evaluator_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("example_evaluator");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    let genome = SmartsGenome::from_smarts(EXAMPLE_EVALUATOR_QUERY).unwrap();
+
+    for dataset in EXAMPLE_DATASETS {
+        let task = build_example_task(dataset);
+        let evaluator = SmartsEvaluator::new(task.folds().to_vec());
+        group.bench_with_input(
+            BenchmarkId::new("objective_of", dataset.name),
+            &dataset.name,
+            |b, _| {
+                b.iter(|| evaluator.objective_of(black_box(&genome)));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn example_evolution_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("example_evolution");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(8));
+    group.sample_size(10);
+
+    let config = build_example_config();
+    let seed_corpus = SeedCorpus::builtin();
+
+    for dataset in EXAMPLE_DATASETS {
+        let task = build_example_task(dataset);
+        group.bench_with_input(
+            BenchmarkId::new(
+                "evolve_task",
+                format!(
+                    "{}_pop{}_gen{}",
+                    dataset.name, EXAMPLE_BENCH_POPULATION_SIZE, EXAMPLE_BENCH_GENERATION_LIMIT
+                ),
+            ),
+            &dataset.name,
+            |b, _| {
+                b.iter(|| {
+                    let result = evolve_task(
+                        black_box(&task),
+                        black_box(&config),
+                        black_box(&seed_corpus),
+                    )
+                    .unwrap();
+                    black_box(result.best_mcc());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn operator_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("operators");
     group.warm_up_time(Duration::from_secs(1));
@@ -217,6 +364,8 @@ criterion_group!(
     evaluator_benches,
     evaluator_component_benches,
     evolution_benches,
+    example_evaluator_benches,
+    example_evolution_benches,
     operator_benches
 );
 criterion_main!(benches);
