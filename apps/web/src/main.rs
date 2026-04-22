@@ -185,6 +185,19 @@ impl DraftValidation {
             .or(self.random_immigrant_ratio.as_deref())
             .or(self.stagnation_limit.as_deref())
     }
+
+    fn first_config_error(&self) -> Option<&str> {
+        self.population_size
+            .as_deref()
+            .or(self.generation_limit.as_deref())
+            .or(self.mutation_rate.as_deref())
+            .or(self.crossover_rate.as_deref())
+            .or(self.selection_ratio.as_deref())
+            .or(self.tournament_size.as_deref())
+            .or(self.elite_count.as_deref())
+            .or(self.random_immigrant_ratio.as_deref())
+            .or(self.stagnation_limit.as_deref())
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -679,7 +692,7 @@ fn App() -> Element {
                                 })}
                             }
 
-                            if let Some(error) = validation.first_error() {
+                            if let Some(error) = validation.first_config_error() {
                                 p { class: "message message-error", "{error}" }
                             }
                         }
@@ -1595,7 +1608,7 @@ fn parse_f64(label: &str, value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXAMPLE_PRESETS, RankedCandidate, compare_ranked_candidates,
+        DraftValidation, EXAMPLE_PRESETS, RankedCandidate, compare_ranked_candidates,
     };
 
     #[test]
@@ -1620,6 +1633,24 @@ mod tests {
         let higher_mcc = RankedCandidate::new("[#6]", 0.9000, 1);
 
         assert!(compare_ranked_candidates(&higher_mcc, &lower_mcc).is_lt());
+    }
+
+    #[test]
+    fn config_summary_error_does_not_repeat_smiles_errors() {
+        let validation = DraftValidation {
+            positive_smiles: Some("positive SMILES cannot be empty.".to_string()),
+            population_size: Some("Population must be greater than zero.".to_string()),
+            ..DraftValidation::default()
+        };
+
+        assert_eq!(
+            validation.first_error(),
+            Some("positive SMILES cannot be empty.")
+        );
+        assert_eq!(
+            validation.first_config_error(),
+            Some("Population must be greater than zero.")
+        );
     }
 }
 
