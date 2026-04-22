@@ -258,7 +258,7 @@ fn evaluate_candidate(
     let tn = (context.negative_targets.len() - negative_support) as u64;
 
     Some(CandidateStats {
-        smarts: smarts.to_string(),
+        smarts: genome.smarts().to_string(),
         positive_support,
         negative_support,
         mcc: compute_mcc_from_counts(tp, fp, tn, fn_),

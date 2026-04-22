@@ -308,9 +308,14 @@ mod tests {
     #[test]
     fn builtin_seed_corpus_is_valid() {
         let corpus = SeedCorpus::builtin();
-        assert!(
-            corpus.len() >= GENERIC_BUILTIN_SEED_SMARTS.len() + CURATED_BUILTIN_SEED_SMARTS.len()
-        );
+        let unique_smarts = corpus
+            .entries()
+            .iter()
+            .map(|genome| genome.smarts())
+            .collect::<HashSet<_>>();
+
+        assert!(!corpus.is_empty());
+        assert_eq!(unique_smarts.len(), corpus.len());
         assert!(corpus.entries().iter().all(SmartsGenome::is_valid));
     }
 
@@ -323,9 +328,13 @@ mod tests {
             .map(|genome| genome.smarts())
             .collect();
 
-        assert!(smarts.contains("[#7](~[#6])(~[#6])~[#6]"));
-        assert!(smarts.contains("[#16](=[#8])(=[#8])~[#7]"));
-        assert!(smarts.contains("[#6;r6]~[#6]~[#6]~[#7]"));
+        let tertiary_amine = SmartsGenome::from_smarts("[#7](~[#6])(~[#6])~[#6]").unwrap();
+        let sulfonamide = SmartsGenome::from_smarts("[#16](=[#8])(=[#8])~[#7]").unwrap();
+        let aryl_amine = SmartsGenome::from_smarts("[#6;r6]~[#6]~[#6]~[#7]").unwrap();
+
+        assert!(smarts.contains(tertiary_amine.smarts()));
+        assert!(smarts.contains(sulfonamide.smarts()));
+        assert!(smarts.contains(aryl_amine.smarts()));
     }
 
     #[test]
@@ -409,7 +418,10 @@ mod tests {
             .map(|i| builder.build_genome(i, &mut rng).smarts().to_string())
             .collect();
 
-        assert!(observed.contains("[#6]~[#17]") || observed.contains("[#6]~[#35]"));
+        let chloride = SmartsGenome::from_smarts("[#6]~[#17]").unwrap();
+        let bromide = SmartsGenome::from_smarts("[#6]~[#35]").unwrap();
+
+        assert!(observed.contains(chloride.smarts()) || observed.contains(bromide.smarts()));
     }
 
     #[test]

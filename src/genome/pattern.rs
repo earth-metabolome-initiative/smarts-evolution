@@ -26,7 +26,7 @@ impl SmartsGenome {
     ///
     /// let genome = SmartsGenome::from_smarts("[#6](=[#8])[#7]").unwrap();
     /// assert!(genome.is_valid());
-    /// assert_eq!(genome.to_string(), "[#6](=[#8])[#7]");
+    /// assert_eq!(genome.to_string(), "[#6]([#7])=[#8]");
     /// ```
     pub fn from_smarts(smarts: &str) -> Result<Self, String> {
         let query = QueryMol::from_str(smarts).map_err(|error| error.to_string())?;
@@ -39,7 +39,8 @@ impl SmartsGenome {
     }
 
     fn from_query(query: QueryMol) -> Self {
-        let smarts_string: Arc<str> = query.to_string().into();
+        let query = query.canonicalize();
+        let smarts_string: Arc<str> = query.to_canonical_smarts().into();
         Self {
             complexity: query.atom_count() + query.bonds().len(),
             query,
@@ -102,7 +103,7 @@ mod tests {
         let smarts = "[#6](=[#8])[#7]";
         let genome = SmartsGenome::from_smarts(smarts).unwrap();
 
-        assert_eq!(genome.smarts(), smarts);
+        assert_eq!(genome.smarts(), "[#6]([#7])=[#8]");
         assert_eq!(genome.complexity(), 5);
         assert!(genome.is_valid());
     }
@@ -112,17 +113,28 @@ mod tests {
         let query = QueryMol::from_str("[#6]~[#7]~[#8]").unwrap();
         let genome = SmartsGenome::from_query_mol(&query);
 
-        assert_eq!(genome.query().to_string(), query.to_string());
+        assert!(genome.query().is_canonical());
+        assert_eq!(genome.query().to_string(), query.to_canonical_smarts());
         assert!(genome.is_valid());
     }
 
     #[test]
     fn genome_equality_and_display_use_canonical_smarts() {
         let left = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
-        let right = SmartsGenome::from_query_mol(&QueryMol::from_str("[#6]~[#7]").unwrap());
+        let right = SmartsGenome::from_smarts("[#7]~[#6]").unwrap();
 
         assert_eq!(left, right);
         assert_eq!(left.to_string(), "[#6]~[#7]");
+    }
+
+    #[test]
+    fn genome_canonicalizes_equivalent_atom_orderings() {
+        let left = SmartsGenome::from_smarts("[#6](=[#8])[#7]").unwrap();
+        let right = SmartsGenome::from_smarts("[#8]=[#6]([#7])").unwrap();
+
+        assert_eq!(left, right);
+        assert_eq!(left.smarts(), "[#6]([#7])=[#8]");
+        assert!(left.query().is_canonical());
     }
 
     #[test]
