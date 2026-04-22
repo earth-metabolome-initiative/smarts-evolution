@@ -55,11 +55,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-binstall
-        uses: taiki-e/install-action@cargo-binstall
-
       - name: Install Dioxus CLI
-        run: cargo binstall dioxus-cli@0.7.6 --no-confirm --root "${{ runner.temp }}/dioxus-cli"
+        run: cargo install dioxus-cli --locked --version 0.7.6 --root "${{ runner.temp }}/dioxus-cli"
 
       - name: Verify Dioxus CLI
         run: $DIOXUS_BIN_DIR/dx --version
