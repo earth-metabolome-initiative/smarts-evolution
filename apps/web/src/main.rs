@@ -1,8 +1,11 @@
+mod icons;
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::str::FromStr;
 
 use dioxus::prelude::*;
+use icons::{AppIcon, app_icon};
 use smiles_parser::Smiles;
 use smarts_evolution_web_protocol::{
     CompletedRun, EvolutionConfigInput, ProgressUpdate, RankedCandidate, RunRequest, StartupUpdate,
@@ -18,8 +21,6 @@ use web_sys::{
 #[cfg(target_arch = "wasm32")]
 use smarts_evolution_web_protocol::{WorkerRequest, WorkerResponse};
 
-static STYLE: Asset = asset!("/assets/style.css");
-static FAVICON: Asset = asset!("/assets/favicon.svg");
 #[cfg(target_arch = "wasm32")]
 const WORKER_SCRIPT: &str = "/generated/evolution-worker.js";
 const LEADERBOARD_LIMIT: usize = 100;
@@ -38,7 +39,7 @@ const PLOT_BOTTOM_PAD: f64 = 30.0;
 #[derive(Clone, Copy)]
 struct ExamplePreset {
     label: &'static str,
-    icon_class: &'static str,
+    icon: AppIcon,
     positive_smiles: &'static str,
     negative_smiles: &'static str,
 }
@@ -47,7 +48,7 @@ struct ExamplePreset {
 struct NumericFieldSpec {
     label: &'static str,
     id: &'static str,
-    icon_class: &'static str,
+    icon: AppIcon,
     note: Option<&'static str>,
 }
 
@@ -64,7 +65,7 @@ impl ExamplePreset {
 const EXAMPLE_PRESETS: [ExamplePreset; 5] = [
     ExamplePreset {
         label: "Amphetamines",
-        icon_class: "fa-solid fa-bolt",
+        icon: AppIcon::Bolt,
         positive_smiles: include_str!(
             "../examples/amphetamines_and_derivatives_positive.smiles"
         ),
@@ -74,7 +75,7 @@ const EXAMPLE_PRESETS: [ExamplePreset; 5] = [
     },
     ExamplePreset {
         label: "Flavonoids",
-        icon_class: "fa-solid fa-leaf",
+        icon: AppIcon::Leaf,
         positive_smiles: include_str!(
             "../examples/flavonoids_positive.smiles"
         ),
@@ -84,7 +85,7 @@ const EXAMPLE_PRESETS: [ExamplePreset; 5] = [
     },
     ExamplePreset {
         label: "Fatty acids",
-        icon_class: "fa-solid fa-droplet",
+        icon: AppIcon::Droplet,
         positive_smiles: include_str!(
             "../examples/fatty_acids_and_conjugates_positive.smiles"
         ),
@@ -94,7 +95,7 @@ const EXAMPLE_PRESETS: [ExamplePreset; 5] = [
     },
     ExamplePreset {
         label: "Penicillins",
-        icon_class: "fa-solid fa-capsules",
+        icon: AppIcon::Capsules,
         positive_smiles: include_str!(
             "../examples/penicillins_positive.smiles"
         ),
@@ -104,7 +105,7 @@ const EXAMPLE_PRESETS: [ExamplePreset; 5] = [
     },
     ExamplePreset {
         label: "Steroids",
-        icon_class: "fa-solid fa-dumbbell",
+        icon: AppIcon::Dumbbell,
         positive_smiles: include_str!(
             "../examples/steroids_and_steroid_derivatives_positive.smiles"
         ),
@@ -587,23 +588,6 @@ fn App() -> Element {
     let mut set_leaderboard_page = leaderboard_page;
 
     rsx! {
-        document::Title { "SMARTS Evolution" }
-        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
-        document::Meta {
-            name: "description",
-            content: "Interactive browser workbench for evolving SMARTS against positive and negative SMILES sets.",
-        }
-        document::Meta { name: "application-name", content: "SMARTS Evolution" }
-        document::Meta { name: "apple-mobile-web-app-title", content: "SMARTS Evolution" }
-        document::Meta { name: "theme-color", content: "#132630" }
-        document::Meta { name: "color-scheme", content: "light" }
-        document::Link { rel: "icon", href: FAVICON, r#type: "image/svg+xml" }
-        document::Link {
-            rel: "stylesheet",
-            href: "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css",
-        }
-        document::Stylesheet { href: STYLE }
-
         main { class: "page",
             header { class: "hero",
                 div {
@@ -622,7 +606,7 @@ fn App() -> Element {
                             div { class: "panel-head",
                                 div {
                                     div { class: "panel-title",
-                                        i { class: "fa-solid fa-list-check", aria_hidden: "true" }
+                                        {app_icon(AppIcon::ListCheck)}
                                         h2 { "Run Setup" }
                                     }
                                     p { class: "panel-copy",
@@ -659,7 +643,7 @@ fn App() -> Element {
                                         hide_setup.set(false);
                                         reset_leaderboard_page.set(0);
                                     },
-                                    i { class: "fa-solid fa-play", aria_hidden: "true" }
+                                    {app_icon(AppIcon::Play)}
                                     span { "{start_button_label(phase)}" }
                                 }
                             }
@@ -678,7 +662,7 @@ fn App() -> Element {
                                                 next.negative_smiles = preset.negative_smiles();
                                                 next.seed_smarts.clear();
                                             },
-                                            i { class: "{preset.icon_class}", aria_hidden: "true" }
+                                            {app_icon(preset.icon)}
                                             span { "{preset.label}" }
                                         }
                                     }
@@ -689,7 +673,7 @@ fn App() -> Element {
                                 div { class: if validation.positive_smiles.is_some() { "field field-invalid" } else { "field" },
                                     label { r#for: "positive-smiles",
                                         span { class: "field-label-row",
-                                            i { class: "fa-regular fa-face-smile", aria_hidden: "true" }
+                                            {app_icon(AppIcon::FaceSmile)}
                                             span { "Positive SMILES" }
                                             span { class: "field-count", "{smiles_count_label(positive_smiles_count)}" }
                                         }
@@ -714,7 +698,7 @@ fn App() -> Element {
                                 div { class: if validation.negative_smiles.is_some() { "field field-invalid" } else { "field" },
                                     label { r#for: "negative-smiles",
                                         span { class: "field-label-row",
-                                            i { class: "fa-regular fa-face-frown", aria_hidden: "true" }
+                                            {app_icon(AppIcon::FaceFrown)}
                                             span { "Negative SMILES" }
                                             span { class: "field-count", "{smiles_count_label(negative_smiles_count)}" }
                                         }
@@ -739,7 +723,7 @@ fn App() -> Element {
                                 div { class: "field",
                                     label { r#for: "seed-smarts",
                                         span { class: "field-label-row",
-                                            i { class: "fa-solid fa-seedling", aria_hidden: "true" }
+                                            {app_icon(AppIcon::Seedling)}
                                             span { "Seed SMARTS" }
                                         }
                                     }
@@ -758,31 +742,31 @@ fn App() -> Element {
                             }
 
                             div { class: "config-grid",
-                                {numeric_field(NumericFieldSpec { label: "Population", id: "population-size", icon_class: "fa-solid fa-people-group", note: Some("Population size per generation; larger populations increase search breadth but raise evaluation cost.") }, draft_value.population_size.clone(), validation.population_size.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Population", id: "population-size", icon: AppIcon::PeopleGroup, note: Some("Population size per generation; larger populations increase search breadth but raise evaluation cost.") }, draft_value.population_size.clone(), validation.population_size.as_deref(), is_running, move |value| {
                                     draft.write().population_size = value;
                                 })}
-                                {numeric_field(NumericFieldSpec { label: "Generations", id: "generation-limit", icon_class: "fa-solid fa-timeline", note: Some("Upper bound on the number of evolutionary generations.") }, draft_value.generation_limit.clone(), validation.generation_limit.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Generations", id: "generation-limit", icon: AppIcon::Timeline, note: Some("Upper bound on the number of evolutionary generations.") }, draft_value.generation_limit.clone(), validation.generation_limit.as_deref(), is_running, move |value| {
                                     draft.write().generation_limit = value;
                                 })}
-                                {numeric_field(NumericFieldSpec { label: "Mutation rate", id: "mutation-rate", icon_class: "fa-solid fa-wand-magic-sparkles", note: Some("Per-offspring mutation probability.") }, draft_value.mutation_rate.clone(), validation.mutation_rate.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Mutation rate", id: "mutation-rate", icon: AppIcon::WandMagicSparkles, note: Some("Per-offspring mutation probability.") }, draft_value.mutation_rate.clone(), validation.mutation_rate.as_deref(), is_running, move |value| {
                                     draft.write().mutation_rate = value;
                                 })}
-                                {numeric_field(NumericFieldSpec { label: "Crossover rate", id: "crossover-rate", icon_class: "fa-solid fa-code-branch", note: Some("Probability of crossover by subtree splicing between two parents.") }, draft_value.crossover_rate.clone(), validation.crossover_rate.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Crossover rate", id: "crossover-rate", icon: AppIcon::CodeBranch, note: Some("Probability of crossover by subtree splicing between two parents.") }, draft_value.crossover_rate.clone(), validation.crossover_rate.as_deref(), is_running, move |value| {
                                     draft.write().crossover_rate = value;
                                 })}
-                                {numeric_field(NumericFieldSpec { label: "Selection ratio", id: "selection-ratio", icon_class: "fa-solid fa-filter", note: Some("Fraction of the population retained in the parent-selection pool.") }, draft_value.selection_ratio.clone(), validation.selection_ratio.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Selection ratio", id: "selection-ratio", icon: AppIcon::Filter, note: Some("Fraction of the population retained in the parent-selection pool.") }, draft_value.selection_ratio.clone(), validation.selection_ratio.as_deref(), is_running, move |value| {
                                     draft.write().selection_ratio = value;
                                 })}
-                                {numeric_field(NumericFieldSpec { label: "Tournament size", id: "tournament-size", icon_class: "fa-solid fa-trophy", note: Some("Number of candidates sampled per tournament during parent selection.") }, draft_value.tournament_size.clone(), validation.tournament_size.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Tournament size", id: "tournament-size", icon: AppIcon::Trophy, note: Some("Number of candidates sampled per tournament during parent selection.") }, draft_value.tournament_size.clone(), validation.tournament_size.as_deref(), is_running, move |value| {
                                     draft.write().tournament_size = value;
                                 })}
-                                {numeric_field(NumericFieldSpec { label: "Elite count", id: "elite-count", icon_class: "fa-solid fa-crown", note: Some("Number of elite candidates preserved unchanged by elitist reinsertion.") }, draft_value.elite_count.clone(), validation.elite_count.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Elite count", id: "elite-count", icon: AppIcon::Crown, note: Some("Number of elite candidates preserved unchanged by elitist reinsertion.") }, draft_value.elite_count.clone(), validation.elite_count.as_deref(), is_running, move |value| {
                                     draft.write().elite_count = value;
                                 })}
-                                {numeric_field(NumericFieldSpec { label: "Immigrant ratio", id: "immigrant-ratio", icon_class: "fa-solid fa-shuffle", note: Some("Fraction of each generation replaced by random immigrants.") }, draft_value.random_immigrant_ratio.clone(), validation.random_immigrant_ratio.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Immigrant ratio", id: "immigrant-ratio", icon: AppIcon::Shuffle, note: Some("Fraction of each generation replaced by random immigrants.") }, draft_value.random_immigrant_ratio.clone(), validation.random_immigrant_ratio.as_deref(), is_running, move |value| {
                                     draft.write().random_immigrant_ratio = value;
                                 })}
-                                {numeric_field(NumericFieldSpec { label: "Stagnation limit", id: "stagnation-limit", icon_class: "fa-solid fa-hourglass-half", note: Some("Terminate after this many generations without improvement in the incumbent best candidate.") }, draft_value.stagnation_limit.clone(), validation.stagnation_limit.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Stagnation limit", id: "stagnation-limit", icon: AppIcon::HourglassHalf, note: Some("Terminate after this many generations without improvement in the incumbent best candidate.") }, draft_value.stagnation_limit.clone(), validation.stagnation_limit.as_deref(), is_running, move |value| {
                                     draft.write().stagnation_limit = value;
                                 })}
                             }
@@ -800,7 +784,7 @@ fn App() -> Element {
                             div { class: "panel-head",
                                 div {
                                     div { class: "panel-title",
-                                        i { class: "fa-solid fa-chart-line", aria_hidden: "true" }
+                                        {app_icon(AppIcon::ChartLine)}
                                         h2 { "Run Snapshot" }
                                     }
                                     p { class: "panel-copy",
@@ -814,7 +798,7 @@ fn App() -> Element {
                                             onclick: move |_| {
                                                 stop_worker.stop();
                                             },
-                                            i { class: "fa-solid fa-stop", aria_hidden: "true" }
+                                            {app_icon(AppIcon::Stop)}
                                             span { "Stop" }
                                         }
                                     } else if !setup_is_visible {
@@ -823,7 +807,7 @@ fn App() -> Element {
                                             onclick: move |_| {
                                                 reopen_setup.set(true);
                                             },
-                                            i { class: "fa-solid fa-sliders", aria_hidden: "true" }
+                                            {app_icon(AppIcon::Sliders)}
                                             span { "Edit Setup" }
                                         }
                                     }
@@ -888,7 +872,7 @@ fn App() -> Element {
                             div { class: "leaderboard-head",
                                 div {
                                     div { class: "panel-title panel-title-compact",
-                                        i { class: "fa-solid fa-trophy", aria_hidden: "true" }
+                                        {app_icon(AppIcon::Trophy)}
                                         h3 { "Candidates" }
                                     }
                                     p { class: "leaderboard-meta",
@@ -933,7 +917,7 @@ fn App() -> Element {
                                                     set_leaderboard_page.set(page_window.page - 1);
                                                 }
                                             },
-                                            i { class: "fa-solid fa-chevron-left", aria_hidden: "true" }
+                                            {app_icon(AppIcon::ChevronLeft)}
                                         }
                                         button {
                                             class: "button button-secondary button-compact",
@@ -943,7 +927,7 @@ fn App() -> Element {
                                                     set_leaderboard_page.set(page_window.page + 1);
                                                 }
                                             },
-                                            i { class: "fa-solid fa-chevron-right", aria_hidden: "true" }
+                                            {app_icon(AppIcon::ChevronRight)}
                                         }
                                     }
                                 }
@@ -997,7 +981,7 @@ fn numeric_field(
             div { class: "field-inline-row",
                 label { r#for: "{spec.id}", class: "field-inline-label",
                     span { class: "field-label-row",
-                        i { class: "{spec.icon_class}", aria_hidden: "true" }
+                        {app_icon(spec.icon)}
                         span { "{spec.label}" }
                     }
                 }
