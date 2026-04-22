@@ -718,6 +718,7 @@ name = "smarts-evolution"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "elements_rs",
  "getrandom",
  "hashbrown 0.17.0",
  "log",

@@ -13,6 +13,7 @@ lto = "thin"
 codegen-units = 1
 
 [dependencies]
+elements_rs = "0.2.3"
 smarts-parser = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-parser" }
 smarts-validator = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-validator" }
 smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main" }
