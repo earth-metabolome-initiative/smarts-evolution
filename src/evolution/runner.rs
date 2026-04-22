@@ -13,7 +13,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use super::config::EvolutionConfig;
-use crate::fitness::evaluator::{FoldData, SmartsEvaluator};
+use crate::fitness::evaluator::{FoldData, GenomeEvaluation, SmartsEvaluator};
 use crate::fitness::objective::ObjectiveFitness;
 use crate::genome::SmartsGenome;
 use crate::genome::seed::{SeedCorpus, SmartsGenomeBuilder};
@@ -21,6 +21,7 @@ use crate::operators::crossover::SmartsCrossover;
 use crate::operators::mutation::SmartsMutation;
 
 const RESET_POOL_SIZE: usize = 32;
+const DIVERSE_ELITE_POOL_FACTOR: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvolutionError {
@@ -52,14 +53,15 @@ struct GenerationStats {
     average_complexity: f64,
 }
 
-#[derive(Clone, Copy)]
-struct CachedFitness {
+#[derive(Clone)]
+struct CachedEvaluation {
     fitness: ObjectiveFitness,
+    phenotype: Arc<[u64]>,
     stamp: u64,
 }
 
 struct FitnessCache {
-    entries: HashMap<Arc<str>, CachedFitness>,
+    entries: HashMap<Arc<str>, CachedEvaluation>,
     access_order: VecDeque<(Arc<str>, u64)>,
     capacity: usize,
     next_stamp: u64,
@@ -75,30 +77,36 @@ impl FitnessCache {
         }
     }
 
-    fn get(&mut self, key: &Arc<str>) -> Option<ObjectiveFitness> {
+    fn get(&mut self, key: &Arc<str>) -> Option<(ObjectiveFitness, Arc<[u64]>)> {
         if self.capacity == 0 {
             return None;
         }
 
         let stamp = self.bump_stamp();
-        let fitness = {
+        let evaluation = {
             let cached = self.entries.get_mut(key)?;
             cached.stamp = stamp;
-            cached.fitness
+            (cached.fitness, cached.phenotype.clone())
         };
         self.access_order.push_back((key.clone(), stamp));
         self.compact_if_needed();
-        Some(fitness)
+        Some(evaluation)
     }
 
-    fn insert(&mut self, key: Arc<str>, fitness: ObjectiveFitness) {
+    fn insert(&mut self, key: Arc<str>, fitness: ObjectiveFitness, phenotype: Arc<[u64]>) {
         if self.capacity == 0 {
             return;
         }
 
         let stamp = self.bump_stamp();
-        self.entries
-            .insert(key.clone(), CachedFitness { fitness, stamp });
+        self.entries.insert(
+            key.clone(),
+            CachedEvaluation {
+                fitness,
+                phenotype,
+                stamp,
+            },
+        );
         self.access_order.push_back((key, stamp));
         self.evict_to_capacity();
         self.compact_if_needed();
@@ -149,6 +157,13 @@ impl FitnessCache {
         entries.sort_by_key(|(_, stamp)| *stamp);
         self.access_order = entries.into();
     }
+}
+
+#[derive(Clone)]
+struct ScoredGenome {
+    genome: SmartsGenome,
+    fitness: ObjectiveFitness,
+    phenotype: Arc<[u64]>,
 }
 
 /// One generic evolution task.
@@ -494,31 +509,41 @@ fn evolve_task_inner(
 
         for genome in unique_population {
             let smarts = genome.smarts_shared().clone();
-            if let Some(fitness) = fitness_cache.get(&smarts) {
+            if let Some((fitness, phenotype)) = fitness_cache.get(&smarts) {
                 cache_hits += 1;
-                unique_scored.push((genome, fitness));
+                unique_scored.push(ScoredGenome {
+                    genome,
+                    fitness,
+                    phenotype,
+                });
             } else {
                 uncached_genomes.push(genome);
             }
         }
 
-        let freshly_scored = evaluator.fitness_of_many(uncached_genomes);
-        for (genome, fitness) in freshly_scored {
-            fitness_cache.insert(genome.smarts_shared().clone(), fitness);
-            unique_scored.push((genome, fitness));
+        let freshly_scored = evaluator.evaluate_many(uncached_genomes);
+        for (genome, evaluation) in freshly_scored {
+            unique_scored.push(build_scored_genome(&mut fitness_cache, genome, evaluation));
         }
 
+        unique_scored = phenotypically_deduplicate(unique_scored);
         unique_scored.sort_by(compare_scored_genomes);
         let leaders = leaderboard_from_scored(&unique_scored, leaderboard_size);
 
         let lead = &unique_scored[0];
-        let lead_complexity = lead.0.complexity();
+        let lead_complexity = lead.genome.complexity();
         if generation == 0
-            || is_better_candidate(lead.1, &lead.0, best_fitness, best_text_len, &best_smarts)
+            || is_better_candidate(
+                lead.fitness,
+                &lead.genome,
+                best_fitness,
+                best_text_len,
+                &best_smarts,
+            )
         {
-            best_fitness = lead.1;
-            best_smarts = lead.0.smarts().to_string();
-            best_text_len = lead.0.smarts().len();
+            best_fitness = lead.fitness;
+            best_smarts = lead.genome.smarts().to_string();
+            best_text_len = lead.genome.smarts().len();
             stagnation = 0;
         } else {
             stagnation += 1;
@@ -537,7 +562,7 @@ fn evolve_task_inner(
             "Task '{}' gen {}: {}",
             task_id,
             generation + 1,
-            generation_progress_message(&stats, lead.1, best_fitness,),
+            generation_progress_message(&stats, lead.fitness, best_fitness,),
         );
 
         let generations = generation + 1;
@@ -555,7 +580,7 @@ fn evolve_task_inner(
             generation: generations,
             generation_limit: config.generation_limit(),
             status,
-            best: RankedSmarts::new(&lead.0, lead.1),
+            best: RankedSmarts::new(&lead.genome, lead.fitness),
             leaders,
             stats: &stats,
             stagnation,
@@ -664,6 +689,21 @@ fn build_task_result(
     }
 }
 
+fn build_scored_genome(
+    fitness_cache: &mut FitnessCache,
+    genome: SmartsGenome,
+    evaluation: GenomeEvaluation,
+) -> ScoredGenome {
+    let phenotype = evaluation.phenotype().clone();
+    let fitness = evaluation.fitness();
+    fitness_cache.insert(genome.smarts_shared().clone(), fitness, phenotype.clone());
+    ScoredGenome {
+        genome,
+        fitness,
+        phenotype,
+    }
+}
+
 #[cfg(test)]
 fn deduplicate_population(population: &[SmartsGenome]) -> (Vec<SmartsGenome>, usize) {
     let mut unique = Vec::with_capacity(population.len());
@@ -693,7 +733,7 @@ fn insert_unique_genome(
 }
 
 fn reinsert_population(
-    scored_unique: &[(SmartsGenome, ObjectiveFitness)],
+    scored_unique: &[ScoredGenome],
     offspring: Vec<SmartsGenome>,
     population_size: usize,
     elite_count: usize,
@@ -704,8 +744,8 @@ fn reinsert_population(
     let mut next_gen = Vec::with_capacity(population_size);
     let mut seen: HashSet<Arc<str>> = HashSet::with_capacity(population_size);
 
-    for (genome, _) in scored_unique.iter().take(elite_count) {
-        insert_unique_genome(&mut next_gen, &mut seen, genome.clone());
+    for genome in select_diverse_elites(scored_unique, elite_count) {
+        insert_unique_genome(&mut next_gen, &mut seen, genome);
     }
 
     for genome in offspring {
@@ -800,15 +840,12 @@ fn generation_progress_message(
     )
 }
 
-fn compare_scored_genomes(
-    left: &(SmartsGenome, ObjectiveFitness),
-    right: &(SmartsGenome, ObjectiveFitness),
-) -> Ordering {
+fn compare_scored_genomes(left: &ScoredGenome, right: &ScoredGenome) -> Ordering {
     right
-        .1
-        .cmp(&left.1)
-        .then_with(|| left.0.smarts().len().cmp(&right.0.smarts().len()))
-        .then_with(|| left.0.smarts().cmp(right.0.smarts()))
+        .fitness
+        .cmp(&left.fitness)
+        .then_with(|| left.genome.smarts().len().cmp(&right.genome.smarts().len()))
+        .then_with(|| left.genome.smarts().cmp(right.genome.smarts()))
 }
 
 fn is_better_candidate(
@@ -825,7 +862,7 @@ fn is_better_candidate(
 }
 
 fn tournament_select(
-    scored: &[(SmartsGenome, ObjectiveFitness)],
+    scored: &[ScoredGenome],
     count: usize,
     tournament_size: usize,
     rng: &mut impl rand::Rng,
@@ -839,20 +876,102 @@ fn tournament_select(
                 best_idx = idx;
             }
         }
-        parents.push(scored[best_idx].0.clone());
+        parents.push(scored[best_idx].genome.clone());
     }
     parents
 }
 
-fn leaderboard_from_scored(
-    scored: &[(SmartsGenome, ObjectiveFitness)],
-    limit: usize,
-) -> Vec<RankedSmarts> {
+fn leaderboard_from_scored(scored: &[ScoredGenome], limit: usize) -> Vec<RankedSmarts> {
     scored
         .iter()
         .take(limit.max(1))
-        .map(|(genome, fitness)| RankedSmarts::new(genome, *fitness))
+        .map(|candidate| RankedSmarts::new(&candidate.genome, candidate.fitness))
         .collect()
+}
+
+fn phenotypically_deduplicate(scored: Vec<ScoredGenome>) -> Vec<ScoredGenome> {
+    let mut best_by_phenotype: HashMap<Arc<[u64]>, ScoredGenome> =
+        HashMap::with_capacity(scored.len());
+
+    for candidate in scored {
+        let phenotype = candidate.phenotype.clone();
+        match best_by_phenotype.entry(phenotype) {
+            hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                if compare_scored_genomes(&candidate, entry.get()).is_lt() {
+                    entry.insert(candidate);
+                }
+            }
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+        }
+    }
+
+    best_by_phenotype.into_values().collect()
+}
+
+fn select_diverse_elites(scored: &[ScoredGenome], elite_count: usize) -> Vec<SmartsGenome> {
+    if scored.is_empty() || elite_count == 0 {
+        return Vec::new();
+    }
+
+    let pool_len = scored
+        .len()
+        .min(elite_count.max(1).saturating_mul(DIVERSE_ELITE_POOL_FACTOR));
+    let pool = &scored[..pool_len];
+    let target = elite_count.min(pool.len());
+    let mut selected = Vec::with_capacity(target);
+    let mut selected_indices = Vec::with_capacity(target);
+
+    selected.push(pool[0].genome.clone());
+    selected_indices.push(0usize);
+
+    while selected.len() < target {
+        let mut best_idx = None;
+        let mut best_distance = 0u32;
+
+        for candidate_idx in 0..pool.len() {
+            if selected_indices.contains(&candidate_idx) {
+                continue;
+            }
+
+            let distance = selected_indices
+                .iter()
+                .map(|&selected_idx| {
+                    phenotype_distance(
+                        pool[candidate_idx].phenotype.as_ref(),
+                        pool[selected_idx].phenotype.as_ref(),
+                    )
+                })
+                .min()
+                .unwrap_or(0);
+
+            let is_better = distance > best_distance
+                || (distance == best_distance
+                    && best_idx.is_some_and(|current_best| {
+                        compare_scored_genomes(&pool[candidate_idx], &pool[current_best]).is_lt()
+                    }));
+            if best_idx.is_none() || is_better {
+                best_idx = Some(candidate_idx);
+                best_distance = distance;
+            }
+        }
+
+        let Some(next_idx) = best_idx else {
+            break;
+        };
+        selected.push(pool[next_idx].genome.clone());
+        selected_indices.push(next_idx);
+    }
+
+    selected
+}
+
+fn phenotype_distance(left: &[u64], right: &[u64]) -> u32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left_word, right_word)| (left_word ^ right_word).count_ones())
+        .sum()
 }
 
 #[cfg(test)]
@@ -868,6 +987,14 @@ mod regression_tests {
 
     fn fitness(mcc: f64) -> ObjectiveFitness {
         ObjectiveFitness::from_mcc(mcc)
+    }
+
+    fn scored(smarts: &str, mcc: f64, phenotype: &[u64]) -> ScoredGenome {
+        ScoredGenome {
+            genome: SmartsGenome::from_smarts(smarts).unwrap(),
+            fitness: fitness(mcc),
+            phenotype: Arc::from(phenotype.to_vec()),
+        }
     }
 
     fn target(smiles: &str) -> PreparedTarget {
@@ -1046,8 +1173,8 @@ mod regression_tests {
     #[test]
     fn reinsert_population_prefers_unique_offspring_and_immigrants() {
         let scored = vec![
-            (SmartsGenome::from_smarts("[#6]").unwrap(), fitness(0.90)),
-            (SmartsGenome::from_smarts("[#7]").unwrap(), fitness(0.80)),
+            scored("[#6]", 0.90, &[0b0001]),
+            scored("[#7]", 0.80, &[0b0010]),
         ];
         let offspring = vec![
             SmartsGenome::from_smarts("[#6]").unwrap(),
@@ -1072,7 +1199,7 @@ mod regression_tests {
 
     #[test]
     fn reinsert_population_falls_back_to_duplicate_immigrants_after_unique_budget() {
-        let scored = vec![(SmartsGenome::from_smarts("[#6]").unwrap(), fitness(0.90))];
+        let scored = vec![scored("[#6]", 0.90, &[0b0001])];
         let offspring = vec![SmartsGenome::from_smarts("[#6]").unwrap()];
 
         let next_gen = reinsert_population(&scored, offspring, 3, 1, 0, || {
@@ -1114,14 +1241,51 @@ mod regression_tests {
 
     #[test]
     fn shorter_textual_smarts_win_when_scores_tie() {
-        let short = (SmartsGenome::from_smarts("[N]").unwrap(), fitness(0.75));
-        let long = (SmartsGenome::from_smarts("[#7]").unwrap(), fitness(0.75));
+        let short = scored("[N]", 0.75, &[0b0001]);
+        let long = scored("[#7]", 0.75, &[0b0010]);
 
-        assert_eq!(short.0.complexity(), long.0.complexity());
-        assert!(short.0.smarts().len() < long.0.smarts().len());
+        assert_eq!(short.genome.complexity(), long.genome.complexity());
+        assert!(short.genome.smarts().len() < long.genome.smarts().len());
 
         assert!(compare_scored_genomes(&short, &long).is_lt());
         assert!(compare_scored_genomes(&long, &short).is_gt());
+    }
+
+    #[test]
+    fn phenotypic_dedup_keeps_best_representative_for_same_behavior() {
+        let deduped = phenotypically_deduplicate(vec![
+            scored("[#7]", 0.80, &[0b0101]),
+            scored("[N]", 0.80, &[0b0101]),
+            scored("[#8]", 0.70, &[0b0011]),
+        ]);
+        let mut smarts = deduped
+            .iter()
+            .map(|candidate| candidate.genome.smarts())
+            .collect::<Vec<_>>();
+        smarts.sort_unstable();
+
+        assert_eq!(smarts, vec!["[#8]", "[N]"]);
+    }
+
+    #[test]
+    fn select_diverse_elites_prefers_distinct_behaviors_within_front() {
+        let elites = select_diverse_elites(
+            &[
+                scored("[#6]", 0.90, &[0b0000]),
+                scored("[#7]", 0.89, &[0b0000]),
+                scored("[#8]", 0.88, &[0b1111]),
+                scored("[#16]", 0.87, &[0b1100]),
+            ],
+            2,
+        );
+
+        assert_eq!(
+            elites
+                .iter()
+                .map(|genome| genome.smarts())
+                .collect::<Vec<_>>(),
+            vec!["[#6]", "[#8]"]
+        );
     }
 
     #[test]
@@ -1157,14 +1321,135 @@ mod regression_tests {
         let b: Arc<str> = "[#7]".into();
         let c: Arc<str> = "[#8]".into();
 
-        cache.insert(a.clone(), fitness(0.8));
-        cache.insert(b.clone(), fitness(0.7));
+        cache.insert(a.clone(), fitness(0.8), Arc::from([0b0001u64]));
+        cache.insert(b.clone(), fitness(0.7), Arc::from([0b0010u64]));
         assert!(cache.get(&a).is_some());
-        cache.insert(c.clone(), fitness(0.6));
+        cache.insert(c.clone(), fitness(0.6), Arc::from([0b0100u64]));
 
         assert_eq!(cache.len(), 2);
         assert!(cache.get(&a).is_some());
         assert!(cache.get(&c).is_some());
         assert!(cache.get(&b).is_none());
+    }
+
+    #[test]
+    fn fitness_cache_zero_capacity_and_compaction_paths_are_safe() {
+        let mut cache = FitnessCache::new(0);
+        let key: Arc<str> = "[#6]".into();
+        cache.insert(key.clone(), fitness(0.8), Arc::from([0b1u64]));
+        assert!(cache.get(&key).is_none());
+        assert_eq!(cache.len(), 0);
+
+        let mut cache = FitnessCache::new(1);
+        let key: Arc<str> = "[#7]".into();
+        cache.insert(key.clone(), fitness(0.7), Arc::from([0b10u64]));
+        for _ in 0..1100 {
+            assert!(cache.get(&key).is_some());
+        }
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn public_accessors_and_display_helpers_round_trip() {
+        let ranked = RankedSmarts::new(&SmartsGenome::from_smarts("[#6]").unwrap(), fitness(0.5));
+        assert_eq!(ranked.smarts(), "[#6]");
+        assert_eq!(ranked.mcc(), 0.5);
+        assert_eq!(ranked.complexity(), 1);
+
+        let stats = GenerationStats {
+            unique_count: 2,
+            total_count: 3,
+            duplicate_count: 1,
+            cache_hits: 1,
+            lead_complexity: 4,
+            average_complexity: 2.5,
+        };
+        let progress = EvolutionProgress::from_snapshot(ProgressSnapshot {
+            task_id: "task-1",
+            generation: 3,
+            generation_limit: 7,
+            status: EvolutionStatus::Running,
+            best: ranked.clone(),
+            leaders: vec![ranked.clone()],
+            stats: &stats,
+            stagnation: 2,
+        });
+
+        assert_eq!(progress.task_id(), "task-1");
+        assert_eq!(progress.generation(), 3);
+        assert_eq!(progress.generation_limit(), 7);
+        assert_eq!(progress.status(), EvolutionStatus::Running);
+        assert_eq!(progress.best().smarts(), "[#6]");
+        assert_eq!(progress.leaders().len(), 1);
+        assert_eq!(progress.unique_count(), 2);
+        assert_eq!(progress.total_count(), 3);
+        assert_eq!(progress.duplicate_count(), 1);
+        assert_eq!(progress.cache_hits(), 1);
+        assert_eq!(progress.lead_complexity(), 4);
+        assert_eq!(progress.average_complexity(), 2.5);
+        assert_eq!(progress.stagnation(), 2);
+
+        let result =
+            build_task_result("task-1", "[#7]".to_string(), fitness(0.75), 4, vec![ranked]);
+        assert_eq!(result.task_id(), "task-1");
+        assert_eq!(result.best_smarts(), "[#7]");
+        assert_eq!(result.best_mcc(), 0.75);
+        assert_eq!(result.generations(), 4);
+        assert_eq!(result.leaders().len(), 1);
+
+        assert_eq!(
+            EvolutionError::InvalidConfig("bad".to_string()).to_string(),
+            "bad"
+        );
+    }
+
+    #[test]
+    fn helper_branches_cover_tie_breaks_and_empty_inputs() {
+        let seeded = EvolutionConfig::builder().rng_seed(17).build().unwrap();
+        let mut rng_a = build_rng(&seeded);
+        let mut rng_b = build_rng(&seeded);
+        assert_eq!(rng_a.random::<u64>(), rng_b.random::<u64>());
+
+        let short = SmartsGenome::from_smarts("[N]").unwrap();
+        let long = SmartsGenome::from_smarts("[#7]").unwrap();
+        assert!(is_better_candidate(
+            fitness(0.5),
+            &short,
+            fitness(0.5),
+            long.smarts().len(),
+            long.smarts(),
+        ));
+        assert!(!is_better_candidate(
+            fitness(0.5),
+            &long,
+            fitness(0.5),
+            short.smarts().len(),
+            short.smarts(),
+        ));
+
+        let alpha = SmartsGenome::from_smarts("[#6]").unwrap();
+        let beta = SmartsGenome::from_smarts("[#7]").unwrap();
+        assert!(is_better_candidate(
+            fitness(0.5),
+            &alpha,
+            fitness(0.5),
+            beta.smarts().len(),
+            beta.smarts(),
+        ));
+
+        let leaders = leaderboard_from_scored(&[scored("[#6]", 0.9, &[0b1])], 0);
+        assert_eq!(leaders.len(), 1);
+        assert_eq!(leaders[0].smarts(), "[#6]");
+
+        let deduped = phenotypically_deduplicate(vec![
+            scored("[#6]", 0.8, &[0b1]),
+            scored("[#7]", 0.7, &[0b1]),
+        ]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].genome.smarts(), "[#6]");
+
+        assert!(select_diverse_elites(&[], 2).is_empty());
+        assert!(select_diverse_elites(&[scored("[#6]", 0.8, &[0b1])], 0).is_empty());
+        assert_eq!(phenotype_distance(&[0b1010], &[0b0011]), 2);
     }
 }

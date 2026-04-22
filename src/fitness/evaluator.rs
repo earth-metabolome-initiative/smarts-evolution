@@ -1,3 +1,5 @@
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -77,6 +79,22 @@ pub struct SmartsEvaluator {
     folds: Vec<FoldData>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenomeEvaluation {
+    fitness: ObjectiveFitness,
+    phenotype: Arc<[u64]>,
+}
+
+impl GenomeEvaluation {
+    pub fn fitness(&self) -> ObjectiveFitness {
+        self.fitness
+    }
+
+    pub fn phenotype(&self) -> &Arc<[u64]> {
+        &self.phenotype
+    }
+}
+
 impl fmt::Debug for SmartsEvaluator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SmartsEvaluator")
@@ -91,49 +109,69 @@ impl SmartsEvaluator {
         Self { folds }
     }
 
-    fn fold_counts_for_query(
+    fn fold_counts_and_behavior_for_query(
         &self,
         query: &smarts_parser::QueryMol,
-    ) -> Option<Vec<ConfusionCounts>> {
+    ) -> Option<(Vec<ConfusionCounts>, Arc<[u64]>)> {
         let compiled = CompiledQuery::new(query.clone()).ok()?;
-        Some(self.fold_counts_for_compiled(&compiled))
+        Some(self.fold_counts_and_behavior_for_compiled(&compiled))
     }
 
     // Keep fold aggregation localized so future evaluator changes stay local.
-    fn fold_counts_for_compiled(&self, compiled: &CompiledQuery) -> Vec<ConfusionCounts> {
-        self.folds
+    fn fold_counts_and_behavior_for_compiled(
+        &self,
+        compiled: &CompiledQuery,
+    ) -> (Vec<ConfusionCounts>, Arc<[u64]>) {
+        let total_samples: usize = self.folds.iter().map(FoldData::len).sum();
+        let mut behavior_words = vec![0u64; total_samples.div_ceil(64)];
+        let mut bit_index = 0usize;
+        let fold_counts = self
+            .folds
             .iter()
-            .map(|fold| count_matches_in_fold(compiled, fold))
-            .collect()
+            .map(|fold| count_matches_in_fold(compiled, fold, &mut behavior_words, &mut bit_index))
+            .collect();
+        (fold_counts, Arc::from(behavior_words))
     }
 
     /// Evaluate the MCC objective for a genome.
     pub fn objective_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
-        let Some(fold_counts) = self.fold_counts_for_query(genome.query()) else {
-            return ObjectiveFitness::invalid();
-        };
-
-        let mcc = compute_fold_averaged_mcc(&fold_counts);
-        ObjectiveFitness::from_mcc(mcc)
+        self.evaluate(genome).fitness()
     }
 
     pub fn fitness_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
         self.objective_of(genome)
     }
 
+    pub fn evaluate(&self, genome: &SmartsGenome) -> GenomeEvaluation {
+        let Some((fold_counts, phenotype)) =
+            self.fold_counts_and_behavior_for_query(genome.query())
+        else {
+            return GenomeEvaluation {
+                fitness: ObjectiveFitness::invalid(),
+                phenotype: Arc::from([]),
+            };
+        };
+
+        let mcc = compute_fold_averaged_mcc(&fold_counts);
+        GenomeEvaluation {
+            fitness: ObjectiveFitness::from_mcc(mcc),
+            phenotype,
+        }
+    }
+
     /// Evaluate a batch of genomes, using Rayon on std targets when the batch
     /// is large enough to amortize scheduling overhead.
-    pub fn fitness_of_many(
+    pub fn evaluate_many(
         &self,
         genomes: Vec<SmartsGenome>,
-    ) -> Vec<(SmartsGenome, ObjectiveFitness)> {
+    ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         if genomes.len() >= MIN_PARALLEL_GENOMES {
             return genomes
                 .into_par_iter()
                 .map(|genome| {
-                    let fitness = self.fitness_of(&genome);
-                    (genome, fitness)
+                    let evaluation = self.evaluate(&genome);
+                    (genome, evaluation)
                 })
                 .collect();
         }
@@ -141,30 +179,49 @@ impl SmartsEvaluator {
         genomes
             .into_iter()
             .map(|genome| {
-                let fitness = self.fitness_of(&genome);
-                (genome, fitness)
+                let evaluation = self.evaluate(&genome);
+                (genome, evaluation)
             })
+            .collect()
+    }
+
+    pub fn fitness_of_many(
+        &self,
+        genomes: Vec<SmartsGenome>,
+    ) -> Vec<(SmartsGenome, ObjectiveFitness)> {
+        self.evaluate_many(genomes)
+            .into_iter()
+            .map(|(genome, evaluation)| (genome, evaluation.fitness()))
             .collect()
     }
 }
 
-fn count_matches_in_fold(query: &CompiledQuery, fold: &FoldData) -> ConfusionCounts {
+fn count_matches_in_fold(
+    query: &CompiledQuery,
+    fold: &FoldData,
+    behavior_words: &mut [u64],
+    bit_index: &mut usize,
+) -> ConfusionCounts {
     let mut counts = ConfusionCounts::default();
 
     for sample in fold.samples() {
-        counts += count_match_for_sample(query, sample);
+        let matched = matches_compiled(query, sample.target());
+        record_behavior_match(behavior_words, *bit_index, matched);
+        *bit_index += 1;
+        counts.record_match(matched, sample.is_positive());
     }
 
     counts
 }
 
-fn count_match_for_sample(query: &CompiledQuery, sample: &FoldSample) -> ConfusionCounts {
-    let mut counts = ConfusionCounts::default();
-    counts.record_match(
-        matches_compiled(query, sample.target()),
-        sample.is_positive(),
-    );
-    counts
+fn record_behavior_match(behavior_words: &mut [u64], bit_index: usize, matched: bool) {
+    if !matched {
+        return;
+    }
+
+    let word_index = bit_index / 64;
+    let bit_offset = bit_index % 64;
+    behavior_words[word_index] |= 1u64 << bit_offset;
 }
 
 #[cfg(test)]
@@ -202,10 +259,13 @@ mod tests {
         ]);
         let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
         let compiled = CompiledQuery::new(genome.query().clone()).unwrap();
+        let mut behavior = vec![0u64; 1];
+        let mut bit_index = 0usize;
 
-        let counts = count_matches_in_fold(&compiled, &fold);
+        let counts = count_matches_in_fold(&compiled, &fold, &mut behavior, &mut bit_index);
 
         assert_eq!(counts, ConfusionCounts::new(1, 1, 1, 1));
+        assert_eq!(behavior[0], 0b0011);
     }
 
     #[test]
@@ -228,5 +288,55 @@ mod tests {
         let via_trait = evaluator.fitness_of(&genome);
         let direct = evaluator.objective_of(&genome);
         assert!((via_trait.mcc() - direct.mcc()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fold_sample_constructors_and_batch_helpers_work() {
+        let positive = FoldSample::positive(prepared("CN"));
+        let negative = FoldSample::negative(prepared("CC"));
+        assert!(positive.is_positive());
+        assert!(!negative.is_positive());
+        let _ = positive.target();
+        let _ = negative.target();
+
+        let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
+            positive.clone(),
+            negative.clone(),
+        ])]);
+        let genomes = vec![
+            SmartsGenome::from_smarts("[#6]").unwrap(),
+            SmartsGenome::from_smarts("[#7]").unwrap(),
+            SmartsGenome::from_smarts("[#8]").unwrap(),
+            SmartsGenome::from_smarts("[#6]~[#7]").unwrap(),
+            SmartsGenome::from_smarts("[#6]~[#8]").unwrap(),
+            SmartsGenome::from_smarts("[#6]=[#8]").unwrap(),
+            SmartsGenome::from_smarts("[#6]-[#6]").unwrap(),
+            SmartsGenome::from_smarts("[#6]-[#7]").unwrap(),
+        ];
+
+        let evaluated = evaluator.evaluate_many(genomes.clone());
+        let fitness_only = evaluator.fitness_of_many(genomes);
+        assert_eq!(evaluated.len(), 8);
+        assert_eq!(fitness_only.len(), 8);
+        assert!(evaluated.iter().zip(fitness_only.iter()).all(
+            |((left_genome, left_eval), (right_genome, right_fitness))| {
+                left_genome == right_genome && left_eval.fitness() == *right_fitness
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluate_tracks_exact_training_behavior() {
+        let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
+            sample("CN", true),
+            sample("CC", false),
+            sample("CN", false),
+        ])]);
+        let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+
+        let evaluation = evaluator.evaluate(&genome);
+
+        assert_eq!(evaluation.phenotype().as_ref(), &[0b0101]);
+        assert!(evaluation.fitness().mcc() > 0.49);
     }
 }

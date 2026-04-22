@@ -4,9 +4,17 @@ mod example_support;
 use example_support::{EXAMPLE_DATASETS, QUALITY_SEEDS, SeedStrategy, run_example_strategy};
 
 fn main() {
+    let dataset_filters = std::env::args().skip(1).collect::<Vec<_>>();
     println!("dataset\tstrategy\tseed\tbest_mcc\tbest_size\tbest_smarts");
 
     for dataset in EXAMPLE_DATASETS {
+        if !dataset_filters.is_empty()
+            && !dataset_filters
+                .iter()
+                .any(|filter| dataset.name.contains(filter.as_str()))
+        {
+            continue;
+        }
         for strategy in [SeedStrategy::Builtin, SeedStrategy::DiscriminativePaths] {
             let mut scores = Vec::new();
             for &seed in QUALITY_SEEDS {
