@@ -8,4 +8,4 @@ title = "SMARTS Evolution"
 base_path = "/"
 
 [web.watcher]
-watch_path = ["src", "public/style.css", "public/favicon.svg"]
+watch_path = ["src", "assets"]

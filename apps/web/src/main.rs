@@ -1,5 +1,3 @@
-#![allow(clippy::needless_return)]
-
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -20,7 +18,8 @@ use web_sys::{
 #[cfg(target_arch = "wasm32")]
 use smarts_evolution_web_protocol::{WorkerRequest, WorkerResponse};
 
-const STYLE: &str = include_str!("../public/style.css");
+static STYLE: Asset = asset!("/assets/style.css");
+static FAVICON: Asset = asset!("/assets/favicon.svg");
 #[cfg(target_arch = "wasm32")]
 const WORKER_SCRIPT: &str = "/generated/evolution-worker.js";
 const LEADERBOARD_LIMIT: usize = 100;
@@ -42,6 +41,14 @@ struct ExamplePreset {
     icon_class: &'static str,
     positive_smiles: &'static str,
     negative_smiles: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct NumericFieldSpec {
+    label: &'static str,
+    id: &'static str,
+    icon_class: &'static str,
+    note: Option<&'static str>,
 }
 
 impl ExamplePreset {
@@ -66,13 +73,13 @@ const EXAMPLE_PRESETS: [ExamplePreset; 5] = [
         ),
     },
     ExamplePreset {
-        label: "Benzodiazepines",
-        icon_class: "fa-solid fa-tablets",
+        label: "Flavonoids",
+        icon_class: "fa-solid fa-leaf",
         positive_smiles: include_str!(
-            "../examples/benzodiazepines_positive.smiles"
+            "../examples/flavonoids_positive.smiles"
         ),
         negative_smiles: include_str!(
-            "../examples/benzodiazepines_negative.smiles"
+            "../examples/flavonoids_negative.smiles"
         ),
     },
     ExamplePreset {
@@ -424,6 +431,13 @@ impl EvolutionWorker {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl Drop for EvolutionWorker {
+    fn drop(&mut self) {
+        self.worker.terminate();
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 struct EvolutionWorker;
 
@@ -439,6 +453,65 @@ impl EvolutionWorker {
     fn terminate(&self) {}
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for EvolutionWorker {
+    fn drop(&mut self) {}
+}
+
+#[derive(Clone)]
+struct EvolutionWorkerController {
+    run_view: Signal<RunView>,
+    worker_slot: Rc<RefCell<Option<EvolutionWorker>>>,
+    active_run_id: Rc<Cell<u64>>,
+    pending_request: Rc<RefCell<Option<RunRequest>>>,
+}
+
+impl EvolutionWorkerController {
+    fn next_run_id(&self) -> u64 {
+        self.active_run_id.get() + 1
+    }
+
+    fn start(&self, request: RunRequest) -> Result<(), String> {
+        let run_id = request.run_id();
+        self.active_run_id.set(run_id);
+        self.terminate();
+        *self.pending_request.borrow_mut() = Some(request);
+
+        let worker = EvolutionWorker::new(
+            self.run_view,
+            self.active_run_id.clone(),
+            self.pending_request.clone(),
+        )?;
+
+        let mut run_view = self.run_view;
+        run_view.set(RunView::starting(run_id));
+        *self.worker_slot.borrow_mut() = Some(worker);
+        Ok(())
+    }
+
+    fn stop(&self) {
+        self.terminate();
+        *self.pending_request.borrow_mut() = None;
+        let mut run_view = self.run_view;
+        run_view.write().stop();
+    }
+
+    fn terminate(&self) {
+        if let Some(worker) = self.worker_slot.borrow_mut().take() {
+            worker.terminate();
+        }
+    }
+}
+
+fn use_evolution_worker(run_view: Signal<RunView>) -> EvolutionWorkerController {
+    use_hook(move || EvolutionWorkerController {
+        run_view,
+        worker_slot: Rc::new(RefCell::new(None::<EvolutionWorker>)),
+        active_run_id: Rc::new(Cell::new(0_u64)),
+        pending_request: Rc::new(RefCell::new(None::<RunRequest>)),
+    })
+}
+
 fn main() {
     dioxus::launch(App);
 }
@@ -448,9 +521,7 @@ fn App() -> Element {
     let mut draft = use_signal(RunDraft::default);
     let run_view = use_signal(RunView::default);
     let setup_visible = use_signal(|| true);
-    let worker_slot = use_hook(|| Rc::new(RefCell::new(None::<EvolutionWorker>)));
-    let active_run_id = use_hook(|| Rc::new(Cell::new(0_u64)));
-    let pending_request = use_hook(|| Rc::new(RefCell::new(None::<RunRequest>)));
+    let worker_controller = use_evolution_worker(run_view);
     let leaderboard_page_size = use_signal(|| PAGE_SIZE_OPTIONS[0]);
     let leaderboard_page = use_signal(|| 0usize);
 
@@ -466,6 +537,11 @@ fn App() -> Element {
     let page_window = leaderboard_page_window(leaders.len(), page_size, page_index);
     let visible_leaders = &leaders[page_window.start..page_window.end];
     let phase = run_view_value.phase;
+    let run_message_class = if phase == RunPhase::Failed {
+        "message message-error"
+    } else {
+        "message"
+    };
     let is_running = phase == RunPhase::Running;
     let can_start = !is_running && !validation.has_errors();
     let has_run_started = run_view_value.startup.is_some()
@@ -473,17 +549,13 @@ fn App() -> Element {
         || run_view_value.result.is_some();
     let layout_class = "layout layout-results";
 
-    let start_worker_slot = worker_slot.clone();
-    let start_run_id = active_run_id.clone();
     let mut start_run_view = run_view;
     let start_draft = draft;
-    let start_pending_request = pending_request.clone();
+    let start_worker = worker_controller.clone();
     let mut hide_setup = setup_visible;
     let mut reset_leaderboard_page = leaderboard_page;
 
-    let stop_worker_slot = worker_slot.clone();
-    let mut stop_run_view = run_view;
-    let stop_pending_request = pending_request.clone();
+    let stop_worker = worker_controller.clone();
     let mut reopen_setup = setup_visible;
     let mut set_leaderboard_page_size = leaderboard_page_size;
     let mut set_leaderboard_page = leaderboard_page;
@@ -499,13 +571,12 @@ fn App() -> Element {
         document::Meta { name: "apple-mobile-web-app-title", content: "SMARTS Evolution" }
         document::Meta { name: "theme-color", content: "#132630" }
         document::Meta { name: "color-scheme", content: "light" }
-        document::Link { rel: "icon", href: "favicon.svg", r#type: "image/svg+xml" }
+        document::Link { rel: "icon", href: FAVICON, r#type: "image/svg+xml" }
         document::Link {
             rel: "stylesheet",
             href: "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css",
         }
-
-        style { {STYLE} }
+        document::Stylesheet { href: STYLE }
 
         main { class: "page",
             header { class: "hero",
@@ -536,8 +607,7 @@ fn App() -> Element {
                                     class: "button button-primary",
                                     disabled: !can_start,
                                     onclick: move |_| {
-                                        let next_run_id = start_run_id.get() + 1;
-                                        start_run_id.set(next_run_id);
+                                        let next_run_id = start_worker.next_run_id();
 
                                         let request = match build_run_request(next_run_id, &start_draft()) {
                                             Ok(request) => request,
@@ -547,27 +617,13 @@ fn App() -> Element {
                                             }
                                         };
 
-                                        if let Some(existing_worker) = start_worker_slot.borrow_mut().take() {
-                                            existing_worker.terminate();
+                                        if let Err(message) = start_worker.start(request) {
+                                            start_run_view.write().fail(message);
+                                            return;
                                         }
-                                        *start_pending_request.borrow_mut() = Some(request);
-
-                                        let worker = match EvolutionWorker::new(
-                                            start_run_view,
-                                            start_run_id.clone(),
-                                            start_pending_request.clone(),
-                                        ) {
-                                            Ok(worker) => worker,
-                                            Err(message) => {
-                                                start_run_view.write().fail(message);
-                                                return;
-                                            }
-                                        };
 
                                         hide_setup.set(false);
                                         reset_leaderboard_page.set(0);
-                                        start_run_view.set(RunView::starting(next_run_id));
-                                        *start_worker_slot.borrow_mut() = Some(worker);
                                     },
                                     i { class: "fa-solid fa-play", aria_hidden: "true" }
                                     span { "{start_button_label(phase)}" }
@@ -579,6 +635,7 @@ fn App() -> Element {
                                 div { class: "example-buttons",
                                     for preset in EXAMPLE_PRESETS {
                                         button {
+                                            key: "{preset.label}",
                                             class: "button button-secondary button-example",
                                             disabled: is_running,
                                             onclick: move |_| {
@@ -665,31 +722,31 @@ fn App() -> Element {
                             }
 
                             div { class: "config-grid",
-                                {numeric_field("Population", "population-size", "fa-solid fa-people-group", Some("Population size per generation; larger populations increase search breadth but raise evaluation cost."), draft_value.population_size.clone(), validation.population_size.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Population", id: "population-size", icon_class: "fa-solid fa-people-group", note: Some("Population size per generation; larger populations increase search breadth but raise evaluation cost.") }, draft_value.population_size.clone(), validation.population_size.as_deref(), is_running, move |value| {
                                     draft.write().population_size = value;
                                 })}
-                                {numeric_field("Generations", "generation-limit", "fa-solid fa-timeline", Some("Upper bound on the number of evolutionary generations."), draft_value.generation_limit.clone(), validation.generation_limit.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Generations", id: "generation-limit", icon_class: "fa-solid fa-timeline", note: Some("Upper bound on the number of evolutionary generations.") }, draft_value.generation_limit.clone(), validation.generation_limit.as_deref(), is_running, move |value| {
                                     draft.write().generation_limit = value;
                                 })}
-                                {numeric_field("Mutation rate", "mutation-rate", "fa-solid fa-wand-magic-sparkles", Some("Per-offspring mutation probability."), draft_value.mutation_rate.clone(), validation.mutation_rate.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Mutation rate", id: "mutation-rate", icon_class: "fa-solid fa-wand-magic-sparkles", note: Some("Per-offspring mutation probability.") }, draft_value.mutation_rate.clone(), validation.mutation_rate.as_deref(), is_running, move |value| {
                                     draft.write().mutation_rate = value;
                                 })}
-                                {numeric_field("Crossover rate", "crossover-rate", "fa-solid fa-code-branch", Some("Probability of crossover by subtree splicing between two parents."), draft_value.crossover_rate.clone(), validation.crossover_rate.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Crossover rate", id: "crossover-rate", icon_class: "fa-solid fa-code-branch", note: Some("Probability of crossover by subtree splicing between two parents.") }, draft_value.crossover_rate.clone(), validation.crossover_rate.as_deref(), is_running, move |value| {
                                     draft.write().crossover_rate = value;
                                 })}
-                                {numeric_field("Selection ratio", "selection-ratio", "fa-solid fa-filter", Some("Fraction of the population retained in the parent-selection pool."), draft_value.selection_ratio.clone(), validation.selection_ratio.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Selection ratio", id: "selection-ratio", icon_class: "fa-solid fa-filter", note: Some("Fraction of the population retained in the parent-selection pool.") }, draft_value.selection_ratio.clone(), validation.selection_ratio.as_deref(), is_running, move |value| {
                                     draft.write().selection_ratio = value;
                                 })}
-                                {numeric_field("Tournament size", "tournament-size", "fa-solid fa-trophy", Some("Number of candidates sampled per tournament during parent selection."), draft_value.tournament_size.clone(), validation.tournament_size.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Tournament size", id: "tournament-size", icon_class: "fa-solid fa-trophy", note: Some("Number of candidates sampled per tournament during parent selection.") }, draft_value.tournament_size.clone(), validation.tournament_size.as_deref(), is_running, move |value| {
                                     draft.write().tournament_size = value;
                                 })}
-                                {numeric_field("Elite count", "elite-count", "fa-solid fa-crown", Some("Number of elite candidates preserved unchanged by elitist reinsertion."), draft_value.elite_count.clone(), validation.elite_count.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Elite count", id: "elite-count", icon_class: "fa-solid fa-crown", note: Some("Number of elite candidates preserved unchanged by elitist reinsertion.") }, draft_value.elite_count.clone(), validation.elite_count.as_deref(), is_running, move |value| {
                                     draft.write().elite_count = value;
                                 })}
-                                {numeric_field("Immigrant ratio", "immigrant-ratio", "fa-solid fa-shuffle", Some("Fraction of each generation replaced by random immigrants."), draft_value.random_immigrant_ratio.clone(), validation.random_immigrant_ratio.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Immigrant ratio", id: "immigrant-ratio", icon_class: "fa-solid fa-shuffle", note: Some("Fraction of each generation replaced by random immigrants.") }, draft_value.random_immigrant_ratio.clone(), validation.random_immigrant_ratio.as_deref(), is_running, move |value| {
                                     draft.write().random_immigrant_ratio = value;
                                 })}
-                                {numeric_field("Stagnation limit", "stagnation-limit", "fa-solid fa-hourglass-half", Some("Terminate after this many generations without improvement in the incumbent best candidate."), draft_value.stagnation_limit.clone(), validation.stagnation_limit.as_deref(), is_running, move |value| {
+                                {numeric_field(NumericFieldSpec { label: "Stagnation limit", id: "stagnation-limit", icon_class: "fa-solid fa-hourglass-half", note: Some("Terminate after this many generations without improvement in the incumbent best candidate.") }, draft_value.stagnation_limit.clone(), validation.stagnation_limit.as_deref(), is_running, move |value| {
                                     draft.write().stagnation_limit = value;
                                 })}
                             }
@@ -719,11 +776,7 @@ fn App() -> Element {
                                         button {
                                             class: "button button-danger",
                                             onclick: move |_| {
-                                                if let Some(worker) = stop_worker_slot.borrow_mut().take() {
-                                                    worker.terminate();
-                                                }
-                                                *stop_pending_request.borrow_mut() = None;
-                                                stop_run_view.write().stop();
+                                                stop_worker.stop();
                                             },
                                             i { class: "fa-solid fa-stop", aria_hidden: "true" }
                                             span { "Stop" }
@@ -742,11 +795,7 @@ fn App() -> Element {
                             }
                             if let Some(message) = run_view_value.message.as_ref() {
                                 p {
-                                    class: if phase == RunPhase::Failed {
-                                        "message message-error"
-                                    } else {
-                                        "message"
-                                    },
+                                    class: run_message_class,
                                     "{message}"
                                 }
                             }
@@ -832,6 +881,7 @@ fn App() -> Element {
                                             },
                                             for option in PAGE_SIZE_OPTIONS {
                                                 option {
+                                                    key: "{option}",
                                                     value: "{option}",
                                                     selected: option == page_window.page_size,
                                                     "{option}"
@@ -882,6 +932,7 @@ fn App() -> Element {
                                     tbody {
                                         for (index, candidate) in visible_leaders.iter().enumerate() {
                                             tr {
+                                                key: "{candidate.smarts()}",
                                                 td { "{page_window.start + index + 1}" }
                                                 td { class: "smarts-cell", "{candidate.smarts()}" }
                                                 td { {format!("{:.3}", candidate.mcc())} }
@@ -900,10 +951,7 @@ fn App() -> Element {
 }
 
 fn numeric_field(
-    label: &'static str,
-    id: &'static str,
-    icon_class: &'static str,
-    note: Option<&'static str>,
+    spec: NumericFieldSpec,
     value: String,
     error: Option<&str>,
     disabled: bool,
@@ -913,24 +961,24 @@ fn numeric_field(
         div {
             class: if error.is_some() { "field field-inline field-invalid" } else { "field field-inline" },
             div { class: "field-inline-row",
-                label { r#for: "{id}", class: "field-inline-label",
+                label { r#for: "{spec.id}", class: "field-inline-label",
                     span { class: "field-label-row",
-                        i { class: "{icon_class}", aria_hidden: "true" }
-                        span { "{label}" }
+                        i { class: "{spec.icon_class}", aria_hidden: "true" }
+                        span { "{spec.label}" }
                     }
                 }
                 input {
-                    id: "{id}",
+                    id: "{spec.id}",
                     r#type: "text",
                     inputmode: "decimal",
-                    aria_label: "{label}",
+                    aria_label: "{spec.label}",
                     class: if error.is_some() { "field-inline-input input-invalid" } else { "field-inline-input" },
                     disabled: disabled,
                     value: "{value}",
                     oninput: move |event| on_input(event.value()),
                 }
             }
-            if let Some(note) = note {
+            if let Some(note) = spec.note {
                 p { class: "field-note field-note-inline", "{note}" }
             }
             if let Some(error) = error {
@@ -1449,13 +1497,13 @@ fn validate_draft(draft: &RunDraft) -> DraftValidation {
     let stagnation_limit = validate_u64_value("Stagnation limit", &draft.stagnation_limit, true);
     validation.stagnation_limit = stagnation_limit.error.clone();
 
-    if validation.population_size.is_none() && validation.elite_count.is_none() {
-        if let (Some(population_size), Some(elite_count)) = (population_size.value, elite_count.value)
-        {
-            if elite_count > population_size {
-                validation.elite_count = Some("Elite count must not exceed population.".to_string());
-            }
-        }
+    if validation.population_size.is_none()
+        && validation.elite_count.is_none()
+        && let (Some(population_size), Some(elite_count)) =
+            (population_size.value, elite_count.value)
+        && elite_count > population_size
+    {
+        validation.elite_count = Some("Elite count must not exceed population.".to_string());
     }
 
     validation
@@ -1633,11 +1681,14 @@ mod tests {
 
     #[test]
     fn baked_in_examples_are_smiles_only() {
-        let smiles = EXAMPLE_PRESETS[0].positive_smiles();
-        let first = smiles.lines().next().unwrap();
-        assert!(!first.contains('\t'));
-        assert!(!first.chars().all(|ch| ch.is_ascii_digit()));
-        assert_eq!(smiles.lines().count(), 100);
+        for preset in EXAMPLE_PRESETS {
+            for smiles in [preset.positive_smiles(), preset.negative_smiles()] {
+                let first = smiles.lines().next().unwrap();
+                assert!(!first.contains('\t'));
+                assert!(!first.chars().all(|ch| ch.is_ascii_digit()));
+                assert_eq!(smiles.lines().count(), 100);
+            }
+        }
     }
 
     #[test]
