@@ -525,10 +525,27 @@ fn App() -> Element {
     let leaderboard_page_size = use_signal(|| PAGE_SIZE_OPTIONS[0]);
     let leaderboard_page = use_signal(|| 0usize);
 
-    let draft_value = draft();
-    let validation = validate_draft(&draft_value);
     let run_view_value = run_view();
     let setup_is_visible = setup_visible();
+    let draft_value = if setup_is_visible { Some(draft()) } else { None };
+    let validation_cache =
+        use_hook(|| RefCell::new(None::<(RunDraft, DraftValidation)>));
+    let validation = if let Some(draft_value) = draft_value.as_ref() {
+        let mut cache = validation_cache.borrow_mut();
+        let recompute = match cache.as_ref() {
+            Some((cached_draft, _)) => cached_draft != draft_value,
+            None => true,
+        };
+        if recompute {
+            *cache = Some((draft_value.clone(), validate_draft(draft_value)));
+        }
+        cache
+            .as_ref()
+            .map(|(_, validation)| validation.clone())
+            .unwrap_or_default()
+    } else {
+        DraftValidation::default()
+    };
     let leaders = current_leaders(&run_view_value);
     let best = current_best(&run_view_value);
     let last_stagnation = run_view_value.history.last().map(|point| point.stagnation);
@@ -544,8 +561,15 @@ fn App() -> Element {
     };
     let is_running = phase == RunPhase::Running;
     let can_start = !is_running && !validation.has_errors();
-    let positive_smiles_count = smiles_entry_count(&draft_value.positive_smiles);
-    let negative_smiles_count = smiles_entry_count(&draft_value.negative_smiles);
+    let positive_smiles_count = draft_value
+        .as_ref()
+        .map(|draft_value| smiles_entry_count(&draft_value.positive_smiles))
+        .unwrap_or(0);
+    let negative_smiles_count = draft_value
+        .as_ref()
+        .map(|draft_value| smiles_entry_count(&draft_value.negative_smiles))
+        .unwrap_or(0);
+    let draft_value = draft_value.unwrap_or_default();
     let has_run_started = run_view_value.startup.is_some()
         || run_view_value.progress.is_some()
         || run_view_value.result.is_some();
@@ -1525,10 +1549,8 @@ fn build_run_request(run_id: u64, draft: &RunDraft) -> Result<RunRequest, String
         return Err(error.to_string());
     }
 
-    let normalized_positive_smiles =
-        normalize_smiles_lines("positive SMILES", &draft.positive_smiles)?;
-    let normalized_negative_smiles =
-        normalize_smiles_lines("negative SMILES", &draft.negative_smiles)?;
+    let normalized_positive_smiles = compact_smiles_lines("positive SMILES", &draft.positive_smiles)?;
+    let normalized_negative_smiles = compact_smiles_lines("negative SMILES", &draft.negative_smiles)?;
 
     let config = EvolutionConfigInput::default()
         .population_size_mut(parse_usize("population size", &draft.population_size)?)
@@ -1582,11 +1604,7 @@ fn leaderboard_page_window(
 }
 
 fn validate_smiles_lines(label: &str, value: &str) -> Option<String> {
-    normalize_smiles_lines(label, value).err()
-}
-
-fn normalize_smiles_lines(label: &str, value: &str) -> Result<String, String> {
-    let mut normalized = Vec::new();
+    let mut has_any = false;
 
     for (line_idx, line) in value.lines().enumerate() {
         let smiles = line.trim();
@@ -1594,13 +1612,32 @@ fn normalize_smiles_lines(label: &str, value: &str) -> Result<String, String> {
             continue;
         }
 
-        let parsed = Smiles::from_str(smiles).map_err(|error| {
-            format!(
+        has_any = true;
+        if let Err(error) = Smiles::from_str(smiles) {
+            return Some(format!(
                 "{label} has invalid SMILES at line {}: {error}",
                 line_idx + 1
-            )
-        })?;
-        normalized.push(parsed.canonicalize().to_string());
+            ));
+        }
+    }
+
+    if has_any {
+        None
+    } else {
+        Some(format!("{label} cannot be empty."))
+    }
+}
+
+fn compact_smiles_lines(label: &str, value: &str) -> Result<String, String> {
+    let mut normalized = Vec::new();
+
+    for line in value.lines() {
+        let smiles = line.trim();
+        if smiles.is_empty() {
+            continue;
+        }
+
+        normalized.push(smiles.to_string());
     }
 
     if normalized.is_empty() {
@@ -1704,7 +1741,7 @@ fn parse_f64(label: &str, value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         DraftValidation, EXAMPLE_PRESETS, RankedCandidate, build_run_request,
-        compare_ranked_candidates, normalize_smiles_lines, smiles_count_label, smiles_entry_count,
+        compact_smiles_lines, compare_ranked_candidates, smiles_count_label, smiles_entry_count,
         validate_smiles_lines,
     };
 
@@ -1767,13 +1804,13 @@ mod tests {
     }
 
     #[test]
-    fn normalize_smiles_lines_trims_and_compacts_input() {
-        let normalized = normalize_smiles_lines("positive SMILES", " CCO \n\n N \n").unwrap();
+    fn compact_smiles_lines_trims_and_compacts_input() {
+        let normalized = compact_smiles_lines("positive SMILES", " CCO \n\n N \n").unwrap();
         assert_eq!(normalized, "CCO\nN");
     }
 
     #[test]
-    fn build_run_request_normalizes_smiles_before_dispatch() {
+    fn build_run_request_compacts_smiles_before_dispatch() {
         let draft = super::RunDraft {
             positive_smiles: " CCO \n\n N \n".to_string(),
             negative_smiles: " O \n C=C ".to_string(),

@@ -355,9 +355,9 @@ mod tests {
     }
 
     #[test]
-    fn worker_canonicalizes_smiles_before_target_preparation() {
+    fn worker_canonicalizes_smiles_lines() {
         let parsed = parse_worker_smiles("OC", "positive", 1).unwrap();
-        assert_eq!(parsed.to_string(), "CO");
         assert!(parsed.is_canonical());
+        assert_eq!(parsed.to_string(), "CO");
     }
 }
