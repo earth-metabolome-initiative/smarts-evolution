@@ -282,7 +282,7 @@ fn throttled_progress_units(total: usize) -> usize {
 }
 
 fn should_report_progress(completed: usize, total: usize) -> bool {
-    completed == total || completed <= 4 || completed % STARTUP_PROGRESS_BATCH == 0
+    completed == total || completed <= 4 || completed.is_multiple_of(STARTUP_PROGRESS_BATCH)
 }
 
 struct StartupReporter {

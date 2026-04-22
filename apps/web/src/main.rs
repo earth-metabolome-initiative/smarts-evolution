@@ -544,13 +544,15 @@ fn App() -> Element {
     };
     let is_running = phase == RunPhase::Running;
     let can_start = !is_running && !validation.has_errors();
+    let positive_smiles_count = smiles_entry_count(&draft_value.positive_smiles);
+    let negative_smiles_count = smiles_entry_count(&draft_value.negative_smiles);
     let has_run_started = run_view_value.startup.is_some()
         || run_view_value.progress.is_some()
         || run_view_value.result.is_some();
     let layout_class = "layout layout-results";
 
     let mut start_run_view = run_view;
-    let start_draft = draft;
+    let mut start_draft = draft;
     let start_worker = worker_controller.clone();
     let mut hide_setup = setup_visible;
     let mut reset_leaderboard_page = leaderboard_page;
@@ -617,6 +619,14 @@ fn App() -> Element {
                                             }
                                         };
 
+                                        let normalized_positive = request.positive_smiles().to_string();
+                                        let normalized_negative = request.negative_smiles().to_string();
+                                        {
+                                            let mut next = start_draft.write();
+                                            next.positive_smiles = normalized_positive;
+                                            next.negative_smiles = normalized_negative;
+                                        }
+
                                         if let Err(message) = start_worker.start(request) {
                                             start_run_view.write().fail(message);
                                             return;
@@ -657,6 +667,7 @@ fn App() -> Element {
                                         span { class: "field-label-row",
                                             i { class: "fa-regular fa-face-smile", aria_hidden: "true" }
                                             span { "Positive SMILES" }
+                                            span { class: "field-count", "{smiles_count_label(positive_smiles_count)}" }
                                         }
                                     }
                                     textarea {
@@ -681,6 +692,7 @@ fn App() -> Element {
                                         span { class: "field-label-row",
                                             i { class: "fa-regular fa-face-frown", aria_hidden: "true" }
                                             span { "Negative SMILES" }
+                                            span { class: "field-count", "{smiles_count_label(negative_smiles_count)}" }
                                         }
                                     }
                                     textarea {
@@ -1515,6 +1527,11 @@ fn build_run_request(run_id: u64, draft: &RunDraft) -> Result<RunRequest, String
         return Err(error.to_string());
     }
 
+    let normalized_positive_smiles =
+        normalize_smiles_lines("positive SMILES", &draft.positive_smiles)?;
+    let normalized_negative_smiles =
+        normalize_smiles_lines("negative SMILES", &draft.negative_smiles)?;
+
     let config = EvolutionConfigInput::default()
         .population_size_mut(parse_usize("population size", &draft.population_size)?)
         .generation_limit_mut(parse_u64("generation limit", &draft.generation_limit)?)
@@ -1531,8 +1548,8 @@ fn build_run_request(run_id: u64, draft: &RunDraft) -> Result<RunRequest, String
 
     Ok(RunRequest::new(
         run_id,
-        draft.positive_smiles.clone(),
-        draft.negative_smiles.clone(),
+        normalized_positive_smiles,
+        normalized_negative_smiles,
         draft.seed_smarts.clone(),
         config,
         LEADERBOARD_LIMIT,
@@ -1567,7 +1584,11 @@ fn leaderboard_page_window(
 }
 
 fn validate_smiles_lines(label: &str, value: &str) -> Option<String> {
-    let mut has_nonempty = false;
+    normalize_smiles_lines(label, value).err()
+}
+
+fn normalize_smiles_lines(label: &str, value: &str) -> Result<String, String> {
+    let mut normalized = Vec::new();
 
     for (line_idx, line) in value.lines().enumerate() {
         let smiles = line.trim();
@@ -1575,20 +1596,25 @@ fn validate_smiles_lines(label: &str, value: &str) -> Option<String> {
             continue;
         }
 
-        has_nonempty = true;
-        if let Err(error) = Smiles::from_str(smiles) {
-            return Some(format!(
-                "{label} has invalid SMILES at line {}: {error}",
-                line_idx + 1
-            ));
-        }
+        let parsed = Smiles::from_str(smiles)
+            .map_err(|error| format!("{label} has invalid SMILES at line {}: {error}", line_idx + 1))?;
+        normalized.push(parsed.to_string());
     }
 
-    if has_nonempty {
-        None
+    if normalized.is_empty() {
+        Err(format!("{label} cannot be empty."))
     } else {
-        Some(format!("{label} cannot be empty."))
+        Ok(normalized.join("\n"))
     }
+}
+
+fn smiles_entry_count(value: &str) -> usize {
+    value.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+fn smiles_count_label(count: usize) -> String {
+    let suffix = if count == 1 { "entry" } else { "entries" };
+    format!("{count} {suffix}")
 }
 
 struct ParsedValue<T> {
@@ -1675,7 +1701,8 @@ fn parse_f64(label: &str, value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DraftValidation, EXAMPLE_PRESETS, RankedCandidate, compare_ranked_candidates,
+        DraftValidation, EXAMPLE_PRESETS, RankedCandidate, build_run_request,
+        compare_ranked_candidates, normalize_smiles_lines, smiles_count_label, smiles_entry_count,
         validate_smiles_lines,
     };
 
@@ -1683,7 +1710,7 @@ mod tests {
     fn baked_in_examples_are_smiles_only() {
         for preset in EXAMPLE_PRESETS {
             for (smiles, expected_count) in
-                [(preset.positive_smiles(), 500usize), (preset.negative_smiles(), 1000usize)]
+                [(preset.positive_smiles(), 2000usize), (preset.negative_smiles(), 2000usize)]
             {
                 let first = smiles.lines().next().unwrap();
                 assert!(!first.contains('\t'));
@@ -1735,6 +1762,32 @@ mod tests {
                 .unwrap()
                 .starts_with("positive SMILES has invalid SMILES at line 2:")
         );
+    }
+
+    #[test]
+    fn normalize_smiles_lines_trims_and_compacts_input() {
+        let normalized = normalize_smiles_lines("positive SMILES", " CCO \n\n N \n").unwrap();
+        assert_eq!(normalized, "CCO\nN");
+    }
+
+    #[test]
+    fn build_run_request_normalizes_smiles_before_dispatch() {
+        let draft = super::RunDraft {
+            positive_smiles: " CCO \n\n N \n".to_string(),
+            negative_smiles: " O \n C=C ".to_string(),
+            ..super::RunDraft::default()
+        };
+
+        let request = build_run_request(7, &draft).unwrap();
+        assert_eq!(request.positive_smiles(), "CCO\nN");
+        assert_eq!(request.negative_smiles(), "O\nC=C");
+    }
+
+    #[test]
+    fn smiles_entry_counts_ignore_blank_lines() {
+        assert_eq!(smiles_entry_count("CCO\n\nN\n"), 2);
+        assert_eq!(smiles_count_label(1), "1 entry");
+        assert_eq!(smiles_count_label(2), "2 entries");
     }
 }
 
