@@ -1682,11 +1682,13 @@ mod tests {
     #[test]
     fn baked_in_examples_are_smiles_only() {
         for preset in EXAMPLE_PRESETS {
-            for smiles in [preset.positive_smiles(), preset.negative_smiles()] {
+            for (smiles, expected_count) in
+                [(preset.positive_smiles(), 500usize), (preset.negative_smiles(), 1000usize)]
+            {
                 let first = smiles.lines().next().unwrap();
                 assert!(!first.contains('\t'));
                 assert!(!first.chars().all(|ch| ch.is_ascii_digit()));
-                assert_eq!(smiles.lines().count(), 100);
+                assert_eq!(smiles.lines().count(), expected_count);
             }
         }
     }
