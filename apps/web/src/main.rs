@@ -829,9 +829,7 @@ fn App() -> Element {
                                         startup.completed() as f64,
                                         startup.total() as f64,
                                         format!(
-                                            "{}/{} ({:.0}%)",
-                                            startup.completed(),
-                                            startup.total(),
+                                            "{:.0}%",
                                             (startup.completed() as f64 / startup.total().max(1) as f64) * 100.0,
                                         ),
                                         "progress-fill",

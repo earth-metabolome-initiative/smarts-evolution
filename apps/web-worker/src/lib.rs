@@ -248,8 +248,8 @@ fn js_error(error: JsValue) -> String {
 }
 
 fn startup_total(request: &RunRequest) -> usize {
-    1 + throttled_progress_units(count_nonempty_lines(request.positive_smiles()))
-        + throttled_progress_units(count_nonempty_lines(request.negative_smiles()))
+    1 + count_nonempty_lines(request.positive_smiles())
+        + count_nonempty_lines(request.negative_smiles())
         + count_seed_units(request.seed_smarts())
         + 2
 }
@@ -270,15 +270,7 @@ fn count_nonempty_noncomment_lines(input: &str) -> usize {
 
 fn count_seed_units(input: &str) -> usize {
     let count = count_nonempty_noncomment_lines(input);
-    throttled_progress_units(count.max(1))
-}
-
-fn throttled_progress_units(total: usize) -> usize {
-    if total <= 4 {
-        total
-    } else {
-        4 + (total.saturating_sub(4)).div_ceil(STARTUP_PROGRESS_BATCH)
-    }
+    count.max(1)
 }
 
 fn should_report_progress(completed: usize, total: usize) -> bool {
@@ -324,21 +316,8 @@ impl StartupReporter {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_report_progress, throttled_progress_units};
-
-    #[test]
-    fn throttled_progress_keeps_small_totals_exact() {
-        assert_eq!(throttled_progress_units(0), 0);
-        assert_eq!(throttled_progress_units(1), 1);
-        assert_eq!(throttled_progress_units(4), 4);
-    }
-
-    #[test]
-    fn throttled_progress_batches_large_totals() {
-        assert_eq!(throttled_progress_units(5), 5);
-        assert_eq!(throttled_progress_units(20), 5);
-        assert_eq!(throttled_progress_units(36), 6);
-    }
+    use super::{count_seed_units, should_report_progress, startup_total};
+    use smarts_evolution_web_protocol::{EvolutionConfigInput, RunRequest};
 
     #[test]
     fn progress_reporting_is_dense_at_start_then_sparse() {
@@ -347,5 +326,26 @@ mod tests {
         assert!(!should_report_progress(5, 40));
         assert!(should_report_progress(16, 40));
         assert!(should_report_progress(40, 40));
+    }
+
+    #[test]
+    fn seed_units_track_real_seed_entries() {
+        assert_eq!(count_seed_units(""), 1);
+        assert_eq!(count_seed_units("\n# comment\n"), 1);
+        assert_eq!(count_seed_units("[#6]\n[#7]\n"), 2);
+    }
+
+    #[test]
+    fn startup_total_uses_real_dataset_counts() {
+        let request = RunRequest::new(
+            7,
+            "CCO\nN\n",
+            "O\nC=C\n",
+            "",
+            EvolutionConfigInput::default(),
+            10,
+        );
+
+        assert_eq!(startup_total(&request), 8);
     }
 }
