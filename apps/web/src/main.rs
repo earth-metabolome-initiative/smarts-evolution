@@ -2,8 +2,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::str::FromStr;
 
 use dioxus::prelude::*;
+use smiles_parser::Smiles;
 use smarts_evolution_web_protocol::{
     CompletedRun, EvolutionConfigInput, ProgressUpdate, RankedCandidate, RunRequest, StartupUpdate,
 };
@@ -1409,8 +1411,8 @@ fn start_button_label(phase: RunPhase) -> &'static str {
 
 fn validate_draft(draft: &RunDraft) -> DraftValidation {
     let mut validation = DraftValidation {
-        positive_smiles: validate_required_lines("positive SMILES", &draft.positive_smiles),
-        negative_smiles: validate_required_lines("negative SMILES", &draft.negative_smiles),
+        positive_smiles: validate_smiles_lines("positive SMILES", &draft.positive_smiles),
+        negative_smiles: validate_smiles_lines("negative SMILES", &draft.negative_smiles),
         ..DraftValidation::default()
     };
 
@@ -1516,8 +1518,25 @@ fn leaderboard_page_window(
     }
 }
 
-fn validate_required_lines(label: &str, value: &str) -> Option<String> {
-    if value.lines().any(|line| !line.trim().is_empty()) {
+fn validate_smiles_lines(label: &str, value: &str) -> Option<String> {
+    let mut has_nonempty = false;
+
+    for (line_idx, line) in value.lines().enumerate() {
+        let smiles = line.trim();
+        if smiles.is_empty() {
+            continue;
+        }
+
+        has_nonempty = true;
+        if let Err(error) = Smiles::from_str(smiles) {
+            return Some(format!(
+                "{label} has invalid SMILES at line {}: {error}",
+                line_idx + 1
+            ));
+        }
+    }
+
+    if has_nonempty {
         None
     } else {
         Some(format!("{label} cannot be empty."))
@@ -1609,6 +1628,7 @@ fn parse_f64(label: &str, value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         DraftValidation, EXAMPLE_PRESETS, RankedCandidate, compare_ranked_candidates,
+        validate_smiles_lines,
     };
 
     #[test]
@@ -1650,6 +1670,17 @@ mod tests {
         assert_eq!(
             validation.first_config_error(),
             Some("Population must be greater than zero.")
+        );
+    }
+
+    #[test]
+    fn invalid_smiles_line_is_reported_before_start() {
+        let error = validate_smiles_lines("positive SMILES", "CCO\nnot-a-smiles\nCCN");
+        assert!(error.is_some());
+        assert!(
+            error
+                .unwrap()
+                .starts_with("positive SMILES has invalid SMILES at line 2:")
         );
     }
 }
