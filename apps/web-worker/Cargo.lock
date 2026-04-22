@@ -510,9 +510,10 @@ dependencies = [
 [[package]]
 name = "smarts-parser"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#90604e49667beaca8953d61f277ff2e27482e0e0"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#67ad569bb73564d58d70b06f359243c36629dfc6"
 dependencies = [
  "elements_rs",
+ "geometric-traits",
  "smiles-parser",
  "thiserror",
 ]
@@ -520,7 +521,7 @@ dependencies = [
 [[package]]
 name = "smarts-validator"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#90604e49667beaca8953d61f277ff2e27482e0e0"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#67ad569bb73564d58d70b06f359243c36629dfc6"
 dependencies = [
  "elements_rs",
  "geometric-traits",
