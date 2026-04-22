@@ -54,9 +54,9 @@ const EXAMPLE_DATASETS: &[ExampleDataset] = &[
         ),
     },
     ExampleDataset {
-        name: "benzodiazepines",
-        positive_smiles: include_str!("../apps/web/examples/benzodiazepines_positive.smiles"),
-        negative_smiles: include_str!("../apps/web/examples/benzodiazepines_negative.smiles"),
+        name: "flavonoids",
+        positive_smiles: include_str!("../apps/web/examples/flavonoids_positive.smiles"),
+        negative_smiles: include_str!("../apps/web/examples/flavonoids_negative.smiles"),
     },
     ExampleDataset {
         name: "fatty-acids",

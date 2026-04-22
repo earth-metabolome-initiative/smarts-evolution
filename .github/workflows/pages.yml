@@ -38,7 +38,13 @@ jobs:
         uses: taiki-e/install-action@cargo-binstall
 
       - name: Install Dioxus CLI
-        run: cargo binstall dioxus-cli@0.7.5 --no-confirm
+        run: cargo binstall dioxus-cli@0.7.6 --no-confirm
+
+      - name: Add Cargo bin dir to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Dioxus CLI
+        run: dx --version
 
       - name: Build production web app
         working-directory: apps/web
