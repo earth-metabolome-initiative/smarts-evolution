@@ -69,13 +69,7 @@ fn build_task(sample_count_per_class: usize) -> EvolutionTask {
 }
 
 fn build_seed_corpus() -> SeedCorpus {
-    SeedCorpus::from_smarts(
-        SEED_SMARTS
-            .iter()
-            .map(|smarts| (*smarts).to_string())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap()
+    SeedCorpus::try_from(SEED_SMARTS.to_vec()).unwrap()
 }
 
 fn evaluator_benches(c: &mut Criterion) {

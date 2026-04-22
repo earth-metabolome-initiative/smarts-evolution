@@ -18,6 +18,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      DIOXUS_BIN_DIR: ${{ runner.temp }}/dioxus-cli/bin
 
     steps:
       - name: Checkout
@@ -38,14 +40,14 @@ jobs:
         uses: taiki-e/install-action@cargo-binstall
 
       - name: Install Dioxus CLI
-        run: cargo binstall dioxus-cli@0.7.6 --no-confirm
+        run: cargo binstall dioxus-cli@0.7.6 --no-confirm --root "${{ runner.temp }}/dioxus-cli"
 
       - name: Verify Dioxus CLI
-        run: ~/.cargo/bin/dx --version
+        run: $DIOXUS_BIN_DIR/dx --version
 
       - name: Build production web app
         working-directory: apps/web
-        run: ~/.cargo/bin/dx build --platform web --release --debug-symbols false
+        run: $DIOXUS_BIN_DIR/dx build --platform web --release --debug-symbols false
 
       - name: Prepare Pages artifact
         run: touch apps/web/target/dx/smarts-evolution-web/release/web/public/.nojekyll

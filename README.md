@@ -38,9 +38,9 @@ let config = EvolutionConfig::builder()
     .build()
     .unwrap();
 
-let seed_corpus = SeedCorpus::from_smarts(vec![
-    "[#6](=[#8])[#7]".to_string(),
-    "[#6]~[#7]".to_string(),
+let seed_corpus = SeedCorpus::try_from([
+    "[#6](=[#8])[#7]",
+    "[#6]~[#7]",
 ])
 .unwrap();
 

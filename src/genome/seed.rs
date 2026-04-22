@@ -116,32 +116,6 @@ impl SeedCorpus {
         corpus
     }
 
-    /// Build a corpus from in-memory SMARTS strings.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use smarts_evolution::SeedCorpus;
-    ///
-    /// let corpus = SeedCorpus::from_smarts(vec![
-    ///     "[#6]".to_string(),
-    ///     "[#6]".to_string(),
-    ///     "[#7]".to_string(),
-    /// ])
-    /// .unwrap();
-    ///
-    /// assert_eq!(corpus.len(), 2);
-    /// ```
-    pub fn from_smarts<I, S>(smarts: I) -> Result<Self, String>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let mut corpus = Self::default();
-        corpus.extend_from_smarts(smarts)?;
-        Ok(corpus)
-    }
-
     pub fn len(&self) -> usize {
         self.seeds.len()
     }
@@ -213,7 +187,9 @@ where
     type Error = String;
 
     fn try_from(value: Vec<S>) -> Result<Self, Self::Error> {
-        Self::from_smarts(value)
+        let mut corpus = Self::default();
+        corpus.extend_from_smarts(value)?;
+        Ok(corpus)
     }
 }
 
@@ -221,7 +197,9 @@ impl<'a, const N: usize> TryFrom<[&'a str; N]> for SeedCorpus {
     type Error = String;
 
     fn try_from(value: [&'a str; N]) -> Result<Self, Self::Error> {
-        Self::from_smarts(value)
+        let mut corpus = Self::default();
+        corpus.extend_from_smarts(value)?;
+        Ok(corpus)
     }
 }
 
@@ -352,7 +330,7 @@ mod tests {
 
     #[test]
     fn seed_corpus_from_smarts_vec_deduplicates_and_validates() {
-        let corpus = SeedCorpus::from_smarts(vec![
+        let corpus = SeedCorpus::try_from(vec![
             "[#6]".to_string(),
             "[#7]".to_string(),
             "[#6]".to_string(),
@@ -415,8 +393,7 @@ mod tests {
         assert!(corpus.insert_smarts("[#6]").unwrap());
         assert!(!corpus.is_empty());
 
-        let inserted = corpus
-            .extend(SeedCorpus::from_smarts(vec!["[#6]".to_string(), "[#7]".to_string()]).unwrap());
+        let inserted = corpus.extend(SeedCorpus::try_from(["[#6]", "[#7]"]).unwrap());
         assert_eq!(inserted, 1);
         assert_eq!(corpus.len(), 2);
         assert!(corpus.sample(&mut SmallRng::seed_from_u64(12)).is_some());
@@ -424,9 +401,7 @@ mod tests {
 
     #[test]
     fn builder_can_draw_from_explicit_seed_corpus() {
-        let corpus =
-            SeedCorpus::from_smarts(vec!["[#6]~[#17]".to_string(), "[#6]~[#35]".to_string()])
-                .unwrap();
+        let corpus = SeedCorpus::try_from(["[#6]~[#17]", "[#6]~[#35]"]).unwrap();
         let builder = SmartsGenomeBuilder::new(corpus);
         let mut rng = SmallRng::seed_from_u64(7);
 

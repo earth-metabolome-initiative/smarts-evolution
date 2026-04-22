@@ -385,9 +385,9 @@ impl EvolutionProgress {
 ///     .stagnation_limit(2)
 ///     .build()
 ///     .unwrap();
-/// let seed_corpus = SeedCorpus::from_smarts(vec![
-///     "[#6](=[#8])[#7]".to_string(),
-///     "[#6]~[#7]".to_string(),
+/// let seed_corpus = SeedCorpus::try_from([
+///     "[#6](=[#8])[#7]",
+///     "[#6]~[#7]",
 /// ])
 /// .unwrap();
 ///
@@ -940,12 +940,7 @@ mod regression_tests {
             .stagnation_limit(3)
             .build()
             .unwrap();
-        let seed_corpus = SeedCorpus::from_smarts(vec![
-            "[#6](=[#8])[#7]".to_string(),
-            "[#6]~[#7]".to_string(),
-            "[#7]".to_string(),
-        ])
-        .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6](=[#8])[#7]", "[#6]~[#7]", "[#7]"]).unwrap();
 
         let result = evolve_task(&task, &config, &seed_corpus).unwrap();
 
@@ -973,7 +968,7 @@ mod regression_tests {
             .elite_count(1)
             .build()
             .unwrap();
-        let seed_corpus = SeedCorpus::from_smarts(vec!["[#6]".to_string()]).unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6]"]).unwrap();
 
         let result = evolve_task(&task, &config, &seed_corpus).unwrap();
 
@@ -999,12 +994,7 @@ mod regression_tests {
             .stagnation_limit(2)
             .build()
             .unwrap();
-        let seed_corpus = SeedCorpus::from_smarts(vec![
-            "[#6](=[#8])[#7]".to_string(),
-            "[#6]~[#7]".to_string(),
-            "[#7]".to_string(),
-        ])
-        .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6](=[#8])[#7]", "[#6]~[#7]", "[#7]"]).unwrap();
         let mut snapshots = Vec::new();
 
         let result = evolve_task_with_progress(&task, &config, &seed_corpus, 3, |snapshot| {
@@ -1097,12 +1087,7 @@ mod regression_tests {
 
     #[test]
     fn build_reset_pool_prefers_corpus_and_respects_limit() {
-        let seed_corpus = SeedCorpus::from_smarts(vec![
-            "[#6]".to_string(),
-            "[#7]".to_string(),
-            "[#8]".to_string(),
-        ])
-        .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6]", "[#7]", "[#8]"]).unwrap();
         let population = vec![
             SmartsGenome::from_smarts("[#9]").unwrap(),
             SmartsGenome::from_smarts("[#15]").unwrap(),
