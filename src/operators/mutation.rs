@@ -1,9 +1,9 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use rand::prelude::IndexedRandom;
 use rand::Rng;
 use rand::RngExt;
+use rand::prelude::IndexedRandom;
 use rand::seq::IteratorRandom;
 use smarts_parser::{
     AtomExpr, AtomPrimitive, BondExpr, BondExprTree, BondPrimitive, BracketExpr, BracketExprTree,

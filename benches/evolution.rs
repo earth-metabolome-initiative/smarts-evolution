@@ -73,7 +73,7 @@ fn build_seed_corpus() -> SeedCorpus {
         SEED_SMARTS
             .iter()
             .map(|smarts| (*smarts).to_string())
-            .collect(),
+            .collect::<Vec<_>>(),
     )
     .unwrap()
 }

@@ -1,6 +1,7 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 
 use rand::Rng;
 use rand::RngExt;
@@ -131,7 +132,11 @@ impl SeedCorpus {
     ///
     /// assert_eq!(corpus.len(), 2);
     /// ```
-    pub fn from_smarts(smarts: Vec<String>) -> Result<Self, String> {
+    pub fn from_smarts<I, S>(smarts: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let mut corpus = Self::default();
         corpus.extend_from_smarts(smarts)?;
         Ok(corpus)
@@ -198,6 +203,25 @@ impl SeedCorpus {
         }
         self.seeds.push(genome);
         true
+    }
+}
+
+impl<S> TryFrom<Vec<S>> for SeedCorpus
+where
+    S: AsRef<str>,
+{
+    type Error = String;
+
+    fn try_from(value: Vec<S>) -> Result<Self, Self::Error> {
+        Self::from_smarts(value)
+    }
+}
+
+impl<'a, const N: usize> TryFrom<[&'a str; N]> for SeedCorpus {
+    type Error = String;
+
+    fn try_from(value: [&'a str; N]) -> Result<Self, Self::Error> {
+        Self::from_smarts(value)
     }
 }
 
@@ -334,6 +358,36 @@ mod tests {
             "[#6]".to_string(),
         ])
         .unwrap();
+
+        let smarts: HashSet<_> = corpus
+            .entries()
+            .iter()
+            .map(|genome| genome.smarts())
+            .collect();
+
+        assert_eq!(corpus.len(), 2);
+        assert!(smarts.contains("[#6]"));
+        assert!(smarts.contains("[#7]"));
+    }
+
+    #[test]
+    fn seed_corpus_try_from_vec_of_strs_deduplicates_and_validates() {
+        let corpus = SeedCorpus::try_from(vec!["[#6]", "[#7]", "[#6]"]).unwrap();
+
+        let smarts: HashSet<_> = corpus
+            .entries()
+            .iter()
+            .map(|genome| genome.smarts())
+            .collect();
+
+        assert_eq!(corpus.len(), 2);
+        assert!(smarts.contains("[#6]"));
+        assert!(smarts.contains("[#7]"));
+    }
+
+    #[test]
+    fn seed_corpus_try_from_array_of_strs_deduplicates_and_validates() {
+        let corpus = SeedCorpus::try_from(["[#6]", "[#7]", "[#6]"]).unwrap();
 
         let smarts: HashSet<_> = corpus
             .entries()
