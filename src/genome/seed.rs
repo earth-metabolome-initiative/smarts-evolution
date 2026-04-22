@@ -11,7 +11,7 @@ const STRATEGY_BUCKETS: usize = 12;
 const CORPUS_BUCKETS: usize = 8;
 const SIMPLE_BUILTIN_BUCKETS: usize = 2;
 
-const BUILTIN_SEED_SMARTS: &[&str] = &[
+const GENERIC_BUILTIN_SEED_SMARTS: &[&str] = &[
     "[#6]",
     "[#7]",
     "[#8]",
@@ -65,6 +65,29 @@ const BUILTIN_SEED_SMARTS: &[&str] = &[
     "[#15](~[#8])(~[#8])~[#8]",
 ];
 
+const CURATED_BUILTIN_SEED_SMARTS: &[&str] = &[
+    "[#7;H2]~[#6]",
+    "[#7;H1](~[#6])~[#6]",
+    "[#7](~[#6])(~[#6])~[#6]",
+    "[#6;r6]~[#7]",
+    "[#6;r6]~[#8]",
+    "[#6;r6]~[#17]",
+    "[#6;r6]~[#35]",
+    "[#6]~[#6]~[#6]~[#7]",
+    "[#6;r6]~[#6]~[#6]~[#7]",
+    "[#7]~[#6](=[#8])~[#7]",
+    "[#8]~[#6](=[#8])~[#7]",
+    "[#8]~[#6](=[#8])~[#8]",
+    "[#16](=[#8])~[#6]",
+    "[#16](=[#8])(=[#8])~[#6]",
+    "[#16](=[#8])(=[#8])~[#7]",
+    "[#6]#[#7]",
+    "[#6]~[#6]#[#7]",
+    "[#8]~[#6]~[#6]~[#8]",
+    "[#6]~[#6]~[#6]~[#6](=[#8])[#8]",
+    "[#15](=[#8])([#8])([#8])[#8]",
+];
+
 /// A curated corpus of known-reasonable SMARTS seeds.
 ///
 /// This is a first-class fuzzing-style seed corpus, not just an incidental
@@ -78,7 +101,12 @@ impl SeedCorpus {
     /// Build a corpus from the shipped built-in SMARTS fragments.
     pub fn builtin() -> Self {
         let mut corpus = Self::default();
-        let inserted = corpus.extend_from_smarts(BUILTIN_SEED_SMARTS.iter().copied());
+        let inserted = corpus.extend_from_smarts(
+            GENERIC_BUILTIN_SEED_SMARTS
+                .iter()
+                .chain(CURATED_BUILTIN_SEED_SMARTS.iter())
+                .copied(),
+        );
         debug_assert!(
             inserted.is_ok(),
             "built-in SMARTS seed corpus must stay valid"
@@ -204,7 +232,13 @@ fn corpus_seed<R: Rng>(seed_corpus: &SeedCorpus, rng: &mut R) -> SmartsGenome {
 
 /// Generate one small built-in SMARTS seed.
 fn builtin_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
-    let pat = BUILTIN_SEED_SMARTS.choose(rng).unwrap();
+    let total = GENERIC_BUILTIN_SEED_SMARTS.len() + CURATED_BUILTIN_SEED_SMARTS.len();
+    let idx = rng.gen_range(0..total);
+    let pat = if idx < GENERIC_BUILTIN_SEED_SMARTS.len() {
+        GENERIC_BUILTIN_SEED_SMARTS[idx]
+    } else {
+        CURATED_BUILTIN_SEED_SMARTS[idx - GENERIC_BUILTIN_SEED_SMARTS.len()]
+    };
     SmartsGenome::from_smarts(pat).unwrap()
 }
 
@@ -271,8 +305,24 @@ mod tests {
     #[test]
     fn builtin_seed_corpus_is_valid() {
         let corpus = SeedCorpus::builtin();
-        assert!(corpus.len() >= BUILTIN_SEED_SMARTS.len());
+        assert!(
+            corpus.len() >= GENERIC_BUILTIN_SEED_SMARTS.len() + CURATED_BUILTIN_SEED_SMARTS.len()
+        );
         assert!(corpus.entries().iter().all(SmartsGenome::is_valid));
+    }
+
+    #[test]
+    fn builtin_seed_corpus_contains_curated_motifs() {
+        let corpus = SeedCorpus::builtin();
+        let smarts: HashSet<_> = corpus
+            .entries()
+            .iter()
+            .map(|genome| genome.smarts())
+            .collect();
+
+        assert!(smarts.contains("[#7](~[#6])(~[#6])~[#6]"));
+        assert!(smarts.contains("[#16](=[#8])(=[#8])~[#7]"));
+        assert!(smarts.contains("[#6;r6]~[#6]~[#6]~[#7]"));
     }
 
     #[test]
