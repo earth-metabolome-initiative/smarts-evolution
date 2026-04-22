@@ -1,7 +1,7 @@
 use alloc::collections::VecDeque;
 use alloc::format;
-use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt;
@@ -58,8 +58,8 @@ struct CachedFitness {
 }
 
 struct FitnessCache {
-    entries: HashMap<Rc<str>, CachedFitness>,
-    access_order: VecDeque<(Rc<str>, u64)>,
+    entries: HashMap<Arc<str>, CachedFitness>,
+    access_order: VecDeque<(Arc<str>, u64)>,
     capacity: usize,
     next_stamp: u64,
 }
@@ -74,7 +74,7 @@ impl FitnessCache {
         }
     }
 
-    fn get(&mut self, key: &Rc<str>) -> Option<ObjectiveFitness> {
+    fn get(&mut self, key: &Arc<str>) -> Option<ObjectiveFitness> {
         if self.capacity == 0 {
             return None;
         }
@@ -90,7 +90,7 @@ impl FitnessCache {
         Some(fitness)
     }
 
-    fn insert(&mut self, key: Rc<str>, fitness: ObjectiveFitness) {
+    fn insert(&mut self, key: Arc<str>, fitness: ObjectiveFitness) {
         if self.capacity == 0 {
             return;
         }
@@ -489,17 +489,21 @@ fn evolve_task_inner(
         }
         let unique_count = seen_population.len();
         let mut unique_scored = Vec::with_capacity(unique_count);
+        let mut uncached_genomes = Vec::new();
 
         for genome in unique_population {
             let smarts = genome.smarts_shared().clone();
-            let fitness = if let Some(fitness) = fitness_cache.get(&smarts) {
+            if let Some(fitness) = fitness_cache.get(&smarts) {
                 cache_hits += 1;
-                fitness
+                unique_scored.push((genome, fitness));
             } else {
-                let fitness = evaluator.fitness_of(&genome);
-                fitness_cache.insert(smarts, fitness);
-                fitness
-            };
+                uncached_genomes.push(genome);
+            }
+        }
+
+        let freshly_scored = evaluator.fitness_of_many(uncached_genomes);
+        for (genome, fitness) in freshly_scored {
+            fitness_cache.insert(genome.smarts_shared().clone(), fitness);
             unique_scored.push((genome, fitness));
         }
 
@@ -662,7 +666,7 @@ fn build_task_result(
 #[cfg(test)]
 fn deduplicate_population(population: &[SmartsGenome]) -> (Vec<SmartsGenome>, usize) {
     let mut unique = Vec::with_capacity(population.len());
-    let mut seen: HashSet<Rc<str>> = HashSet::with_capacity(population.len());
+    let mut seen: HashSet<Arc<str>> = HashSet::with_capacity(population.len());
 
     for genome in population {
         if seen.insert(genome.smarts_shared().clone()) {
@@ -676,7 +680,7 @@ fn deduplicate_population(population: &[SmartsGenome]) -> (Vec<SmartsGenome>, us
 
 fn insert_unique_genome(
     next_gen: &mut Vec<SmartsGenome>,
-    seen: &mut HashSet<Rc<str>>,
+    seen: &mut HashSet<Arc<str>>,
     genome: SmartsGenome,
 ) -> bool {
     if seen.insert(genome.smarts_shared().clone()) {
@@ -697,7 +701,7 @@ fn reinsert_population(
 ) -> Vec<SmartsGenome> {
     let pre_immigrant_target = population_size.saturating_sub(immigrant_count);
     let mut next_gen = Vec::with_capacity(population_size);
-    let mut seen: HashSet<Rc<str>> = HashSet::with_capacity(population_size);
+    let mut seen: HashSet<Arc<str>> = HashSet::with_capacity(population_size);
 
     for (genome, _) in scored_unique.iter().take(elite_count) {
         insert_unique_genome(&mut next_gen, &mut seen, genome.clone());
@@ -730,7 +734,7 @@ fn build_reset_pool(
     limit: usize,
 ) -> Vec<SmartsGenome> {
     let mut reset_pool = Vec::with_capacity(limit);
-    let mut seen: HashSet<Rc<str>> = HashSet::with_capacity(limit);
+    let mut seen: HashSet<Arc<str>> = HashSet::with_capacity(limit);
 
     for genome in seed_corpus.entries() {
         if reset_pool.len() >= limit {
@@ -1163,9 +1167,9 @@ mod regression_tests {
     #[test]
     fn fitness_cache_evicts_least_recently_used_entries() {
         let mut cache = FitnessCache::new(2);
-        let a: Rc<str> = "[#6]".into();
-        let b: Rc<str> = "[#7]".into();
-        let c: Rc<str> = "[#8]".into();
+        let a: Arc<str> = "[#6]".into();
+        let b: Arc<str> = "[#7]".into();
+        let c: Arc<str> = "[#8]".into();
 
         cache.insert(a.clone(), fitness(0.8));
         cache.insert(b.clone(), fitness(0.7));

@@ -594,6 +594,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "log",
  "rand",
+ "rayon",
  "smarts-parser",
  "smarts-validator",
  "smiles-parser",

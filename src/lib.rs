@@ -2,7 +2,7 @@
 #![doc = include_str!("../README.md")]
 
 extern crate alloc;
-#[cfg(test)]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
 pub mod evolution;

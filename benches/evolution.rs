@@ -2,6 +2,9 @@ use std::hint::black_box;
 use std::str::FromStr;
 use std::time::Duration;
 
+#[path = "../experiments/example_support.rs"]
+mod example_support;
+
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -14,6 +17,12 @@ use smarts_evolution::{
 };
 use smarts_validator::{CompiledQuery, PreparedTarget, matches_compiled};
 use smiles_parser::Smiles;
+
+use example_support::{
+    EXAMPLE_BENCH_GENERATION_LIMIT, EXAMPLE_BENCH_POPULATION_SIZE, EXAMPLE_BENCH_SEED,
+    EXAMPLE_DATASETS, EXAMPLE_EVALUATOR_QUERY, SeedStrategy, build_example_config,
+    build_example_task, run_example_strategy,
+};
 
 const POSITIVE_SMILES: &[&str] = &[
     "CC(=O)N",
@@ -36,58 +45,6 @@ const SEED_SMARTS: &[&str] = &[
     "[#7]~[#6](=[#8])",
     "[#6](=[#8])[#6]",
 ];
-
-struct ExampleDataset {
-    name: &'static str,
-    positive_smiles: &'static str,
-    negative_smiles: &'static str,
-}
-
-const EXAMPLE_DATASETS: &[ExampleDataset] = &[
-    ExampleDataset {
-        name: "amphetamines",
-        positive_smiles: include_str!(
-            "../apps/web/examples/amphetamines_and_derivatives_positive.smiles"
-        ),
-        negative_smiles: include_str!(
-            "../apps/web/examples/amphetamines_and_derivatives_negative.smiles"
-        ),
-    },
-    ExampleDataset {
-        name: "flavonoids",
-        positive_smiles: include_str!("../apps/web/examples/flavonoids_positive.smiles"),
-        negative_smiles: include_str!("../apps/web/examples/flavonoids_negative.smiles"),
-    },
-    ExampleDataset {
-        name: "fatty-acids",
-        positive_smiles: include_str!(
-            "../apps/web/examples/fatty_acids_and_conjugates_positive.smiles"
-        ),
-        negative_smiles: include_str!(
-            "../apps/web/examples/fatty_acids_and_conjugates_negative.smiles"
-        ),
-    },
-    ExampleDataset {
-        name: "penicillins",
-        positive_smiles: include_str!("../apps/web/examples/penicillins_positive.smiles"),
-        negative_smiles: include_str!("../apps/web/examples/penicillins_negative.smiles"),
-    },
-    ExampleDataset {
-        name: "steroids",
-        positive_smiles: include_str!(
-            "../apps/web/examples/steroids_and_steroid_derivatives_positive.smiles"
-        ),
-        negative_smiles: include_str!(
-            "../apps/web/examples/steroids_and_steroid_derivatives_negative.smiles"
-        ),
-    },
-];
-
-const EXAMPLE_BENCH_POPULATION_SIZE: usize = 64;
-const EXAMPLE_BENCH_GENERATION_LIMIT: u64 = 20;
-const EXAMPLE_BENCH_STAGNATION_LIMIT: u64 = 10;
-const EXAMPLE_BENCH_SEED: u64 = 17;
-const EXAMPLE_EVALUATOR_QUERY: &str = "[#6](~[#6])~[#6]";
 
 fn prepared(smiles: &str) -> PreparedTarget {
     PreparedTarget::new(Smiles::from_str(smiles).unwrap())
@@ -119,41 +76,6 @@ fn build_seed_corpus() -> SeedCorpus {
             .collect(),
     )
     .unwrap()
-}
-
-fn parse_dataset_samples(smiles_block: &str, is_positive: bool) -> Vec<FoldSample> {
-    smiles_block
-        .lines()
-        .map(str::trim)
-        .filter(|smiles| !smiles.is_empty())
-        .map(|smiles| {
-            let target = prepared(smiles);
-            if is_positive {
-                FoldSample::positive(target)
-            } else {
-                FoldSample::negative(target)
-            }
-        })
-        .collect()
-}
-
-fn build_example_task(dataset: &ExampleDataset) -> EvolutionTask {
-    let mut samples = parse_dataset_samples(dataset.positive_smiles, true);
-    samples.extend(parse_dataset_samples(dataset.negative_smiles, false));
-    EvolutionTask::new(
-        format!("example-{}", dataset.name),
-        vec![FoldData::new(samples)],
-    )
-}
-
-fn build_example_config() -> EvolutionConfig {
-    EvolutionConfig::builder()
-        .population_size(EXAMPLE_BENCH_POPULATION_SIZE)
-        .generation_limit(EXAMPLE_BENCH_GENERATION_LIMIT)
-        .stagnation_limit(EXAMPLE_BENCH_STAGNATION_LIMIT)
-        .rng_seed(EXAMPLE_BENCH_SEED)
-        .build()
-        .unwrap()
 }
 
 fn evaluator_benches(c: &mut Criterion) {
@@ -285,7 +207,7 @@ fn example_evolution_benches(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(8));
     group.sample_size(10);
 
-    let config = build_example_config();
+    let config = build_example_config(EXAMPLE_BENCH_SEED);
     let seed_corpus = SeedCorpus::builtin();
 
     for dataset in EXAMPLE_DATASETS {
@@ -311,6 +233,36 @@ fn example_evolution_benches(c: &mut Criterion) {
                 });
             },
         );
+    }
+
+    group.finish();
+}
+
+fn example_strategy_total_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("example_strategy_total");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(8));
+    group.sample_size(10);
+
+    for strategy in [SeedStrategy::Builtin, SeedStrategy::DiscriminativePaths] {
+        for dataset in EXAMPLE_DATASETS {
+            group.bench_with_input(
+                BenchmarkId::new(
+                    strategy.name(),
+                    format!(
+                        "{}_pop{}_gen{}",
+                        dataset.name, EXAMPLE_BENCH_POPULATION_SIZE, EXAMPLE_BENCH_GENERATION_LIMIT
+                    ),
+                ),
+                &dataset.name,
+                |b, _| {
+                    b.iter(|| {
+                        let result = run_example_strategy(dataset, strategy, EXAMPLE_BENCH_SEED);
+                        black_box(result.best_mcc());
+                    });
+                },
+            );
+        }
     }
 
     group.finish();
@@ -366,6 +318,7 @@ criterion_group!(
     evolution_benches,
     example_evaluator_benches,
     example_evolution_benches,
+    example_strategy_total_benches,
     operator_benches
 );
 criterion_main!(benches);

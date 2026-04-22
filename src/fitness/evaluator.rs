@@ -1,11 +1,16 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+use rayon::prelude::*;
 use smarts_validator::{CompiledQuery, PreparedTarget, matches_compiled};
 
 use super::mcc::{ConfusionCounts, compute_fold_averaged_mcc};
 use super::objective::ObjectiveFitness;
 use crate::genome::SmartsGenome;
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+const MIN_PARALLEL_GENOMES: usize = 8;
 
 /// One labeled evaluation target.
 #[derive(Clone, Debug)]
@@ -114,6 +119,32 @@ impl SmartsEvaluator {
 
     pub fn fitness_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
         self.objective_of(genome)
+    }
+
+    /// Evaluate a batch of genomes, using Rayon on std targets when the batch
+    /// is large enough to amortize scheduling overhead.
+    pub fn fitness_of_many(
+        &self,
+        genomes: Vec<SmartsGenome>,
+    ) -> Vec<(SmartsGenome, ObjectiveFitness)> {
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        if genomes.len() >= MIN_PARALLEL_GENOMES {
+            return genomes
+                .into_par_iter()
+                .map(|genome| {
+                    let fitness = self.fitness_of(&genome);
+                    (genome, fitness)
+                })
+                .collect();
+        }
+
+        genomes
+            .into_iter()
+            .map(|genome| {
+                let fitness = self.fitness_of(&genome);
+                (genome, fitness)
+            })
+            .collect()
     }
 }
 

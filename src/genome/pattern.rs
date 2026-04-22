@@ -1,5 +1,5 @@
-use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use core::fmt;
 use core::str::FromStr;
 use smarts_parser::QueryMol;
@@ -12,7 +12,7 @@ use super::limits::MAX_SMARTS_COMPLEXITY;
 #[derive(Clone, Debug)]
 pub struct SmartsGenome {
     query: QueryMol,
-    smarts_string: Rc<str>,
+    smarts_string: Arc<str>,
     complexity: usize,
 }
 
@@ -39,7 +39,7 @@ impl SmartsGenome {
     }
 
     fn from_query(query: QueryMol) -> Self {
-        let smarts_string: Rc<str> = query.to_string().into();
+        let smarts_string: Arc<str> = query.to_string().into();
         Self {
             complexity: query.atom_count() + query.bonds().len(),
             query,
@@ -67,7 +67,7 @@ impl SmartsGenome {
     }
 
     #[inline]
-    pub(crate) fn smarts_shared(&self) -> &Rc<str> {
+    pub(crate) fn smarts_shared(&self) -> &Arc<str> {
         &self.smarts_string
     }
 
