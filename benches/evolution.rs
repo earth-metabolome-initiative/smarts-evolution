@@ -5,6 +5,8 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use smarts_evolution::fitness::mcc::{ConfusionCounts, compute_fold_averaged_mcc};
+use smarts_evolution::fitness::objective::ObjectiveFitness;
 use smarts_evolution::genome::seed::SmartsGenomeBuilder;
 use smarts_evolution::operators::crossover::SmartsCrossover;
 use smarts_evolution::operators::mutation::SmartsMutation;
@@ -42,6 +44,7 @@ const EXAMPLE_BENCH_GENERATION_LIMIT: u64 = 20;
 const EXAMPLE_BENCH_STAGNATION_LIMIT: u64 = 10;
 const EXAMPLE_BENCH_SEED: u64 = 17;
 const EXAMPLE_EVALUATOR_QUERY: &str = "[#6](~[#6])~[#6]";
+const EXAMPLE_EVALUATOR_BATCH_SIZE: usize = 64;
 
 #[derive(Clone, Copy)]
 struct ExampleDataset {
@@ -148,6 +151,59 @@ fn build_example_config(seed: u64) -> EvolutionConfig {
         .unwrap()
 }
 
+fn build_example_genome_batch(size: usize) -> Vec<SmartsGenome> {
+    let builder = SmartsGenomeBuilder::new(SeedCorpus::builtin());
+    let mut rng = SmallRng::seed_from_u64(EXAMPLE_BENCH_SEED);
+    (0..size)
+        .map(|index| builder.build_genome(index, &mut rng))
+        .collect()
+}
+
+fn scalar_objective_of(genome: &SmartsGenome, folds: &[FoldData]) -> ObjectiveFitness {
+    let Ok(compiled) = CompiledQuery::new(genome.query().clone()) else {
+        return ObjectiveFitness::invalid();
+    };
+    let fold_counts = folds
+        .iter()
+        .map(|fold| {
+            let mut counts = ConfusionCounts::default();
+            for sample in fold.samples() {
+                counts.record_match(compiled.matches(sample.target()), sample.is_positive());
+            }
+            counts
+        })
+        .collect::<Vec<_>>();
+    ObjectiveFitness::from_mcc(compute_fold_averaged_mcc(&fold_counts))
+}
+
+fn scalar_objectives_of(genomes: &[SmartsGenome], folds: &[FoldData]) -> Vec<ObjectiveFitness> {
+    genomes
+        .iter()
+        .map(|genome| scalar_objective_of(genome, folds))
+        .collect()
+}
+
+fn indexed_objectives_of(
+    genomes: &[SmartsGenome],
+    evaluator: &SmartsEvaluator,
+) -> Vec<ObjectiveFitness> {
+    genomes
+        .iter()
+        .map(|genome| evaluator.objective_of(genome))
+        .collect()
+}
+
+fn indexed_batch_objectives_of(
+    genomes: &[SmartsGenome],
+    evaluator: &SmartsEvaluator,
+) -> Vec<ObjectiveFitness> {
+    evaluator
+        .evaluate_many(genomes.to_vec())
+        .into_iter()
+        .map(|(_, evaluation)| evaluation.fitness())
+        .collect()
+}
+
 fn evaluator_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluator");
     group.warm_up_time(Duration::from_secs(1));
@@ -162,6 +218,70 @@ fn evaluator_benches(c: &mut Criterion) {
             &sample_count_per_class,
             |b, _| {
                 b.iter(|| evaluator.objective_of(black_box(&genome)));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn example_evaluator_batch_mode_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("example_evaluator_batch_modes");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(6));
+    group.sample_size(10);
+
+    let genomes = build_example_genome_batch(EXAMPLE_EVALUATOR_BATCH_SIZE);
+
+    for dataset in EXAMPLE_DATASETS {
+        let task = build_example_task(&dataset);
+        let evaluator = SmartsEvaluator::new(task.folds().to_vec());
+        let scalar = scalar_objectives_of(&genomes, task.folds());
+        let indexed = indexed_objectives_of(&genomes, &evaluator);
+        let indexed_batch = indexed_batch_objectives_of(&genomes, &evaluator);
+        assert_eq!(
+            scalar, indexed,
+            "scalar/indexed drifted for {}",
+            dataset.name
+        );
+        assert_eq!(
+            scalar, indexed_batch,
+            "scalar/indexed-batch drifted for {}",
+            dataset.name
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("scalar_batch64", dataset.name),
+            &dataset.name,
+            |b, _| {
+                b.iter(|| {
+                    let fitness =
+                        scalar_objectives_of(black_box(&genomes), black_box(task.folds()));
+                    black_box(fitness);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("indexed_scalar_batch64", dataset.name),
+            &dataset.name,
+            |b, _| {
+                b.iter(|| {
+                    let fitness = indexed_objectives_of(black_box(&genomes), black_box(&evaluator));
+                    black_box(fitness);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("indexed_batch_batch64", dataset.name),
+            &dataset.name,
+            |b, _| {
+                b.iter(|| {
+                    let fitness =
+                        indexed_batch_objectives_of(black_box(&genomes), black_box(&evaluator));
+                    black_box(fitness);
+                });
             },
         );
     }
@@ -355,6 +475,7 @@ criterion_group!(
     benches,
     evaluator_benches,
     evaluator_component_benches,
+    example_evaluator_batch_mode_benches,
     evolution_benches,
     example_evaluator_benches,
     example_evolution_benches,
