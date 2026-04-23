@@ -239,6 +239,53 @@ impl StartupUpdate {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationUpdate {
+    run_id: u64,
+    generation: u64,
+    generation_limit: u64,
+    completed: usize,
+    total: usize,
+}
+
+impl EvaluationUpdate {
+    pub fn new(
+        run_id: u64,
+        generation: u64,
+        generation_limit: u64,
+        completed: usize,
+        total: usize,
+    ) -> Self {
+        Self {
+            run_id,
+            generation,
+            generation_limit,
+            completed,
+            total: total.max(1),
+        }
+    }
+
+    pub fn run_id(&self) -> u64 {
+        self.run_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn generation_limit(&self) -> u64 {
+        self.generation_limit
+    }
+
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RunStatus {
     Running,
@@ -433,6 +480,7 @@ impl WorkerRequest {
 pub enum WorkerResponse {
     Ready,
     Startup(StartupUpdate),
+    Evaluation(EvaluationUpdate),
     Progress(ProgressUpdate),
     Complete(CompletedRun),
     Fatal(FatalResponse),
@@ -443,6 +491,7 @@ impl WorkerResponse {
         match self {
             Self::Ready => 0,
             Self::Startup(startup) => startup.run_id(),
+            Self::Evaluation(evaluation) => evaluation.run_id(),
             Self::Progress(progress) => progress.run_id(),
             Self::Complete(result) => result.run_id(),
             Self::Fatal(error) => error.run_id(),

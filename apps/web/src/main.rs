@@ -8,8 +8,8 @@ use dioxus::prelude::*;
 use icons::{AppIcon, app_icon};
 use smiles_parser::Smiles;
 use smarts_evolution_web_protocol::{
-    CompletedRun, EvolutionConfigInput, ProgressUpdate, RankedCandidate, RunRequest, StartupUpdate,
-    WorkerRequest,
+    CompletedRun, EvaluationUpdate, EvolutionConfigInput, ProgressUpdate, RankedCandidate,
+    RunRequest, StartupUpdate, WorkerRequest,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -262,6 +262,7 @@ struct ScatterTooltip {
 struct RunView {
     phase: RunPhase,
     startup: Option<StartupUpdate>,
+    evaluation: Option<EvaluationUpdate>,
     progress: Option<ProgressUpdate>,
     result: Option<CompletedRun>,
     history: Vec<ProgressPoint>,
@@ -273,6 +274,7 @@ impl Default for RunView {
         Self {
             phase: RunPhase::Idle,
             startup: None,
+            evaluation: None,
             progress: None,
             result: None,
             history: Vec::new(),
@@ -287,6 +289,7 @@ impl RunView {
         Self {
             phase: RunPhase::Running,
             startup: Some(StartupUpdate::new(run_id, "Launching worker", 0, 1)),
+            evaluation: None,
             progress: None,
             result: None,
             history: Vec::new(),
@@ -300,7 +303,18 @@ impl RunView {
             self.message = None;
         }
         self.startup = Some(startup);
+        self.evaluation = None;
         self.progress = None;
+        self.result = None;
+    }
+
+    fn apply_evaluation(&mut self, evaluation: EvaluationUpdate) {
+        if self.phase != RunPhase::Stopped {
+            self.phase = RunPhase::Running;
+            self.message = None;
+        }
+        self.startup = None;
+        self.evaluation = Some(evaluation);
         self.result = None;
     }
 
@@ -310,6 +324,7 @@ impl RunView {
             self.phase = RunPhase::Running;
         }
         self.startup = None;
+        self.evaluation = None;
         self.push_progress_point(&progress);
         self.progress = Some(progress);
         self.result = None;
@@ -323,6 +338,7 @@ impl RunView {
     fn finish(&mut self, result: CompletedRun) {
         self.phase = RunPhase::Completed;
         self.startup = None;
+        self.evaluation = None;
         self.result = Some(result);
         self.message = Some("Evolution run completed.".to_string());
     }
@@ -330,6 +346,7 @@ impl RunView {
     fn fail(&mut self, message: String) {
         self.phase = RunPhase::Failed;
         self.startup = None;
+        self.evaluation = None;
         self.message = Some(message);
     }
 
@@ -425,6 +442,9 @@ impl EvolutionWorker {
                     }
                 }
                 WorkerResponse::Startup(startup) => run_view.write().apply_startup(startup),
+                WorkerResponse::Evaluation(evaluation) => {
+                    run_view.write().apply_evaluation(evaluation)
+                }
                 WorkerResponse::Progress(progress) => run_view.write().apply_progress(progress),
                 WorkerResponse::Complete(result) => run_view.write().finish(result),
                 WorkerResponse::Fatal(error) => run_view.write().fail(error.message().to_string()),
@@ -643,6 +663,7 @@ fn App() -> Element {
         .unwrap_or(0);
     let draft_value = draft_value.unwrap_or_default();
     let has_run_started = run_view_value.startup.is_some()
+        || run_view_value.evaluation.is_some()
         || run_view_value.progress.is_some()
         || run_view_value.result.is_some();
     let layout_class = "layout layout-results";
@@ -920,6 +941,15 @@ fn App() -> Element {
                                         format!("{}/{}", progress.generation(), progress.generation_limit()),
                                         "progress-fill",
                                     )}
+                                    if let Some(evaluation) = run_view_value.evaluation.as_ref() {
+                                        {progress_meter(
+                                            format!("Scoring generation {}", evaluation.generation()),
+                                            evaluation.completed() as f64,
+                                            evaluation.total() as f64,
+                                            format!("{}/{} SMARTS", evaluation.completed(), evaluation.total()),
+                                            "progress-fill",
+                                        )}
+                                    }
                                 }
                             } else if let Some(startup) = run_view_value.startup.as_ref() {
                                 div { class: "progress-stack",
@@ -931,6 +961,27 @@ fn App() -> Element {
                                             "{:.0}%",
                                             (startup.completed() as f64 / startup.total().max(1) as f64) * 100.0,
                                         ),
+                                        "progress-fill",
+                                    )}
+                                }
+                            } else if let Some(evaluation) = run_view_value.evaluation.as_ref() {
+                                div { class: "progress-stack",
+                                    {progress_meter(
+                                        "Generation progress",
+                                        evaluation.generation().saturating_sub(1) as f64,
+                                        evaluation.generation_limit() as f64,
+                                        format!(
+                                            "{}/{}",
+                                            evaluation.generation().saturating_sub(1),
+                                            evaluation.generation_limit(),
+                                        ),
+                                        "progress-fill",
+                                    )}
+                                    {progress_meter(
+                                        format!("Scoring generation {}", evaluation.generation()),
+                                        evaluation.completed() as f64,
+                                        evaluation.total() as f64,
+                                        format!("{}/{} SMARTS", evaluation.completed(), evaluation.total()),
                                         "progress-fill",
                                     )}
                                 }
@@ -969,6 +1020,8 @@ fn App() -> Element {
                                     p { class: "leaderboard-meta",
                                         if let Some(progress) = run_view_value.progress.as_ref() {
                                             "Generation {progress.generation()} of {progress.generation_limit()}"
+                                        } else if let Some(evaluation) = run_view_value.evaluation.as_ref() {
+                                            "Scoring generation {evaluation.generation()} of {evaluation.generation_limit()}"
                                         } else if let Some(result) = run_view_value.result.as_ref() {
                                             "Leaderboard after {result.generations()} generations"
                                         } else {

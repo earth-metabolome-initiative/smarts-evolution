@@ -5,12 +5,12 @@ use std::str::FromStr;
 
 use js_sys::global;
 use smarts_evolution::{
-    EvolutionConfig, EvolutionProgress, EvolutionStatus, EvolutionTask, FoldData, FoldSample,
-    EvolutionSession, RankedSmarts, SeedCorpus, TaskResult,
+    EvolutionConfig, EvolutionEvaluationProgress, EvolutionProgress, EvolutionSession,
+    EvolutionStatus, EvolutionTask, FoldData, FoldSample, RankedSmarts, SeedCorpus, TaskResult,
 };
 use smarts_evolution_web_protocol::{
-    CompletedRun, EvolutionConfigInput, FatalResponse, ProgressUpdate, RankedCandidate, RunRequest,
-    RunStatus, StartupUpdate, WorkerRequest, WorkerResponse,
+    CompletedRun, EvaluationUpdate, EvolutionConfigInput, FatalResponse, ProgressUpdate,
+    RankedCandidate, RunRequest, RunStatus, StartupUpdate, WorkerRequest, WorkerResponse,
 };
 use smarts_validator::PreparedTarget;
 use smiles_parser::Smiles;
@@ -233,6 +233,19 @@ fn progress_update_from_snapshot(run_id: u64, snapshot: &EvolutionProgress) -> P
     )
 }
 
+fn evaluation_update_from_snapshot(
+    run_id: u64,
+    snapshot: &EvolutionEvaluationProgress,
+) -> EvaluationUpdate {
+    EvaluationUpdate::new(
+        run_id,
+        snapshot.generation(),
+        snapshot.generation_limit(),
+        snapshot.completed(),
+        snapshot.total(),
+    )
+}
+
 fn completed_run_from_result(run_id: u64, result: &TaskResult) -> CompletedRun {
     CompletedRun::new(
         run_id,
@@ -332,7 +345,18 @@ fn drive_active_run() {
             return StepOutcome::Idle;
         }
 
-        let Some(progress) = active_run.session.step() else {
+        let run_id = active_run.run_id;
+        let Some(progress) =
+            active_run
+                .session
+                .step_with_evaluation_progress(|progress| {
+                    if should_report_evaluation_progress(progress.completed(), progress.total()) {
+                        let _ = post_response(&WorkerResponse::Evaluation(
+                            evaluation_update_from_snapshot(run_id, &progress),
+                        ));
+                    }
+                })
+        else {
             return StepOutcome::Fatal(FatalResponse::new(
                 active_run.run_id,
                 "paused evolution session ended unexpectedly",
@@ -422,6 +446,10 @@ fn count_seed_units(input: &str) -> usize {
 
 fn should_report_progress(completed: usize, total: usize) -> bool {
     completed == total || completed <= 4 || completed.is_multiple_of(STARTUP_PROGRESS_BATCH)
+}
+
+fn should_report_evaluation_progress(completed: usize, total: usize) -> bool {
+    completed == 0 || completed == total || completed <= 4 || completed.is_multiple_of(8)
 }
 
 struct StartupReporter {

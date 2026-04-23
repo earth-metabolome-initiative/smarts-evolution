@@ -282,6 +282,16 @@ pub struct EvolutionProgress {
     stagnation: u64,
 }
 
+/// Progress while the current generation is being scored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvolutionEvaluationProgress {
+    task_id: String,
+    generation: u64,
+    generation_limit: u64,
+    completed: usize,
+    total: usize,
+}
+
 struct ProgressSnapshot<'a> {
     task_id: &'a str,
     generation: u64,
@@ -291,6 +301,44 @@ struct ProgressSnapshot<'a> {
     leaders: Vec<RankedSmarts>,
     stats: &'a GenerationStats,
     stagnation: u64,
+}
+
+impl EvolutionEvaluationProgress {
+    fn new(
+        task_id: &str,
+        generation: u64,
+        generation_limit: u64,
+        completed: usize,
+        total: usize,
+    ) -> Self {
+        Self {
+            task_id: task_id.to_string(),
+            generation,
+            generation_limit,
+            completed,
+            total: total.max(1),
+        }
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn generation_limit(&self) -> u64 {
+        self.generation_limit
+    }
+
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
 }
 
 impl EvolutionProgress {
@@ -452,22 +500,59 @@ impl EvolutionSession {
 
     /// Advance the search by one scored generation.
     pub fn step(&mut self) -> Option<EvolutionProgress> {
+        self.step_internal(None)
+    }
+
+    /// Advance the search by one generation and report scoring progress.
+    pub fn step_with_evaluation_progress(
+        &mut self,
+        mut on_evaluation_progress: impl FnMut(EvolutionEvaluationProgress),
+    ) -> Option<EvolutionProgress> {
+        self.step_internal(Some(&mut on_evaluation_progress))
+    }
+
+    fn step_internal(
+        &mut self,
+        mut on_evaluation_progress: Option<&mut dyn FnMut(EvolutionEvaluationProgress)>,
+    ) -> Option<EvolutionProgress> {
         if self.finished_result.is_some() || self.generation >= self.config.generation_limit() {
             return None;
         }
 
         let generation = self.generation;
+        let generation_number = generation + 1;
+        let generation_limit = self.config.generation_limit();
         let total_count = self.population.len();
+        let evaluation_total = total_count.max(1);
+        let mut evaluation_completed = 0usize;
         let average_complexity = average_complexity(&self.population);
         let mut seen_population = HashSet::with_capacity(total_count);
         let mut duplicate_count = 0usize;
         let mut cache_hits = 0usize;
         let mut unique_population = Vec::with_capacity(total_count);
 
+        emit_evaluation_progress(
+            &self.task_id,
+            generation_number,
+            generation_limit,
+            evaluation_completed,
+            evaluation_total,
+            &mut on_evaluation_progress,
+        );
+
         for genome in self.population.drain(..) {
             let smarts = genome.smarts_shared().clone();
             if !seen_population.insert(smarts.clone()) {
                 duplicate_count += 1;
+                evaluation_completed += 1;
+                emit_evaluation_progress(
+                    &self.task_id,
+                    generation_number,
+                    generation_limit,
+                    evaluation_completed,
+                    evaluation_total,
+                    &mut on_evaluation_progress,
+                );
                 continue;
             }
 
@@ -486,18 +571,47 @@ impl EvolutionSession {
                     fitness,
                     phenotype,
                 });
+                evaluation_completed += 1;
+                emit_evaluation_progress(
+                    &self.task_id,
+                    generation_number,
+                    generation_limit,
+                    evaluation_completed,
+                    evaluation_total,
+                    &mut on_evaluation_progress,
+                );
             } else {
                 uncached_genomes.push(genome);
             }
         }
 
-        let freshly_scored = self.evaluator.evaluate_many(uncached_genomes);
-        for (genome, evaluation) in freshly_scored {
-            unique_scored.push(build_scored_genome(
-                &mut self.fitness_cache,
-                genome,
-                evaluation,
-            ));
+        if on_evaluation_progress.is_some() {
+            for genome in uncached_genomes {
+                let evaluation = self.evaluator.evaluate(&genome);
+                unique_scored.push(build_scored_genome(
+                    &mut self.fitness_cache,
+                    genome,
+                    evaluation,
+                ));
+                evaluation_completed += 1;
+                emit_evaluation_progress(
+                    &self.task_id,
+                    generation_number,
+                    generation_limit,
+                    evaluation_completed,
+                    evaluation_total,
+                    &mut on_evaluation_progress,
+                );
+            }
+        } else {
+            let freshly_scored = self.evaluator.evaluate_many(uncached_genomes);
+            for (genome, evaluation) in freshly_scored {
+                unique_scored.push(build_scored_genome(
+                    &mut self.fitness_cache,
+                    genome,
+                    evaluation,
+                ));
+            }
         }
 
         unique_scored = phenotypically_deduplicate(unique_scored);
@@ -539,10 +653,10 @@ impl EvolutionSession {
             generation_progress_message(&stats, lead.fitness, self.best_fitness,),
         );
 
-        let generations = generation + 1;
+        let generations = generation_number;
         let status = if self.stagnation >= self.config.stagnation_limit() {
             EvolutionStatus::Stagnated
-        } else if generations == self.config.generation_limit() {
+        } else if generations == generation_limit {
             EvolutionStatus::Completed
         } else {
             EvolutionStatus::Running
@@ -552,7 +666,7 @@ impl EvolutionSession {
         let progress = EvolutionProgress::from_snapshot(ProgressSnapshot {
             task_id: &self.task_id,
             generation: generations,
-            generation_limit: self.config.generation_limit(),
+            generation_limit,
             status,
             best: RankedSmarts::new(&lead.genome, lead.fitness),
             leaders,
@@ -659,6 +773,25 @@ impl EvolutionSession {
     /// Takes the terminal task result once the session has finished.
     pub fn take_result(&mut self) -> Option<TaskResult> {
         self.finished_result.take()
+    }
+}
+
+fn emit_evaluation_progress(
+    task_id: &str,
+    generation: u64,
+    generation_limit: u64,
+    completed: usize,
+    total: usize,
+    on_evaluation_progress: &mut Option<&mut dyn FnMut(EvolutionEvaluationProgress)>,
+) {
+    if let Some(callback) = on_evaluation_progress.as_deref_mut() {
+        callback(EvolutionEvaluationProgress::new(
+            task_id,
+            generation,
+            generation_limit,
+            completed,
+            total,
+        ));
     }
 }
 
@@ -1217,6 +1350,51 @@ mod regression_tests {
         assert_eq!(
             snapshots.last().unwrap().leaders()[0].smarts(),
             result.leaders()[0].smarts()
+        );
+    }
+
+    #[test]
+    fn evolution_session_reports_within_generation_evaluation_progress() {
+        let task = EvolutionTask::new(
+            "amide-evaluation-progress",
+            vec![FoldData::new(vec![
+                sample("CC(=O)N", true),
+                sample("NC(=O)C", true),
+                sample("CCO", false),
+                sample("CCCl", false),
+            ])],
+        );
+        let config = EvolutionConfig::builder()
+            .population_size(8)
+            .generation_limit(1)
+            .stagnation_limit(1)
+            .build()
+            .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6](=[#8])[#7]", "[#6]~[#7]", "[#7]"]).unwrap();
+        let mut session = EvolutionSession::new(&task, &config, &seed_corpus, 3).unwrap();
+        let mut evaluations = Vec::new();
+
+        let progress = session
+            .step_with_evaluation_progress(|progress| evaluations.push(progress))
+            .unwrap();
+
+        assert_eq!(progress.generation(), 1);
+        assert!(!evaluations.is_empty());
+        assert_eq!(evaluations.first().unwrap().completed(), 0);
+        assert_eq!(
+            evaluations.last().unwrap().completed(),
+            config.population_size()
+        );
+        assert_eq!(
+            evaluations.last().unwrap().total(),
+            config.population_size()
+        );
+        assert!(
+            evaluations
+                .iter()
+                .all(|progress| progress.task_id() == "amide-evaluation-progress"
+                    && progress.generation() == 1
+                    && progress.generation_limit() == 1)
         );
     }
 

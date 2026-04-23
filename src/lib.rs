@@ -12,8 +12,9 @@ pub mod operators;
 
 pub use evolution::config::{EvolutionConfig, EvolutionConfigBuilder};
 pub use evolution::runner::{
-    EvolutionError, EvolutionProgress, EvolutionSession, EvolutionStatus, EvolutionTask,
-    RankedSmarts, TaskResult, evolve_task, evolve_task_with_progress,
+    EvolutionError, EvolutionEvaluationProgress, EvolutionProgress, EvolutionSession,
+    EvolutionStatus, EvolutionTask, RankedSmarts, TaskResult, evolve_task,
+    evolve_task_with_progress,
 };
 pub use fitness::evaluator::{FoldData, FoldSample, SmartsEvaluator};
 pub use genome::SmartsGenome;
