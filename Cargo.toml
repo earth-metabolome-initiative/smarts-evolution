@@ -14,8 +14,7 @@ codegen-units = 1
 
 [dependencies]
 elements_rs = "0.2.3"
-smarts-parser = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-parser" }
-smarts-validator = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-validator" }
+smarts-rs = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main" }
 smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main" }
 rand = { version = "0.10.1", default-features = false, features = ["alloc", "std_rng"] }
 getrandom = { version = "0.4.2", features = ["wasm_js"] }

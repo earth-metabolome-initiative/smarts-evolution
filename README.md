@@ -15,7 +15,7 @@ use smiles_parser::Smiles;
 use smarts_evolution::{
     EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, evolve_task,
 };
-use smarts_validator::PreparedTarget;
+use smarts_rs::PreparedTarget;
 
 fn prepared(smiles: &str) -> PreparedTarget {
     PreparedTarget::new(Smiles::from_str(smiles).unwrap())

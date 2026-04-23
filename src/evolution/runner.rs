@@ -808,7 +808,7 @@ fn emit_evaluation_progress(
 /// use smarts_evolution::{
 ///     EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, evolve_task,
 /// };
-/// use smarts_validator::PreparedTarget;
+/// use smarts_rs::PreparedTarget;
 ///
 /// fn prepared(smiles: &str) -> PreparedTarget {
 ///     PreparedTarget::new(Smiles::from_str(smiles).unwrap())
@@ -1181,7 +1181,7 @@ mod regression_tests {
     use std::vec;
 
     use crate::fitness::evaluator::FoldSample;
-    use smarts_validator::PreparedTarget;
+    use smarts_rs::PreparedTarget;
     use smiles_parser::Smiles;
 
     use super::*;

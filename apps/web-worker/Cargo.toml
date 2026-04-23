@@ -20,6 +20,6 @@ serde-wasm-bindgen = "0.6.5"
 smarts-evolution = { path = "../.." }
 smarts-evolution-web-protocol = { path = "../web-protocol" }
 smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main" }
-smarts-validator = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main", package = "smarts-validator" }
+smarts-rs = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main" }
 wasm-bindgen = "0.2.118"
 web-sys = { version = "0.3.95", features = ["DedicatedWorkerGlobalScope", "MessageEvent"] }

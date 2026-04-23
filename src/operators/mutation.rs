@@ -10,7 +10,7 @@ use rand::Rng;
 use rand::RngExt;
 use rand::prelude::IndexedRandom;
 use rand::seq::IteratorRandom;
-use smarts_parser::{
+use smarts_rs::{
     AtomExpr, AtomPrimitive, BondExpr, BondExprTree, BondPrimitive, BracketExpr, BracketExprTree,
     ComponentGroupId, EditableQueryMol, ExprPath, HydrogenKind, NumericQuery, NumericRange,
     QueryMol, add_atom_primitive, add_bond_primitive, normalize_bond_tree, remove_atom_primitive,

@@ -12,7 +12,7 @@ use smarts_evolution::{
     EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, SmartsEvaluator,
     SmartsGenome, evolve_task,
 };
-use smarts_validator::{CompiledQuery, PreparedTarget, matches_compiled};
+use smarts_rs::{CompiledQuery, PreparedTarget};
 use smiles_parser::Smiles;
 
 const POSITIVE_SMILES: &[&str] = &[
@@ -191,7 +191,7 @@ fn evaluator_component_benches(c: &mut Criterion) {
                     let matched = fold
                         .samples()
                         .iter()
-                        .filter(|sample| matches_compiled(&compiled, sample.target()))
+                        .filter(|sample| compiled.matches(sample.target()))
                         .count();
                     black_box(matched);
                 });

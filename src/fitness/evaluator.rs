@@ -5,7 +5,10 @@ use core::fmt;
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use rayon::prelude::*;
-use smarts_validator::{CompiledQuery, PreparedTarget, matches_compiled};
+use smarts_rs::{
+    CompiledQuery, MatchScratch, PreparedTarget, QueryMol, QueryScreen, TargetCorpusIndex,
+    TargetCorpusScratch,
+};
 
 use super::mcc::{ConfusionCounts, compute_fold_averaged_mcc};
 use super::objective::ObjectiveFitness;
@@ -52,12 +55,28 @@ impl FoldSample {
 pub struct FoldData {
     /// Test-set prepared targets in this fold.
     samples: Vec<FoldSample>,
+    positive_count: usize,
+    negative_count: usize,
+    index: TargetCorpusIndex,
 }
 
 impl FoldData {
     /// Create one evaluation fold from prepared labeled samples.
     pub fn new(samples: Vec<FoldSample>) -> Self {
-        Self { samples }
+        let positive_count = samples.iter().filter(|sample| sample.is_positive()).count();
+        let negative_count = samples.len().saturating_sub(positive_count);
+        let targets = samples
+            .iter()
+            .map(FoldSample::target)
+            .cloned()
+            .collect::<Vec<_>>();
+        let index = TargetCorpusIndex::new(&targets);
+        Self {
+            samples,
+            positive_count,
+            negative_count,
+            index,
+        }
     }
 
     pub fn samples(&self) -> &[FoldSample] {
@@ -70,6 +89,18 @@ impl FoldData {
 
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
+    }
+
+    pub fn positive_count(&self) -> usize {
+        self.positive_count
+    }
+
+    pub fn negative_count(&self) -> usize {
+        self.negative_count
+    }
+
+    fn index(&self) -> &TargetCorpusIndex {
+        &self.index
     }
 }
 
@@ -111,16 +142,18 @@ impl SmartsEvaluator {
 
     fn fold_counts_and_behavior_for_query(
         &self,
-        query: &smarts_parser::QueryMol,
+        query: &QueryMol,
     ) -> Option<(Vec<ConfusionCounts>, Arc<[u64]>)> {
         let compiled = CompiledQuery::new(query.clone()).ok()?;
-        Some(self.fold_counts_and_behavior_for_compiled(&compiled))
+        let screen = QueryScreen::new(compiled.query());
+        Some(self.fold_counts_and_behavior_for_compiled(&compiled, &screen))
     }
 
     // Keep fold aggregation localized so future evaluator changes stay local.
     fn fold_counts_and_behavior_for_compiled(
         &self,
         compiled: &CompiledQuery,
+        screen: &QueryScreen,
     ) -> (Vec<ConfusionCounts>, Arc<[u64]>) {
         let total_samples: usize = self.folds.iter().map(FoldData::len).sum();
         let mut behavior_words = vec![0u64; total_samples.div_ceil(64)];
@@ -128,7 +161,9 @@ impl SmartsEvaluator {
         let fold_counts = self
             .folds
             .iter()
-            .map(|fold| count_matches_in_fold(compiled, fold, &mut behavior_words, &mut bit_index))
+            .map(|fold| {
+                count_matches_in_fold(compiled, screen, fold, &mut behavior_words, &mut bit_index)
+            })
             .collect();
         (fold_counts, Arc::from(behavior_words))
     }
@@ -198,20 +233,44 @@ impl SmartsEvaluator {
 
 fn count_matches_in_fold(
     query: &CompiledQuery,
+    screen: &QueryScreen,
     fold: &FoldData,
     behavior_words: &mut [u64],
     bit_index: &mut usize,
 ) -> ConfusionCounts {
-    let mut counts = ConfusionCounts::default();
+    let fold_start_bit_index = *bit_index;
+    *bit_index += fold.len();
 
-    for sample in fold.samples() {
-        let matched = matches_compiled(query, sample.target());
-        record_behavior_match(behavior_words, *bit_index, matched);
-        *bit_index += 1;
-        counts.record_match(matched, sample.is_positive());
+    let mut candidates = Vec::new();
+    let mut corpus_scratch = TargetCorpusScratch::new();
+    fold.index()
+        .candidate_ids_with_scratch_into(screen, &mut corpus_scratch, &mut candidates);
+
+    let mut match_scratch = MatchScratch::new();
+    let mut true_positives = 0u64;
+    let mut false_positives = 0u64;
+
+    for target_id in candidates {
+        let sample = &fold.samples()[target_id];
+        let matched = query.matches_with_scratch(sample.target(), &mut match_scratch);
+        if !matched {
+            continue;
+        }
+
+        record_behavior_match(behavior_words, fold_start_bit_index + target_id, true);
+        if sample.is_positive() {
+            true_positives += 1;
+        } else {
+            false_positives += 1;
+        }
     }
 
-    counts
+    ConfusionCounts::new(
+        true_positives,
+        false_positives,
+        fold.negative_count() as u64 - false_positives,
+        fold.positive_count() as u64 - true_positives,
+    )
 }
 
 fn record_behavior_match(behavior_words: &mut [u64], bit_index: usize, matched: bool) {
@@ -259,10 +318,12 @@ mod tests {
         ]);
         let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
         let compiled = CompiledQuery::new(genome.query().clone()).unwrap();
+        let screen = QueryScreen::new(compiled.query());
         let mut behavior = vec![0u64; 1];
         let mut bit_index = 0usize;
 
-        let counts = count_matches_in_fold(&compiled, &fold, &mut behavior, &mut bit_index);
+        let counts =
+            count_matches_in_fold(&compiled, &screen, &fold, &mut behavior, &mut bit_index);
 
         assert_eq!(counts, ConfusionCounts::new(1, 1, 1, 1));
         assert_eq!(behavior[0], 0b0011);

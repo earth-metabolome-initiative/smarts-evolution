@@ -12,7 +12,7 @@ use smarts_evolution_web_protocol::{
     CompletedRun, EvaluationUpdate, EvolutionConfigInput, FatalResponse, ProgressUpdate,
     RankedCandidate, RunRequest, RunStatus, StartupUpdate, WorkerRequest, WorkerResponse,
 };
-use smarts_validator::PreparedTarget;
+use smarts_rs::PreparedTarget;
 use smiles_parser::Smiles;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};

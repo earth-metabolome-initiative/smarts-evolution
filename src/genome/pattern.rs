@@ -2,7 +2,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 use core::str::FromStr;
-use smarts_parser::QueryMol;
+use smarts_rs::QueryMol;
 
 use super::limits::MAX_SMARTS_COMPLEXITY;
 

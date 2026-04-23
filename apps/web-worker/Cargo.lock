@@ -481,8 +481,7 @@ dependencies = [
  "log",
  "rand 0.10.1",
  "rayon",
- "smarts-parser",
- "smarts-validator",
+ "smarts-rs",
  "smiles-parser",
 ]
 
@@ -502,33 +501,19 @@ dependencies = [
  "serde-wasm-bindgen",
  "smarts-evolution",
  "smarts-evolution-web-protocol",
- "smarts-validator",
+ "smarts-rs",
  "smiles-parser",
  "wasm-bindgen",
  "web-sys",
 ]
 
 [[package]]
-name = "smarts-parser"
+name = "smarts-rs"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#67ad569bb73564d58d70b06f359243c36629dfc6"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#e66ba877d67271aa7bd8dd9bff5485568573cab2"
 dependencies = [
  "elements_rs",
  "geometric-traits",
- "smiles-parser",
- "thiserror",
-]
-
-[[package]]
-name = "smarts-validator"
-version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#67ad569bb73564d58d70b06f359243c36629dfc6"
-dependencies = [
- "elements_rs",
- "geometric-traits",
- "serde",
- "serde_json",
- "smarts-parser",
  "smiles-parser",
  "thiserror",
 ]

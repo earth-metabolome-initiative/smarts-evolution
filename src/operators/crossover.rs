@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use rand::Rng;
 use rand::RngExt;
 use rand::prelude::IndexedRandom;
-use smarts_parser::QueryMol;
+use smarts_rs::QueryMol;
 
 use crate::genome::SmartsGenome;
 use crate::genome::limits::MAX_CROSSOVER_CHILD_COMPLEXITY;
