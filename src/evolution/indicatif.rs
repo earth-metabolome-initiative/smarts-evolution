@@ -146,12 +146,6 @@ impl IndicatifEvolutionProgress {
         if let Some(best_mcc) = progress.generation_best_mcc() {
             message.push_str(&format!(" gen_best_mcc={best_mcc:.3}"));
         }
-        if let Some(best_smarts) = progress.generation_best_smarts() {
-            message.push_str(&format!(
-                " gen_best={}",
-                truncate_smarts(best_smarts, self.best_smarts_width)
-            ));
-        }
         self.evaluation_bar.set_message(message);
     }
 
