@@ -192,6 +192,85 @@ impl EvolutionTask {
     pub fn folds(&self) -> &[FoldData] {
         &self.folds
     }
+
+    /// Evolve this binary task from already-prepared folds.
+    ///
+    /// This is the main library entry point.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::str::FromStr;
+    ///
+    /// use smiles_parser::Smiles;
+    /// use smarts_evolution::{
+    ///     EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus,
+    /// };
+    /// use smarts_rs::PreparedTarget;
+    ///
+    /// fn prepared(smiles: &str) -> PreparedTarget {
+    ///     PreparedTarget::new(Smiles::from_str(smiles).unwrap())
+    /// }
+    ///
+    /// let task = EvolutionTask::new(
+    ///     "amide-vs-rest",
+    ///     vec![FoldData::new(vec![
+    ///         FoldSample::positive(prepared("CC(=O)N")),
+    ///         FoldSample::positive(prepared("NC(=O)C")),
+    ///         FoldSample::negative(prepared("CCO")),
+    ///         FoldSample::negative(prepared("c1ccccc1")),
+    ///     ])],
+    /// );
+    ///
+    /// let config = EvolutionConfig::builder()
+    ///     .population_size(8)
+    ///     .generation_limit(2)
+    ///     .stagnation_limit(2)
+    ///     .build()
+    ///     .unwrap();
+    /// let seed_corpus = SeedCorpus::try_from([
+    ///     "[#6](=[#8])[#7]",
+    ///     "[#6]~[#7]",
+    /// ])
+    /// .unwrap();
+    ///
+    /// let result = task.evolve(&config, &seed_corpus).unwrap();
+    /// assert!(!result.best_smarts().is_empty());
+    /// assert!(result.best_mcc().is_finite());
+    /// ```
+    pub fn evolve(
+        &self,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+    ) -> Result<TaskResult, EvolutionError> {
+        self.evolve_with_progress(config, seed_corpus, 1, |_| {})
+    }
+
+    /// Evolve this task while emitting one snapshot after each scored generation.
+    pub fn evolve_with_progress(
+        &self,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+        leaderboard_size: usize,
+        mut on_progress: impl FnMut(EvolutionProgress),
+    ) -> Result<TaskResult, EvolutionError> {
+        let mut session = EvolutionSession::new(self, config, seed_corpus, leaderboard_size)?;
+        while let Some(progress) = session.step() {
+            on_progress(progress);
+            if session.is_finished() {
+                if let Some(result) = session.take_result() {
+                    return Ok(result);
+                }
+                return Err(EvolutionError::InvalidConfig(
+                    "finished evolution session did not expose a terminal result".into(),
+                ));
+            }
+        }
+
+        session.take_result().ok_or_else(|| {
+            EvolutionError::InvalidConfig("evolution session ended unexpectedly".into())
+        })
+    }
 }
 
 /// Result of evolving a single task.
@@ -272,6 +351,7 @@ pub struct EvolutionProgress {
     generation_limit: u64,
     status: EvolutionStatus,
     best: RankedSmarts,
+    best_so_far: RankedSmarts,
     leaders: Vec<RankedSmarts>,
     unique_count: usize,
     total_count: usize,
@@ -298,6 +378,7 @@ struct ProgressSnapshot<'a> {
     generation_limit: u64,
     status: EvolutionStatus,
     best: RankedSmarts,
+    best_so_far: RankedSmarts,
     leaders: Vec<RankedSmarts>,
     stats: &'a GenerationStats,
     stagnation: u64,
@@ -349,6 +430,7 @@ impl EvolutionProgress {
             generation_limit: snapshot.generation_limit,
             status: snapshot.status,
             best: snapshot.best,
+            best_so_far: snapshot.best_so_far,
             leaders: snapshot.leaders,
             unique_count: snapshot.stats.unique_count,
             total_count: snapshot.stats.total_count,
@@ -378,6 +460,10 @@ impl EvolutionProgress {
 
     pub fn best(&self) -> &RankedSmarts {
         &self.best
+    }
+
+    pub fn best_so_far(&self) -> &RankedSmarts {
+        &self.best_so_far
     }
 
     pub fn leaders(&self) -> &[RankedSmarts] {
@@ -427,6 +513,7 @@ pub struct EvolutionSession {
     best_fitness: ObjectiveFitness,
     best_smarts: String,
     best_text_len: usize,
+    best_complexity: usize,
     stagnation: u64,
     fitness_cache: FitnessCache,
     last_leaders: Vec<RankedSmarts>,
@@ -489,6 +576,7 @@ impl EvolutionSession {
             best_fitness: ObjectiveFitness::invalid(),
             best_smarts: String::from("[#6]"),
             best_text_len: usize::MAX,
+            best_complexity: 0,
             stagnation: 0,
             fitness_cache: FitnessCache::new(config.fitness_cache_capacity()),
             last_leaders: Vec::new(),
@@ -632,6 +720,7 @@ impl EvolutionSession {
             self.best_fitness = lead.fitness;
             self.best_smarts = lead.genome.smarts().to_string();
             self.best_text_len = lead.genome.smarts().len();
+            self.best_complexity = lead.genome.complexity();
             self.stagnation = 0;
         } else {
             self.stagnation += 1;
@@ -669,6 +758,11 @@ impl EvolutionSession {
             generation_limit,
             status,
             best: RankedSmarts::new(&lead.genome, lead.fitness),
+            best_so_far: RankedSmarts {
+                smarts: self.best_smarts.clone(),
+                mcc: self.best_fitness.mcc(),
+                complexity: self.best_complexity,
+            },
             leaders,
             stats: &stats,
             stagnation: self.stagnation,
@@ -793,85 +887,6 @@ fn emit_evaluation_progress(
             total,
         ));
     }
-}
-
-/// Evolve one binary task from already-prepared folds.
-///
-/// This is the main library entry point.
-///
-/// # Examples
-///
-/// ```
-/// use core::str::FromStr;
-///
-/// use smiles_parser::Smiles;
-/// use smarts_evolution::{
-///     EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, evolve_task,
-/// };
-/// use smarts_rs::PreparedTarget;
-///
-/// fn prepared(smiles: &str) -> PreparedTarget {
-///     PreparedTarget::new(Smiles::from_str(smiles).unwrap())
-/// }
-///
-/// let task = EvolutionTask::new(
-///     "amide-vs-rest",
-///     vec![FoldData::new(vec![
-///         FoldSample::positive(prepared("CC(=O)N")),
-///         FoldSample::positive(prepared("NC(=O)C")),
-///         FoldSample::negative(prepared("CCO")),
-///         FoldSample::negative(prepared("c1ccccc1")),
-///     ])],
-/// );
-///
-/// let config = EvolutionConfig::builder()
-///     .population_size(8)
-///     .generation_limit(2)
-///     .stagnation_limit(2)
-///     .build()
-///     .unwrap();
-/// let seed_corpus = SeedCorpus::try_from([
-///     "[#6](=[#8])[#7]",
-///     "[#6]~[#7]",
-/// ])
-/// .unwrap();
-///
-/// let result = evolve_task(&task, &config, &seed_corpus).unwrap();
-/// assert!(!result.best_smarts().is_empty());
-/// assert!(result.best_mcc().is_finite());
-/// ```
-pub fn evolve_task(
-    task: &EvolutionTask,
-    config: &EvolutionConfig,
-    seed_corpus: &SeedCorpus,
-) -> Result<TaskResult, EvolutionError> {
-    evolve_task_with_progress(task, config, seed_corpus, 1, |_| {})
-}
-
-/// Evolve one binary task while emitting one snapshot after each scored generation.
-pub fn evolve_task_with_progress(
-    task: &EvolutionTask,
-    config: &EvolutionConfig,
-    seed_corpus: &SeedCorpus,
-    leaderboard_size: usize,
-    mut on_progress: impl FnMut(EvolutionProgress),
-) -> Result<TaskResult, EvolutionError> {
-    let mut session = EvolutionSession::new(task, config, seed_corpus, leaderboard_size)?;
-    while let Some(progress) = session.step() {
-        on_progress(progress);
-        if session.is_finished() {
-            if let Some(result) = session.take_result() {
-                return Ok(result);
-            }
-            return Err(EvolutionError::InvalidConfig(
-                "finished evolution session did not expose a terminal result".into(),
-            ));
-        }
-    }
-
-    session
-        .take_result()
-        .ok_or_else(|| EvolutionError::InvalidConfig("evolution session ended unexpectedly".into()))
 }
 
 fn build_task_result(
@@ -1207,7 +1222,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn evolve_task_preserves_task_id() {
+    fn task_evolve_preserves_task_id() {
         let task = EvolutionTask {
             task_id: "leaf-1".to_string(),
             folds: vec![FoldData::new(vec![sample("CC", true), sample("CN", false)])],
@@ -1219,12 +1234,12 @@ mod regression_tests {
             .build()
             .unwrap();
 
-        let result = evolve_task(&task, &config, &SeedCorpus::builtin()).unwrap();
+        let result = task.evolve(&config, &SeedCorpus::builtin()).unwrap();
         assert_eq!(result.task_id(), "leaf-1");
     }
 
     #[test]
-    fn evolve_task_rejects_missing_folds_and_targets() {
+    fn task_evolve_rejects_missing_folds_and_targets() {
         let config = EvolutionConfig::default();
         let empty_task = EvolutionTask {
             task_id: "empty".to_string(),
@@ -1236,13 +1251,15 @@ mod regression_tests {
         };
 
         assert_eq!(
-            evolve_task(&empty_task, &config, &SeedCorpus::builtin())
+            empty_task
+                .evolve(&config, &SeedCorpus::builtin())
                 .unwrap_err()
                 .to_string(),
             "evolution task requires at least one fold"
         );
         assert_eq!(
-            evolve_task(&no_target_task, &config, &SeedCorpus::builtin())
+            no_target_task
+                .evolve(&config, &SeedCorpus::builtin())
                 .unwrap_err()
                 .to_string(),
             "task 'no-targets' has no evaluation targets"
@@ -1250,7 +1267,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn evolve_task_runs_end_to_end_and_returns_valid_smarts() {
+    fn task_evolve_runs_end_to_end_and_returns_valid_smarts() {
         let task = EvolutionTask {
             task_id: "amide-vs-rest".to_string(),
             folds: vec![FoldData::new(vec![
@@ -1270,7 +1287,7 @@ mod regression_tests {
             .unwrap();
         let seed_corpus = SeedCorpus::try_from(["[#6](=[#8])[#7]", "[#6]~[#7]", "[#7]"]).unwrap();
 
-        let result = evolve_task(&task, &config, &seed_corpus).unwrap();
+        let result = task.evolve(&config, &seed_corpus).unwrap();
 
         assert_eq!(result.task_id(), "amide-vs-rest");
         assert!(result.generations() >= 1);
@@ -1281,7 +1298,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn evolve_task_handles_static_population() {
+    fn task_evolve_handles_static_population() {
         let task = EvolutionTask {
             task_id: "stagnation".to_string(),
             folds: vec![FoldData::new(vec![sample("CC", true), sample("CN", false)])],
@@ -1298,7 +1315,7 @@ mod regression_tests {
             .unwrap();
         let seed_corpus = SeedCorpus::try_from(["[#6]"]).unwrap();
 
-        let result = evolve_task(&task, &config, &seed_corpus).unwrap();
+        let result = task.evolve(&config, &seed_corpus).unwrap();
 
         assert!(result.generations() >= 2);
         assert!(result.generations() <= config.generation_limit());
@@ -1306,7 +1323,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn evolve_task_with_progress_emits_generation_snapshots_and_leaderboard() {
+    fn task_evolve_with_progress_emits_generation_snapshots_and_leaderboard() {
         let task = EvolutionTask::new(
             "amide-progress",
             vec![FoldData::new(vec![
@@ -1325,10 +1342,11 @@ mod regression_tests {
         let seed_corpus = SeedCorpus::try_from(["[#6](=[#8])[#7]", "[#6]~[#7]", "[#7]"]).unwrap();
         let mut snapshots = Vec::new();
 
-        let result = evolve_task_with_progress(&task, &config, &seed_corpus, 3, |snapshot| {
-            snapshots.push(snapshot);
-        })
-        .unwrap();
+        let result = task
+            .evolve_with_progress(&config, &seed_corpus, 3, |snapshot| {
+                snapshots.push(snapshot);
+            })
+            .unwrap();
 
         assert_eq!(snapshots.len(), result.generations() as usize);
         assert_eq!(snapshots[0].task_id(), "amide-progress");
@@ -1616,6 +1634,7 @@ mod regression_tests {
             generation_limit: 7,
             status: EvolutionStatus::Running,
             best: ranked.clone(),
+            best_so_far: ranked.clone(),
             leaders: vec![ranked.clone()],
             stats: &stats,
             stagnation: 2,
@@ -1626,6 +1645,7 @@ mod regression_tests {
         assert_eq!(progress.generation_limit(), 7);
         assert_eq!(progress.status(), EvolutionStatus::Running);
         assert_eq!(progress.best().smarts(), "[#6]");
+        assert_eq!(progress.best_so_far().smarts(), "[#6]");
         assert_eq!(progress.leaders().len(), 1);
         assert_eq!(progress.unique_count(), 2);
         assert_eq!(progress.total_count(), 3);

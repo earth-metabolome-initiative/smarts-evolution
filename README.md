@@ -13,7 +13,7 @@ use core::str::FromStr;
 
 use smiles_parser::Smiles;
 use smarts_evolution::{
-    EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, evolve_task,
+    EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus,
 };
 use smarts_rs::PreparedTarget;
 
@@ -44,7 +44,11 @@ let seed_corpus = SeedCorpus::try_from([
 ])
 .unwrap();
 
-let result = evolve_task(&task, &config, &seed_corpus).unwrap();
+let result = task.evolve(&config, &seed_corpus).unwrap();
 assert!(!result.best_smarts().is_empty());
 assert!(result.best_mcc().is_finite());
 ```
+
+## Terminal Progress Bars
+
+Enable the `indicatif` feature and call `task.evolve_with_indicatif(&config, &seed_corpus)` to get a generation progress bar plus a per-generation SMARTS evaluation bar. The generation bar reports the current generation, ETA, current MCC, best MCC and SMARTS so far, and generations elapsed without improvement.

@@ -11,8 +11,7 @@ use smarts_evolution::genome::seed::SmartsGenomeBuilder;
 use smarts_evolution::operators::crossover::SmartsCrossover;
 use smarts_evolution::operators::mutation::SmartsMutation;
 use smarts_evolution::{
-    EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, SmartsEvaluator,
-    SmartsGenome, evolve_task,
+    EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, SmartsEvaluator, SmartsGenome,
 };
 use smarts_rs::{CompiledQuery, PreparedTarget};
 use smiles_parser::Smiles;
@@ -342,7 +341,7 @@ fn evolution_benches(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new(
-                "evolve_task",
+                "task_evolve",
                 format!(
                     "pop{}_gen{}_samples{}",
                     population_size,
@@ -353,12 +352,9 @@ fn evolution_benches(c: &mut Criterion) {
             &(population_size, generation_limit, sample_count_per_class),
             |b, _| {
                 b.iter(|| {
-                    let result = evolve_task(
-                        black_box(&task),
-                        black_box(&config),
-                        black_box(&seed_corpus),
-                    )
-                    .unwrap();
+                    let result = black_box(&task)
+                        .evolve(black_box(&config), black_box(&seed_corpus))
+                        .unwrap();
                     black_box(result.best_mcc());
                 });
             },
@@ -404,7 +400,7 @@ fn example_evolution_benches(c: &mut Criterion) {
         let task = build_example_task(&dataset);
         group.bench_with_input(
             BenchmarkId::new(
-                "evolve_task",
+                "task_evolve",
                 format!(
                     "{}_pop{}_gen{}",
                     dataset.name, EXAMPLE_BENCH_POPULATION_SIZE, EXAMPLE_BENCH_GENERATION_LIMIT
@@ -413,12 +409,9 @@ fn example_evolution_benches(c: &mut Criterion) {
             &dataset.name,
             |b, _| {
                 b.iter(|| {
-                    let result = evolve_task(
-                        black_box(&task),
-                        black_box(&config),
-                        black_box(&seed_corpus),
-                    )
-                    .unwrap();
+                    let result = black_box(&task)
+                        .evolve(black_box(&config), black_box(&seed_corpus))
+                        .unwrap();
                     black_box(result.best_mcc());
                 });
             },
