@@ -328,6 +328,7 @@ pub struct TaskResult {
     task_id: String,
     best_smarts: String,
     best_mcc: f64,
+    best_complexity: usize,
     generations: u64,
     leaders: Vec<RankedSmarts>,
 }
@@ -343,6 +344,10 @@ impl TaskResult {
 
     pub fn best_mcc(&self) -> f64 {
         self.best_mcc
+    }
+
+    pub fn best_complexity(&self) -> usize {
+        self.best_complexity
     }
 
     pub fn generations(&self) -> u64 {
@@ -647,7 +652,6 @@ pub struct EvolutionSession {
     rng: SmallRng,
     best_fitness: ObjectiveFitness,
     best_smarts: String,
-    best_text_len: usize,
     best_complexity: usize,
     stagnation: u64,
     fitness_cache: FitnessCache,
@@ -734,7 +738,6 @@ impl EvolutionSession {
             rng,
             best_fitness: ObjectiveFitness::invalid(),
             best_smarts: String::from("[#6]"),
-            best_text_len: usize::MAX,
             best_complexity: 0,
             stagnation: 0,
             fitness_cache: FitnessCache::new(config.fitness_cache_capacity()),
@@ -942,13 +945,12 @@ impl EvolutionSession {
                 lead.fitness,
                 &lead.genome,
                 self.best_fitness,
-                self.best_text_len,
+                self.best_complexity,
                 &self.best_smarts,
             )
         {
             self.best_fitness = lead.fitness;
             self.best_smarts = lead.genome.smarts().to_string();
-            self.best_text_len = lead.genome.smarts().len();
             self.best_complexity = lead.genome.complexity();
             self.stagnation = 0;
         } else {
@@ -1011,6 +1013,7 @@ impl EvolutionSession {
                 &self.task_id,
                 self.best_smarts.clone(),
                 self.best_fitness,
+                self.best_complexity,
                 generations,
                 self.last_leaders.clone(),
             ));
@@ -1028,6 +1031,7 @@ impl EvolutionSession {
                 &self.task_id,
                 self.best_smarts.clone(),
                 self.best_fitness,
+                self.best_complexity,
                 generations,
                 self.last_leaders.clone(),
             ));
@@ -1183,8 +1187,8 @@ fn update_ranked_best(best: &mut Option<RankedSmarts>, candidate: &RankedSmarts)
 fn ranked_is_better(candidate: &RankedSmarts, current: &RankedSmarts) -> bool {
     candidate.mcc() > current.mcc()
         || (candidate.mcc() == current.mcc()
-            && (candidate.smarts().len() < current.smarts().len()
-                || (candidate.smarts().len() == current.smarts().len()
+            && (candidate.complexity() < current.complexity()
+                || (candidate.complexity() == current.complexity()
                     && candidate.smarts() < current.smarts())))
 }
 
@@ -1255,6 +1259,7 @@ fn build_task_result(
     task_id: &str,
     best_smarts: String,
     best_fitness: ObjectiveFitness,
+    best_complexity: usize,
     generations: u64,
     leaders: Vec<RankedSmarts>,
 ) -> TaskResult {
@@ -1262,6 +1267,7 @@ fn build_task_result(
         task_id: task_id.to_string(),
         best_smarts,
         best_mcc: best_fitness.mcc(),
+        best_complexity,
         generations,
         leaders,
     }
@@ -1431,7 +1437,7 @@ fn compare_scored_genomes(left: &ScoredGenome, right: &ScoredGenome) -> Ordering
     right
         .fitness
         .cmp(&left.fitness)
-        .then_with(|| left.genome.smarts().len().cmp(&right.genome.smarts().len()))
+        .then_with(|| left.genome.complexity().cmp(&right.genome.complexity()))
         .then_with(|| left.genome.smarts().cmp(right.genome.smarts()))
 }
 
@@ -1439,13 +1445,13 @@ fn is_better_candidate(
     candidate_fitness: ObjectiveFitness,
     candidate: &SmartsGenome,
     best_fitness: ObjectiveFitness,
-    best_text_len: usize,
+    best_complexity: usize,
     best_smarts: &str,
 ) -> bool {
     candidate_fitness > best_fitness
         || (candidate_fitness == best_fitness
-            && (candidate.smarts().len() < best_text_len
-                || (candidate.smarts().len() == best_text_len && candidate.smarts() < best_smarts)))
+            && (candidate.complexity() < best_complexity
+                || (candidate.complexity() == best_complexity && candidate.smarts() < best_smarts)))
 }
 
 fn tournament_select(
@@ -2050,21 +2056,21 @@ mod regression_tests {
     }
 
     #[test]
-    fn shorter_textual_smarts_win_when_scores_tie() {
-        let short = scored("[N]", 0.75, &[0b0001]);
-        let long = scored("[#7]", 0.75, &[0b0010]);
+    fn lower_complexity_smarts_win_when_scores_tie() {
+        let simple = scored("[#6]", 0.75, &[0b0001]);
+        let complex = scored("[#6]~[#7]", 0.75, &[0b0010]);
 
-        assert!(short.genome.smarts().len() < long.genome.smarts().len());
+        assert!(simple.genome.complexity() < complex.genome.complexity());
 
-        assert!(compare_scored_genomes(&short, &long).is_lt());
-        assert!(compare_scored_genomes(&long, &short).is_gt());
+        assert!(compare_scored_genomes(&simple, &complex).is_lt());
+        assert!(compare_scored_genomes(&complex, &simple).is_gt());
     }
 
     #[test]
     fn phenotypic_dedup_keeps_best_representative_for_same_behavior() {
         let deduped = phenotypically_deduplicate(vec![
-            scored("[#7]", 0.80, &[0b0101]),
-            scored("[N]", 0.80, &[0b0101]),
+            scored("[#6]~[#7]", 0.80, &[0b0101]),
+            scored("[#6]", 0.80, &[0b0101]),
             scored("[#8]", 0.70, &[0b0011]),
         ]);
         let mut smarts = deduped
@@ -2073,7 +2079,7 @@ mod regression_tests {
             .collect::<Vec<_>>();
         smarts.sort_unstable();
 
-        assert_eq!(smarts, vec!["[#8]", "[N]"]);
+        assert_eq!(smarts, vec!["[#6]", "[#8]"]);
     }
 
     #[test]
@@ -2233,11 +2239,18 @@ mod regression_tests {
         assert_eq!(evaluation_progress.incumbent_best_smarts(), "[#6]");
         assert_eq!(evaluation_progress.incumbent_best_mcc(), 0.5);
 
-        let result =
-            build_task_result("task-1", "[#7]".to_string(), fitness(0.75), 4, vec![ranked]);
+        let result = build_task_result(
+            "task-1",
+            "[#7]".to_string(),
+            fitness(0.75),
+            11,
+            4,
+            vec![ranked],
+        );
         assert_eq!(result.task_id(), "task-1");
         assert_eq!(result.best_smarts(), "[#7]");
         assert_eq!(result.best_mcc(), 0.75);
+        assert_eq!(result.best_complexity(), 11);
         assert_eq!(result.generations(), 4);
         assert_eq!(result.leaders().len(), 1);
 
@@ -2254,30 +2267,32 @@ mod regression_tests {
         let mut rng_b = build_rng(&seeded);
         assert_eq!(rng_a.random::<u64>(), rng_b.random::<u64>());
 
-        let short = SmartsGenome::from_smarts("[N]").unwrap();
-        let long = SmartsGenome::from_smarts("[#7]").unwrap();
+        let simple = SmartsGenome::from_smarts("[#6]").unwrap();
+        let complex = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+        assert!(simple.complexity() < complex.complexity());
         assert!(is_better_candidate(
             fitness(0.5),
-            &short,
+            &simple,
             fitness(0.5),
-            long.smarts().len(),
-            long.smarts(),
+            complex.complexity(),
+            complex.smarts(),
         ));
         assert!(!is_better_candidate(
             fitness(0.5),
-            &long,
+            &complex,
             fitness(0.5),
-            short.smarts().len(),
-            short.smarts(),
+            simple.complexity(),
+            simple.smarts(),
         ));
 
         let alpha = SmartsGenome::from_smarts("[#6]").unwrap();
         let beta = SmartsGenome::from_smarts("[#7]").unwrap();
+        assert_eq!(alpha.complexity(), beta.complexity());
         assert!(is_better_candidate(
             fitness(0.5),
             &alpha,
             fitness(0.5),
-            beta.smarts().len(),
+            beta.complexity(),
             beta.smarts(),
         ));
 

@@ -18,10 +18,10 @@ const EVALUATION_STYLE_TEMPLATE: &str = "{prefix} [{wide_bar}] {pos}/{len} SMART
 
 /// Indicatif-backed progress bars for one evolution run.
 ///
-/// The top bar tracks completed generations and shows ETA, the best MCC and
-/// SMARTS so far, and the number of generations since the incumbent last
-/// improved. The second bar tracks SMARTS evaluation inside the current
-/// generation.
+/// The top bar tracks completed generations and shows ETA, the best MCC,
+/// complexity, SMARTS so far, and the number of generations since the
+/// incumbent last improved. The second bar tracks SMARTS evaluation inside the
+/// current generation.
 pub struct IndicatifEvolutionProgress {
     generation_bar: ProgressBar,
     evaluation_bar: ProgressBar,
@@ -146,9 +146,10 @@ impl IndicatifEvolutionProgress {
 
     fn finish(&mut self, result: &TaskResult) {
         let message = format!(
-            "done generations={} best_mcc={:.3} best_smarts={}",
+            "done generations={} best_mcc={:.3} complexity={} best_smarts={}",
             result.generations(),
             result.best_mcc(),
+            result.best_complexity(),
             truncate_smarts(result.best_smarts(), self.best_smarts_width)
         );
         if self.clear_on_finish {
@@ -172,12 +173,13 @@ impl IndicatifEvolutionProgress {
     }
 
     fn generation_message(&self, progress: &EvolutionProgress) -> String {
-        format!(
-            "task={} best_mcc={:.3} no_improve={} best_smarts={}",
+        generation_detail_message(
             progress.task_id(),
             progress.best_so_far().mcc(),
+            progress.best_so_far().complexity(),
             progress.stagnation(),
-            truncate_smarts(progress.best_so_far().smarts(), self.best_smarts_width)
+            progress.best_so_far().smarts(),
+            self.best_smarts_width,
         )
     }
 }
@@ -318,6 +320,20 @@ fn evaluation_detail_message(
     message
 }
 
+fn generation_detail_message(
+    task_id: &str,
+    best_mcc: f64,
+    best_complexity: usize,
+    stagnation: u64,
+    best_smarts: &str,
+    best_smarts_width: usize,
+) -> String {
+    format!(
+        "task={task_id} best_mcc={best_mcc:.3} complexity={best_complexity} no_improve={stagnation} best_smarts={}",
+        truncate_smarts(best_smarts, best_smarts_width)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -366,6 +382,14 @@ mod tests {
         progress.start("alkaloids", 800);
 
         assert_eq!(progress.generation_bar.message(), "task=alkaloids");
+    }
+
+    #[test]
+    fn generation_bar_message_includes_best_complexity() {
+        assert_eq!(
+            generation_detail_message("alkaloids", 0.637, 42, 14, "[#6]~[#7]", 32),
+            "task=alkaloids best_mcc=0.637 complexity=42 no_improve=14 best_smarts=[#6]~[#7]"
+        );
     }
 
     #[test]

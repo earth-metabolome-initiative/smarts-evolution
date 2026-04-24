@@ -990,7 +990,7 @@ fn App() -> Element {
                             if let Some(best) = best {
                                 div { class: "stats-grid",
                                     {stat_card("Best MCC", format!("{:.3}", best.mcc()))}
-                                    {stat_card("Size", best.complexity().to_string())}
+                                    {stat_card("Complexity", best.complexity().to_string())}
                                     if let Some(stagnation) = last_stagnation {
                                         {stat_card("No improvement", stagnation.to_string())}
                                     }
@@ -1088,7 +1088,7 @@ fn App() -> Element {
                                             th { "#" }
                                             th { "SMARTS" }
                                             th { "MCC" }
-                                            th { "Size" }
+                                            th { "Complexity" }
                                         }
                                     }
                                     tbody {
@@ -1175,7 +1175,7 @@ fn candidate_tooltip(tooltip: &ScatterTooltip) -> Element {
                 span { class: "plot-tooltip-value", {format!("{:.3}", tooltip.candidate.mcc())} }
             }
             div { class: "plot-tooltip-row",
-                span { class: "plot-tooltip-label", "Size" }
+                span { class: "plot-tooltip-label", "Complexity" }
                 span { class: "plot-tooltip-value", {tooltip.candidate.complexity().to_string()} }
             }
             p { class: "plot-tooltip-smarts", {tooltip.candidate.smarts()} }

@@ -552,8 +552,8 @@ fn update_best_evaluated(best: &mut Option<EvaluatedSmarts>, candidate: &Evaluat
 fn evaluated_is_better(candidate: &EvaluatedSmarts, current: &EvaluatedSmarts) -> bool {
     candidate.mcc() > current.mcc()
         || (candidate.mcc() == current.mcc()
-            && (candidate.smarts().len() < current.smarts().len()
-                || (candidate.smarts().len() == current.smarts().len()
+            && (candidate.complexity() < current.complexity()
+                || (candidate.complexity() == current.complexity()
                     && candidate.smarts() < current.smarts())))
 }
 
