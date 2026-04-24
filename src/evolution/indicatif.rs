@@ -8,7 +8,7 @@ use ::indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle}
 use super::config::EvolutionConfig;
 use super::runner::{
     EvolutionError, EvolutionEvaluationProgress, EvolutionProgress, EvolutionProgressObserver,
-    EvolutionSession, EvolutionStatus, EvolutionTask, TaskResult,
+    EvolutionSession, EvolutionTask, TaskResult,
 };
 use crate::genome::seed::SeedCorpus;
 
@@ -186,10 +186,8 @@ impl IndicatifEvolutionProgress {
 
     fn generation_message(&self, progress: &EvolutionProgress) -> String {
         format!(
-            "task={} status={} current_mcc={:.3} best_mcc={:.3} no_improve={} best_smarts={}",
+            "task={} best_mcc={:.3} no_improve={} best_smarts={}",
             progress.task_id(),
-            status_label(progress.status()),
-            progress.best().mcc(),
             progress.best_so_far().mcc(),
             progress.stagnation(),
             truncate_smarts(progress.best_so_far().smarts(), self.best_smarts_width)
@@ -303,14 +301,6 @@ fn bar_style(template: &str) -> ProgressStyle {
     ProgressStyle::with_template(template)
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("=>-")
-}
-
-fn status_label(status: EvolutionStatus) -> &'static str {
-    match status {
-        EvolutionStatus::Running => "running",
-        EvolutionStatus::Stagnated => "stagnated",
-        EvolutionStatus::Completed => "completed",
-    }
 }
 
 fn truncate_smarts(smarts: &str, max_width: usize) -> String {
