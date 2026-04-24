@@ -57,6 +57,11 @@ const RESET_RESTART_ATTEMPTS: usize = 4;
 const DEFAULT_RESET_PROBABILITY: f64 = 0.20;
 const DEFAULT_MAX_MUTATION_STEPS: usize = 6;
 const DEFAULT_ATTEMPT_BUDGET: usize = 24;
+const NEAR_COMPLEXITY_LIMIT_PERCENT: usize = 85;
+const ONE_STEP_MUTATION_PROBABILITY: f64 = 0.62;
+const TWO_STEP_MUTATION_PROBABILITY: f64 = 0.84;
+const THREE_STEP_MUTATION_PROBABILITY: f64 = 0.95;
+const REMOVE_ATOM_MAP_PROBABILITY: f64 = 0.80;
 const COMMON_ALIPHATIC_ELEMENT_SYMBOLS: &[&str] = &[
     "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "Se", "Br", "I",
 ];
@@ -330,7 +335,7 @@ impl SmartsMutation {
                 break;
             }
             let restarts_left = RESET_RESTART_ATTEMPTS - restart;
-            let restart_budget = remaining_budget.div_ceil(restarts_left).max(1);
+            let restart_budget = remaining_budget.div_ceil(restarts_left);
             let reset_idx = rng.random_range(0..self.reset_pool.len());
             let reset = &self.reset_pool[reset_idx];
             if let Some(candidate) = self.mutated_candidate_with_budget(
@@ -411,14 +416,14 @@ impl SmartsMutation {
 fn sample_mutation_steps<R: Rng>(max_mutation_steps: usize, rng: &mut R) -> usize {
     let max_steps = max_mutation_steps.max(1);
     let roll: f64 = rng.random();
-    if roll < 0.62 || max_steps == 1 {
+    if roll < ONE_STEP_MUTATION_PROBABILITY || max_steps == 1 {
         1
-    } else if roll < 0.84 || max_steps == 2 {
-        2.min(max_steps)
-    } else if roll < 0.95 || max_steps == 3 {
-        3.min(max_steps)
+    } else if roll < TWO_STEP_MUTATION_PROBABILITY || max_steps == 2 {
+        2
+    } else if roll < THREE_STEP_MUTATION_PROBABILITY || max_steps == 3 {
+        3
     } else {
-        rng.random_range(4.min(max_steps)..=max_steps)
+        rng.random_range(4..=max_steps)
     }
 }
 
@@ -483,7 +488,7 @@ fn sample_mutation_operator<R: Rng>(
 }
 
 fn is_near_complexity_limit(query: &QueryMol) -> bool {
-    query.complexity() * 100 >= MAX_SMARTS_COMPLEXITY * 85
+    query.complexity() * 100 >= MAX_SMARTS_COMPLEXITY * NEAR_COMPLEXITY_LIMIT_PERCENT
 }
 
 fn operator_weight(
@@ -672,10 +677,10 @@ fn mutate_atom_map<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool
         return false;
     };
 
-    expr.atom_map = match expr.atom_map {
-        Some(_) if rng.random_bool(0.80) => None,
-        Some(_) => Some(rng.random_range(1..=MAX_ATOM_MAP)),
-        None => return false,
+    expr.atom_map = if rng.random_bool(REMOVE_ATOM_MAP_PROBABILITY) {
+        None
+    } else {
+        Some(rng.random_range(1..=MAX_ATOM_MAP))
     };
 
     editable
@@ -1627,17 +1632,17 @@ mod tests {
     #[test]
     fn mutation_step_sampler_prefers_local_edits_and_keeps_exploration_tail() {
         let mut rng = SmallRng::seed_from_u64(8);
-        let mut counts = [0usize; 7];
+        let mut counts = [0usize; DEFAULT_MAX_MUTATION_STEPS + 1];
 
         for _ in 0..4096 {
-            let steps = sample_mutation_steps(6, &mut rng);
-            assert!((1..=6).contains(&steps));
+            let steps = sample_mutation_steps(DEFAULT_MAX_MUTATION_STEPS, &mut rng);
+            assert!((1..=DEFAULT_MAX_MUTATION_STEPS).contains(&steps));
             counts[steps] += 1;
         }
 
         assert!(counts[1] > counts[2]);
         assert!(counts[2] > counts[3]);
-        assert!(counts[4] + counts[5] + counts[6] > 0);
+        assert!(counts[4..].iter().sum::<usize>() > 0);
     }
 
     #[test]
