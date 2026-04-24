@@ -15,6 +15,7 @@ const DEFAULT_RANDOM_IMMIGRANT_RATIO: f64 = 0.10;
 const DEFAULT_STAGNATION_LIMIT: u64 = 50;
 const DEFAULT_FITNESS_CACHE_CAPACITY: usize = 100_000;
 const DEFAULT_SLOW_EVALUATION_LOG_THRESHOLD: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_EVALUATION_SMARTS_COMPLEXITY: usize = 1_536;
 
 /// Configuration for the evolutionary algorithm.
 #[derive(Clone, Debug)]
@@ -74,7 +75,7 @@ impl Default for EvolutionConfigBuilder {
             stagnation_limit: DEFAULT_STAGNATION_LIMIT,
             rng_seed: None,
             fitness_cache_capacity: DEFAULT_FITNESS_CACHE_CAPACITY,
-            max_evaluation_smarts_complexity: MAX_SMARTS_COMPLEXITY,
+            max_evaluation_smarts_complexity: DEFAULT_MAX_EVALUATION_SMARTS_COMPLEXITY,
             max_evaluation_smarts_len: None,
             slow_evaluation_log_threshold: Some(DEFAULT_SLOW_EVALUATION_LOG_THRESHOLD),
         }
@@ -319,6 +320,7 @@ impl EvolutionConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SeedCorpus, SmartsGenome};
 
     #[test]
     fn default_config_is_valid() {
@@ -326,13 +328,31 @@ mod tests {
         assert!(config.validate().is_ok());
         assert_eq!(
             config.max_evaluation_smarts_complexity(),
-            MAX_SMARTS_COMPLEXITY
+            DEFAULT_MAX_EVALUATION_SMARTS_COMPLEXITY
         );
+        assert!(config.max_evaluation_smarts_complexity() < MAX_SMARTS_COMPLEXITY);
         assert_eq!(config.max_evaluation_smarts_len(), None);
         assert_eq!(
             config.slow_evaluation_log_threshold(),
             Some(DEFAULT_SLOW_EVALUATION_LOG_THRESHOLD)
         );
+    }
+
+    #[test]
+    fn default_complexity_threshold_has_seed_headroom_and_rejects_known_pathology() {
+        let config = EvolutionConfig::default();
+        let default_limit = config.max_evaluation_smarts_complexity();
+        let builtin_max = SeedCorpus::builtin()
+            .entries()
+            .iter()
+            .map(SmartsGenome::complexity)
+            .max()
+            .unwrap();
+        let pathology = SmartsGenome::from_smarts("[!r6&$([#6,#7])].[R]").unwrap();
+
+        assert!(builtin_max * 10 < default_limit);
+        assert!(pathology.complexity() > default_limit);
+        assert!(pathology.complexity() < MAX_SMARTS_COMPLEXITY);
     }
 
     #[test]
@@ -364,6 +384,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_invalid_probabilities_and_sizes() {
+        let expected_max_complexity_error =
+            format!("max_evaluation_smarts_complexity must not exceed {MAX_SMARTS_COMPLEXITY}");
         let invalid_cases = [
             (
                 EvolutionConfig::builder().mutation_rate(-0.1).build(),
@@ -403,7 +425,7 @@ mod tests {
                 EvolutionConfig::builder()
                     .max_evaluation_smarts_complexity(MAX_SMARTS_COMPLEXITY + 1)
                     .build(),
-                "max_evaluation_smarts_complexity must not exceed 1024",
+                expected_max_complexity_error.as_str(),
             ),
             (
                 EvolutionConfig::builder()

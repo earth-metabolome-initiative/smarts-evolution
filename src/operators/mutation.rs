@@ -1114,6 +1114,7 @@ mod tests {
     use std::vec;
 
     use super::*;
+    use crate::genome::over_limit_smarts_fixture;
     use elements_rs::AtomicNumber;
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
@@ -1161,9 +1162,7 @@ mod tests {
 
     #[test]
     fn genome_from_query_rejects_overly_complex_queries() {
-        let over_limit = std::iter::repeat_n("[#6]", MAX_SMARTS_COMPLEXITY + 1)
-            .collect::<Vec<_>>()
-            .join("~");
+        let over_limit = over_limit_smarts_fixture();
         let query = QueryMol::from_str(&over_limit).unwrap();
 
         assert!(genome_from_query(&query).is_none());

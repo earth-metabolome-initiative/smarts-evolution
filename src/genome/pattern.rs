@@ -40,18 +40,19 @@ impl SmartsGenome {
 
     fn from_query(query: QueryMol) -> Self {
         let query = query.canonicalize();
-        let smarts_string: Arc<str> = query.to_canonical_smarts().into();
+        let smarts_string: Arc<str> = query.to_string().into();
         Self {
-            complexity: query.atom_count() + query.bonds().len(),
+            complexity: query.complexity(),
             query,
             smarts_string,
         }
     }
 
-    /// Returns one cheap structural size metric.
+    /// Returns a target-independent estimate of SMARTS matching cost.
     ///
-    /// This is intentionally coarse. It is used for size limits and progress
-    /// reporting, not as a canonical measure of SMARTS semantics.
+    /// This delegates to the upstream `smarts-rs` query complexity heuristic
+    /// after canonicalization. It is used for size limits and progress
+    /// reporting, not as a semantic property of the SMARTS.
     #[inline]
     pub fn complexity(&self) -> usize {
         self.complexity
@@ -94,9 +95,9 @@ impl fmt::Display for SmartsGenome {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::vec::Vec;
 
     use super::*;
+    use crate::genome::over_limit_smarts_fixture;
 
     #[test]
     fn genome_round_trips_complex_smarts() {
@@ -104,16 +105,18 @@ mod tests {
         let genome = SmartsGenome::from_smarts(smarts).unwrap();
 
         assert_eq!(genome.smarts(), "[#6]([#7])=[#8]");
-        assert_eq!(genome.complexity(), 5);
+        assert_eq!(genome.complexity(), genome.query().complexity());
+        assert!(genome.complexity() > genome.query().atom_count() + genome.query().bonds().len());
         assert!(genome.is_valid());
     }
 
     #[test]
-    fn genome_from_query_mol_preserves_query() {
+    fn genome_from_query_mol_canonicalizes_query_and_display() {
         let query = QueryMol::from_str("[#6]~[#7]~[#8]").unwrap();
         let genome = SmartsGenome::from_query_mol(&query);
 
         assert!(genome.query().is_canonical());
+        assert_eq!(genome.smarts(), query.to_canonical_smarts());
         assert_eq!(genome.query().to_string(), query.to_canonical_smarts());
         assert!(genome.is_valid());
     }
@@ -138,12 +141,25 @@ mod tests {
     }
 
     #[test]
+    fn genome_uses_upstream_canonicalization_for_double_negation() {
+        let direct = SmartsGenome::from_smarts("[!!#6]").unwrap();
+        let nested = SmartsGenome::from_smarts("[$([!!#6])]").unwrap();
+        let bond = SmartsGenome::from_smarts("[#6]!!@[#7]").unwrap();
+
+        assert_eq!(direct.smarts(), "[#6]");
+        assert!(!nested.smarts().contains("!!"));
+        assert_eq!(bond.smarts(), "[#6]@[#7]");
+        assert!(direct.query().is_canonical());
+        assert!(nested.query().is_canonical());
+        assert!(bond.query().is_canonical());
+    }
+
+    #[test]
     fn genome_rejects_queries_past_structural_limit() {
-        let over_limit = std::iter::repeat_n("[#6]", MAX_SMARTS_COMPLEXITY + 1)
-            .collect::<Vec<_>>()
-            .join("~");
+        let over_limit = over_limit_smarts_fixture();
         let genome = SmartsGenome::from_smarts(&over_limit).unwrap();
 
+        assert!(genome.complexity() > MAX_SMARTS_COMPLEXITY);
         assert!(!genome.is_valid());
     }
 }

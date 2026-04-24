@@ -1413,7 +1413,7 @@ fn generation_progress_message(
     best: ObjectiveFitness,
 ) -> String {
     format!(
-        "lead={:.3} best={:.3} uniq={}/{} dup={} cache={}/{} rejected={} size={} avg_size={:.1}",
+        "lead={:.3} best={:.3} uniq={}/{} dup={} cache={}/{} rejected={} complexity={} avg_complexity={:.1}",
         lead.mcc(),
         best.mcc(),
         stats.unique_count,
@@ -2054,7 +2054,6 @@ mod regression_tests {
         let short = scored("[N]", 0.75, &[0b0001]);
         let long = scored("[#7]", 0.75, &[0b0010]);
 
-        assert_eq!(short.genome.complexity(), long.genome.complexity());
         assert!(short.genome.smarts().len() < long.genome.smarts().len());
 
         assert!(compare_scored_genomes(&short, &long).is_lt());
@@ -2116,7 +2115,7 @@ mod regression_tests {
 
         assert_eq!(
             message,
-            "lead=0.662 best=0.731 uniq=382/1024 dup=642 cache=208/382 rejected=17 size=16 avg_size=12.4"
+            "lead=0.662 best=0.731 uniq=382/1024 dup=642 cache=208/382 rejected=17 complexity=16 avg_complexity=12.4"
         );
     }
 
@@ -2162,10 +2161,11 @@ mod regression_tests {
 
     #[test]
     fn public_accessors_and_display_helpers_round_trip() {
-        let ranked = RankedSmarts::new(&SmartsGenome::from_smarts("[#6]").unwrap(), fitness(0.5));
+        let genome = SmartsGenome::from_smarts("[#6]").unwrap();
+        let ranked = RankedSmarts::new(&genome, fitness(0.5));
         assert_eq!(ranked.smarts(), "[#6]");
         assert_eq!(ranked.mcc(), 0.5);
-        assert_eq!(ranked.complexity(), 1);
+        assert_eq!(ranked.complexity(), genome.complexity());
 
         let stats = GenerationStats {
             unique_count: 2,

@@ -18,10 +18,10 @@ const EVALUATION_STYLE_TEMPLATE: &str = "{prefix} [{wide_bar}] {pos}/{len} SMART
 
 /// Indicatif-backed progress bars for one evolution run.
 ///
-/// The top bar tracks completed generations and shows ETA, current generation
-/// MCC, incumbent MCC, incumbent SMARTS, and the number of generations since
-/// the incumbent last improved. The second bar tracks SMARTS evaluation inside
-/// the current generation.
+/// The top bar tracks completed generations and shows ETA, the best MCC and
+/// SMARTS so far, and the number of generations since the incumbent last
+/// improved. The second bar tracks SMARTS evaluation inside the current
+/// generation.
 pub struct IndicatifEvolutionProgress {
     generation_bar: ProgressBar,
     evaluation_bar: ProgressBar,
@@ -113,8 +113,7 @@ impl IndicatifEvolutionProgress {
     fn start(&mut self, task_id: &str, generation_limit: u64) {
         self.generation_bar.set_length(generation_limit.max(1));
         self.generation_bar.set_position(0);
-        self.generation_bar
-            .set_message(format!("task={task_id} status=queued"));
+        self.generation_bar.set_message(format!("task={task_id}"));
         self.evaluation_bar.set_length(1);
         self.evaluation_bar.set_position(0);
         self.evaluation_bar.set_message("waiting for generation 1");
@@ -358,6 +357,15 @@ mod tests {
             evaluation_detail_message(Some(0.478), Some("[#7;R&+0:27651]"), 12),
             " current_mcc=0.478 current=[#7;R&+0:..."
         );
+    }
+
+    #[test]
+    fn generation_bar_start_message_has_no_status_label() {
+        let mut progress = IndicatifEvolutionProgress::hidden();
+
+        progress.start("alkaloids", 800);
+
+        assert_eq!(progress.generation_bar.message(), "task=alkaloids");
     }
 
     #[test]

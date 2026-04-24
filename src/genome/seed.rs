@@ -282,7 +282,7 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::genome::limits::MAX_SMARTS_COMPLEXITY;
+    use crate::genome::over_limit_smarts_fixture;
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
 
@@ -390,9 +390,7 @@ mod tests {
     #[test]
     fn seed_corpus_sample_extend_and_invalid_insertions_behave() {
         let mut corpus = SeedCorpus::default();
-        let too_large = std::iter::repeat_n("[#6]", MAX_SMARTS_COMPLEXITY + 1)
-            .collect::<Vec<_>>()
-            .join("~");
+        let too_large = over_limit_smarts_fixture();
 
         assert!(corpus.is_empty());
         assert!(corpus.sample(&mut SmallRng::seed_from_u64(11)).is_none());
