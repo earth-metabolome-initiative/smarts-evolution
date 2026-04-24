@@ -1287,7 +1287,7 @@ fn compare_ranked_candidates(left: &RankedCandidate, right: &RankedCandidate) ->
         .mcc()
         .partial_cmp(&left.mcc())
         .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| left.smarts().len().cmp(&right.smarts().len()))
+        .then_with(|| left.complexity().cmp(&right.complexity()))
         .then_with(|| left.smarts().cmp(right.smarts()))
 }
 
@@ -1888,10 +1888,10 @@ mod tests {
     }
 
     #[test]
-    fn ranked_candidate_order_prefers_shorter_text_ties() {
-        let longer = RankedCandidate::new("[#6]", 0.8124, 1);
-        let shorter = RankedCandidate::new("[N]", 0.8124, 1);
-        assert!(compare_ranked_candidates(&shorter, &longer).is_lt());
+    fn ranked_candidate_order_prefers_lower_complexity_ties() {
+        let simpler = RankedCandidate::new("[#6]", 0.8124, 1);
+        let complex = RankedCandidate::new("[N]", 0.8124, 2);
+        assert!(compare_ranked_candidates(&simpler, &complex).is_lt());
     }
 
     #[test]

@@ -6,6 +6,7 @@ use core::str::FromStr;
 
 use elements_rs::isotopes::{CarbonIsotope, NitrogenIsotope, OxygenIsotope};
 use elements_rs::{AtomicNumber, Element, ElementVariant, Isotope};
+use log::debug;
 use rand::Rng;
 use rand::RngExt;
 use rand::prelude::IndexedRandom;
@@ -51,6 +52,15 @@ const MAX_RECURSIVE_QUERY_DEPTH: usize = 4;
 const MAX_COMPONENTS: usize = 16;
 const MAX_ATOM_MAP: u32 = 65_535;
 const MAX_BOOLEAN_CHILDREN: usize = 4;
+const RING_CLOSE_ATTEMPTS: usize = 32;
+const RESET_RESTART_ATTEMPTS: usize = 4;
+const DEFAULT_RESET_PROBABILITY: f64 = 0.20;
+const DEFAULT_MAX_MUTATION_STEPS: usize = 6;
+const DEFAULT_ATTEMPT_BUDGET: usize = 24;
+const COMMON_ALIPHATIC_ELEMENT_SYMBOLS: &[&str] = &[
+    "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "Se", "Br", "I",
+];
+const COMMON_ATOMIC_NUMBERS: &[u16] = &[5, 6, 7, 8, 9, 14, 15, 16, 17, 34, 35, 53];
 const RECURSIVE_FRAGMENT_SMARTS: &[&str] = &[
     "[#6]",
     "[#7]",
@@ -63,6 +73,205 @@ const RECURSIVE_FRAGMENT_SMARTS: &[&str] = &[
     "[#6]1~[#6]~[#6]1",
     "[#6]-[#8].[#7]",
 ];
+
+const MUTATION_LOG_TARGET: &str = "smarts_evolution::operators::mutation";
+
+#[derive(Clone, Copy, Debug)]
+enum MutationSource {
+    Parent,
+    Reset,
+}
+
+impl MutationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Parent => "parent",
+            Self::Reset => "reset",
+        }
+    }
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationOperator {
+    AtomConstraints,
+    AtomRefinement,
+    AtomMap,
+    RecursiveQuery,
+    AttachLeafAtom,
+    InsertAtomOnBond,
+    RemoveLeafAtom,
+    BondConstraints,
+    RingEdit,
+    ComponentEdit,
+    ToggleAtomNot,
+    GraftSeedFragment,
+}
+
+impl MutationOperator {
+    const ALL: [Self; 12] = [
+        Self::AtomConstraints,
+        Self::AtomRefinement,
+        Self::AtomMap,
+        Self::RecursiveQuery,
+        Self::AttachLeafAtom,
+        Self::InsertAtomOnBond,
+        Self::RemoveLeafAtom,
+        Self::BondConstraints,
+        Self::RingEdit,
+        Self::ComponentEdit,
+        Self::ToggleAtomNot,
+        Self::GraftSeedFragment,
+    ];
+    const COUNT: usize = Self::ALL.len();
+
+    fn as_index(self) -> usize {
+        self as usize
+    }
+
+    fn weight(self, near_complexity_limit: bool) -> u32 {
+        match self {
+            Self::AtomConstraints => complexity_sensitive_weight(near_complexity_limit, 10, 12),
+            Self::AtomRefinement => complexity_sensitive_weight(near_complexity_limit, 18, 11),
+            Self::AtomMap => 1,
+            Self::RecursiveQuery => complexity_sensitive_weight(near_complexity_limit, 2, 10),
+            Self::AttachLeafAtom => complexity_sensitive_weight(near_complexity_limit, 2, 13),
+            Self::InsertAtomOnBond => complexity_sensitive_weight(near_complexity_limit, 1, 9),
+            Self::RemoveLeafAtom => complexity_sensitive_weight(near_complexity_limit, 22, 10),
+            Self::BondConstraints => 12,
+            Self::RingEdit => 8,
+            Self::ComponentEdit => complexity_sensitive_weight(near_complexity_limit, 3, 7),
+            Self::ToggleAtomNot => 5,
+            Self::GraftSeedFragment => complexity_sensitive_weight(near_complexity_limit, 0, 2),
+        }
+    }
+
+    fn is_eligible(
+        self,
+        query: &QueryMol,
+        reset_pool: &[SmartsGenome],
+        recursive_depth: usize,
+    ) -> bool {
+        match self {
+            Self::AtomConstraints | Self::AtomRefinement | Self::AttachLeafAtom => {
+                query.atom_count() > 0
+            }
+            Self::AtomMap => has_mapped_atom(query),
+            Self::RecursiveQuery => {
+                recursive_depth < MAX_RECURSIVE_QUERY_DEPTH && query.atom_count() > 0
+            }
+            Self::InsertAtomOnBond | Self::BondConstraints => !query.bonds().is_empty(),
+            Self::RemoveLeafAtom => query.atom_count() > 1 && !query.leaf_atoms().is_empty(),
+            Self::RingEdit => can_edit_ring(query),
+            Self::ComponentEdit => true,
+            Self::ToggleAtomNot => has_bracket_atom(query),
+            Self::GraftSeedFragment => !reset_pool.is_empty() && query.atom_count() > 0,
+        }
+    }
+
+    fn apply<R: Rng>(
+        self,
+        editable: &mut EditableQueryMol,
+        reset_pool: &[SmartsGenome],
+        rng: &mut R,
+        recursive_depth: usize,
+    ) -> bool {
+        match self {
+            Self::AtomConstraints => mutate_atom_constraints(editable, rng, recursive_depth),
+            Self::AtomRefinement => generalize_specialize_atom(editable, rng, recursive_depth),
+            Self::AtomMap => mutate_atom_map(editable, rng),
+            Self::RecursiveQuery => {
+                mutate_recursive_query(editable, reset_pool, rng, recursive_depth)
+            }
+            Self::AttachLeafAtom => attach_leaf_atom(editable, rng),
+            Self::InsertAtomOnBond => insert_atom_on_bond(editable, rng),
+            Self::RemoveLeafAtom => remove_leaf_atom(editable, rng),
+            Self::BondConstraints => mutate_bond_constraints(editable, rng),
+            Self::RingEdit => ring_edit(editable, rng),
+            Self::ComponentEdit => component_edit(editable, rng, recursive_depth),
+            Self::ToggleAtomNot => toggle_atom_not(editable, rng),
+            Self::GraftSeedFragment => graft_seed_fragment(editable, reset_pool, rng),
+        }
+    }
+}
+
+fn complexity_sensitive_weight(near_complexity_limit: bool, near_limit: u32, normal: u32) -> u32 {
+    if near_complexity_limit {
+        near_limit
+    } else {
+        normal
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MutationEdit {
+    operator: MutationOperator,
+    changed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MutationAttemptStats {
+    attempts: usize,
+    steps: usize,
+    changed_steps: usize,
+    query_errors: usize,
+    rejected_genomes: usize,
+    canonical_noops: usize,
+    operator_attempts: [usize; MutationOperator::COUNT],
+    operator_changes: [usize; MutationOperator::COUNT],
+}
+
+impl MutationAttemptStats {
+    fn record_edit(&mut self, edit: MutationEdit) {
+        let index = edit.operator.as_index();
+        self.steps += 1;
+        self.operator_attempts[index] += 1;
+        if edit.changed {
+            self.changed_steps += 1;
+            self.operator_changes[index] += 1;
+        }
+    }
+
+    fn log_accepted(
+        &self,
+        source: MutationSource,
+        parent: &SmartsGenome,
+        candidate: &SmartsGenome,
+    ) {
+        debug!(
+            target: MUTATION_LOG_TARGET,
+            "mutation accepted source={} attempts={} steps={} changed_steps={} query_errors={} rejected_genomes={} canonical_noops={} before_complexity={} after_complexity={} operator_attempts={:?} operator_changes={:?}",
+            source.as_str(),
+            self.attempts,
+            self.steps,
+            self.changed_steps,
+            self.query_errors,
+            self.rejected_genomes,
+            self.canonical_noops,
+            parent.complexity(),
+            candidate.complexity(),
+            self.operator_attempts,
+            self.operator_changes,
+        );
+    }
+
+    fn log_rejected(&self, source: MutationSource, parent: &SmartsGenome) {
+        debug!(
+            target: MUTATION_LOG_TARGET,
+            "mutation rejected source={} attempts={} steps={} changed_steps={} query_errors={} rejected_genomes={} canonical_noops={} before_complexity={} operator_attempts={:?} operator_changes={:?}",
+            source.as_str(),
+            self.attempts,
+            self.steps,
+            self.changed_steps,
+            self.query_errors,
+            self.rejected_genomes,
+            self.canonical_noops,
+            parent.complexity(),
+            self.operator_attempts,
+            self.operator_changes,
+        );
+    }
+}
 
 /// SMARTS-aware mutation operator.
 ///
@@ -79,22 +288,16 @@ pub struct SmartsMutation {
 
 impl SmartsMutation {
     pub fn new(mutation_rate: f64) -> Self {
-        Self {
-            mutation_rate,
-            reset_pool: Vec::new(),
-            reset_probability: 0.20,
-            max_mutation_steps: 6,
-            attempt_budget: 24,
-        }
+        Self::with_reset_pool(mutation_rate, Vec::new())
     }
 
     pub fn with_reset_pool(mutation_rate: f64, reset_pool: Vec<SmartsGenome>) -> Self {
         Self {
             mutation_rate,
             reset_pool,
-            reset_probability: 0.20,
-            max_mutation_steps: 6,
-            attempt_budget: 24,
+            reset_probability: DEFAULT_RESET_PROBABILITY,
+            max_mutation_steps: DEFAULT_MAX_MUTATION_STEPS,
+            attempt_budget: DEFAULT_ATTEMPT_BUDGET,
         }
     }
 
@@ -106,18 +309,78 @@ impl SmartsMutation {
             return genome;
         }
 
-        if !self.reset_pool.is_empty() && rng.random_bool(self.reset_probability) {
-            let reset_idx = rng.random_range(0..self.reset_pool.len());
-            return self.reset_pool[reset_idx].clone();
+        if !self.reset_pool.is_empty()
+            && rng.random_bool(self.reset_probability)
+            && let Some(candidate) = self.mutated_reset_candidate(rng)
+        {
+            return candidate;
         }
 
-        for _ in 0..self.attempt_budget {
+        self.mutated_candidate(&genome, MutationSource::Parent, rng)
+            .unwrap_or(genome)
+    }
+
+    fn mutated_reset_candidate<R>(&self, rng: &mut R) -> Option<SmartsGenome>
+    where
+        R: Rng + Sized,
+    {
+        let mut remaining_budget = self.attempt_budget;
+        for restart in 0..RESET_RESTART_ATTEMPTS {
+            if remaining_budget == 0 {
+                break;
+            }
+            let restarts_left = RESET_RESTART_ATTEMPTS - restart;
+            let restart_budget = remaining_budget.div_ceil(restarts_left).max(1);
+            let reset_idx = rng.random_range(0..self.reset_pool.len());
+            let reset = &self.reset_pool[reset_idx];
+            if let Some(candidate) = self.mutated_candidate_with_budget(
+                reset,
+                MutationSource::Reset,
+                restart_budget,
+                rng,
+            ) {
+                return Some(candidate);
+            }
+            remaining_budget = remaining_budget.saturating_sub(restart_budget);
+        }
+
+        None
+    }
+
+    fn mutated_candidate<R>(
+        &self,
+        genome: &SmartsGenome,
+        source: MutationSource,
+        rng: &mut R,
+    ) -> Option<SmartsGenome>
+    where
+        R: Rng + Sized,
+    {
+        self.mutated_candidate_with_budget(genome, source, self.attempt_budget, rng)
+    }
+
+    fn mutated_candidate_with_budget<R>(
+        &self,
+        genome: &SmartsGenome,
+        source: MutationSource,
+        attempt_budget: usize,
+        rng: &mut R,
+    ) -> Option<SmartsGenome>
+    where
+        R: Rng + Sized,
+    {
+        let mut stats = MutationAttemptStats::default();
+
+        for _ in 0..attempt_budget {
+            stats.attempts += 1;
             let mut editable = genome.query().edit();
-            let mutation_steps = rng.random_range(2..=self.max_mutation_steps.max(2));
+            let mutation_steps = sample_mutation_steps(self.max_mutation_steps, rng);
             let mut mutated = false;
 
             for _ in 0..mutation_steps {
-                mutated |= apply_random_mutation(&mut editable, &self.reset_pool, rng, 0);
+                let edit = apply_random_mutation(&mut editable, &self.reset_pool, rng, 0);
+                stats.record_edit(edit);
+                mutated |= edit.changed;
             }
 
             if !mutated {
@@ -125,15 +388,37 @@ impl SmartsMutation {
             }
 
             let Ok(query) = editable.into_query_mol() else {
+                stats.query_errors += 1;
                 continue;
             };
             let Some(candidate) = genome_from_query(&query) else {
+                stats.rejected_genomes += 1;
                 continue;
             };
-            return candidate;
+            if candidate.smarts() == genome.smarts() {
+                stats.canonical_noops += 1;
+                continue;
+            }
+            stats.log_accepted(source, genome, &candidate);
+            return Some(candidate);
         }
 
-        genome
+        stats.log_rejected(source, genome);
+        None
+    }
+}
+
+fn sample_mutation_steps<R: Rng>(max_mutation_steps: usize, rng: &mut R) -> usize {
+    let max_steps = max_mutation_steps.max(1);
+    let roll: f64 = rng.random();
+    if roll < 0.62 || max_steps == 1 {
+        1
+    } else if roll < 0.84 || max_steps == 2 {
+        2.min(max_steps)
+    } else if roll < 0.95 || max_steps == 3 {
+        3.min(max_steps)
+    } else {
+        rng.random_range(4.min(max_steps)..=max_steps)
     }
 }
 
@@ -147,33 +432,71 @@ fn apply_random_mutation<R: Rng>(
     reset_pool: &[SmartsGenome],
     rng: &mut R,
     recursive_depth: usize,
-) -> bool {
-    let roll: f64 = rng.random();
+) -> MutationEdit {
+    let operator =
+        sample_mutation_operator(editable.as_query_mol(), reset_pool, rng, recursive_depth);
+    let changed = operator.apply(editable, reset_pool, rng, recursive_depth);
 
-    if roll < 0.12 {
-        mutate_atom_constraints(editable, rng, recursive_depth)
-    } else if roll < 0.22 {
-        generalize_specialize_atom(editable, rng, recursive_depth)
-    } else if roll < 0.30 {
-        mutate_atom_map(editable, rng, recursive_depth)
-    } else if roll < 0.40 {
-        mutate_recursive_query(editable, reset_pool, rng, recursive_depth)
-    } else if roll < 0.52 {
-        attach_leaf_atom(editable, rng)
-    } else if roll < 0.60 {
-        insert_atom_on_bond(editable, rng)
-    } else if roll < 0.68 {
-        remove_leaf_atom(editable, rng)
-    } else if roll < 0.78 {
-        mutate_bond_constraints(editable, rng)
-    } else if roll < 0.86 {
-        ring_edit(editable, rng)
-    } else if roll < 0.92 {
-        component_edit(editable, rng, recursive_depth)
-    } else if roll < 0.97 {
-        toggle_atom_not(editable, rng)
+    MutationEdit { operator, changed }
+}
+
+fn sample_mutation_operator<R: Rng>(
+    query: &QueryMol,
+    reset_pool: &[SmartsGenome],
+    rng: &mut R,
+    recursive_depth: usize,
+) -> MutationOperator {
+    let near_complexity_limit = is_near_complexity_limit(query);
+    let total_weight = MutationOperator::ALL
+        .into_iter()
+        .map(|operator| {
+            operator_weight(
+                operator,
+                query,
+                reset_pool,
+                recursive_depth,
+                near_complexity_limit,
+            )
+        })
+        .sum();
+
+    if total_weight == 0 {
+        return MutationOperator::AtomConstraints;
+    }
+
+    let mut roll = rng.random_range(0..total_weight);
+    for operator in MutationOperator::ALL {
+        let weight = operator_weight(
+            operator,
+            query,
+            reset_pool,
+            recursive_depth,
+            near_complexity_limit,
+        );
+        if roll < weight {
+            return operator;
+        }
+        roll -= weight;
+    }
+
+    MutationOperator::AtomConstraints
+}
+
+fn is_near_complexity_limit(query: &QueryMol) -> bool {
+    query.complexity() * 100 >= MAX_SMARTS_COMPLEXITY * 85
+}
+
+fn operator_weight(
+    operator: MutationOperator,
+    query: &QueryMol,
+    reset_pool: &[SmartsGenome],
+    recursive_depth: usize,
+    near_complexity_limit: bool,
+) -> u32 {
+    if operator.is_eligible(query, reset_pool, recursive_depth) {
+        operator.weight(near_complexity_limit)
     } else {
-        graft_seed_fragment(editable, reset_pool, rng)
+        0
     }
 }
 
@@ -212,6 +535,59 @@ fn random_bracket_atom<R: Rng>(
             _ => None,
         })
         .choose(rng)
+}
+
+fn random_mapped_bracket_atom<R: Rng>(
+    editable: &EditableQueryMol,
+    rng: &mut R,
+) -> Option<(usize, BracketExpr)> {
+    editable
+        .as_query_mol()
+        .atoms()
+        .iter()
+        .filter_map(|atom| match &atom.expr {
+            AtomExpr::Bracket(expr) if expr.atom_map.is_some() => Some((atom.id, expr.clone())),
+            _ => None,
+        })
+        .choose(rng)
+}
+
+fn has_bracket_atom(query: &QueryMol) -> bool {
+    query
+        .atoms()
+        .iter()
+        .any(|atom| matches!(&atom.expr, AtomExpr::Bracket(_)))
+}
+
+fn has_mapped_atom(query: &QueryMol) -> bool {
+    query.atoms().iter().any(|atom| {
+        matches!(
+            &atom.expr,
+            AtomExpr::Bracket(BracketExpr {
+                atom_map: Some(_),
+                ..
+            })
+        )
+    })
+}
+
+fn can_edit_ring(query: &QueryMol) -> bool {
+    !query.ring_bonds().is_empty() || can_close_ring(query)
+}
+
+fn can_close_ring(query: &QueryMol) -> bool {
+    for component in 0..query.component_count() {
+        let atoms = query.component_atoms(component);
+        for (idx, &left) in atoms.iter().enumerate() {
+            for &right in &atoms[idx + 1..] {
+                if query.bond_between(left, right).is_none() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn mutate_atom_constraints<R: Rng>(
@@ -254,8 +630,8 @@ fn mutate_atom_constraints<R: Rng>(
                     .replace_atom_expr(atom_id, AtomExpr::Bracket(expr))
                     .is_ok()
         }
-        _ => editable
-            .replace_atom_expr(atom_id, random_atom_expr(rng, recursive_depth))
+        other => editable
+            .replace_atom_expr(atom_id, local_atom_expr_mutation(other, rng))
             .is_ok(),
     }
 }
@@ -269,7 +645,7 @@ fn generalize_specialize_atom<R: Rng>(
 
     let AtomExpr::Bracket(mut expr) = atom_expr else {
         return editable
-            .replace_atom_expr(atom_id, random_atom_expr(rng, recursive_depth))
+            .replace_atom_expr(atom_id, local_atom_expr_mutation(atom_expr, rng))
             .is_ok();
     };
     let primitive_paths = bracket_primitive_paths(&expr);
@@ -291,20 +667,15 @@ fn generalize_specialize_atom<R: Rng>(
             .is_ok()
 }
 
-fn mutate_atom_map<R: Rng>(
-    editable: &mut EditableQueryMol,
-    rng: &mut R,
-    recursive_depth: usize,
-) -> bool {
-    let (atom_id, atom_expr) = random_atom(editable, rng);
-    let mut expr = match atom_expr {
-        AtomExpr::Bracket(expr) => expr,
-        other => atom_expr_to_bracket(other, recursive_depth),
+fn mutate_atom_map<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+    let Some((atom_id, mut expr)) = random_mapped_bracket_atom(editable, rng) else {
+        return false;
     };
 
     expr.atom_map = match expr.atom_map {
-        Some(_) if rng.random_bool(0.35) => None,
-        _ => Some(rng.random_range(1..=MAX_ATOM_MAP)),
+        Some(_) if rng.random_bool(0.80) => None,
+        Some(_) => Some(rng.random_range(1..=MAX_ATOM_MAP)),
+        None => return false,
     };
 
     editable
@@ -345,7 +716,7 @@ fn mutate_recursive_query<R: Rng>(
                 expr
             }
             other => {
-                let mut expr = atom_expr_to_bracket(other, recursive_depth);
+                let mut expr = atom_expr_to_bracket(other);
                 expr.tree = BracketExprTree::HighAnd(vec![
                     expr.tree,
                     BracketExprTree::Primitive(AtomPrimitive::RecursiveQuery(Box::new(recursive))),
@@ -371,17 +742,27 @@ fn mutate_recursive_query<R: Rng>(
     };
 
     let mutated_inner = if rng.random_bool(0.30) {
-        **inner = random_recursive_query(rng, recursive_depth + 1);
-        true
+        let candidate = random_recursive_query(rng, recursive_depth + 1);
+        if genome_from_query(&candidate).is_some() {
+            **inner = candidate;
+            true
+        } else {
+            false
+        }
     } else {
         let mut nested = inner.edit();
-        apply_random_mutation(&mut nested, reset_pool, rng, recursive_depth + 1)
-            && nested
-                .into_query_mol()
-                .map(|query| {
-                    **inner = query;
-                })
-                .is_ok()
+        if !apply_random_mutation(&mut nested, reset_pool, rng, recursive_depth + 1).changed {
+            false
+        } else {
+            let Ok(query) = nested.into_query_mol() else {
+                return false;
+            };
+            if genome_from_query(&query).is_none() {
+                return false;
+            }
+            **inner = query;
+            true
+        }
     };
 
     mutated_inner && editable.replace_atom_expr(atom_id, atom_expr).is_ok()
@@ -484,24 +865,27 @@ fn ring_edit<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
         return editable.open_ring(*ring_bonds.choose(rng).unwrap()).is_ok();
     }
 
-    let mut candidates = Vec::new();
-    for component in 0..snapshot.component_count() {
+    for _ in 0..RING_CLOSE_ATTEMPTS {
+        let component = rng.random_range(0..snapshot.component_count());
         let atoms = snapshot.component_atoms(component);
-        for (idx, &left) in atoms.iter().enumerate() {
-            for &right in &atoms[idx + 1..] {
-                if snapshot.bond_between(left, right).is_none() {
-                    candidates.push((left, right));
-                }
-            }
+        if atoms.len() < 2 {
+            continue;
+        }
+        let left_idx = rng.random_range(0..atoms.len());
+        let mut right_idx = rng.random_range(0..atoms.len() - 1);
+        if right_idx >= left_idx {
+            right_idx += 1;
+        }
+        let left = atoms[left_idx];
+        let right = atoms[right_idx];
+        if snapshot.bond_between(left, right).is_none() {
+            return editable
+                .close_ring(left, right, random_bond_expr(rng))
+                .is_ok();
         }
     }
 
-    let Some(&(left, right)) = candidates.choose(rng) else {
-        return false;
-    };
-    editable
-        .close_ring(left, right, random_bond_expr(rng))
-        .is_ok()
+    false
 }
 
 fn component_edit<R: Rng>(
@@ -663,7 +1047,7 @@ fn recursive_sites(query: &QueryMol) -> Vec<(usize, ExprPath)> {
         .collect()
 }
 
-fn atom_expr_to_bracket(atom_expr: AtomExpr, _recursive_depth: usize) -> BracketExpr {
+fn atom_expr_to_bracket(atom_expr: AtomExpr) -> BracketExpr {
     match atom_expr {
         AtomExpr::Bracket(expr) => expr,
         AtomExpr::Wildcard => BracketExpr {
@@ -727,6 +1111,47 @@ fn random_atom_expr<R: Rng>(rng: &mut R, recursive_depth: usize) -> AtomExpr {
     }
 }
 
+fn local_atom_expr_mutation<R: Rng>(atom_expr: AtomExpr, rng: &mut R) -> AtomExpr {
+    match atom_expr {
+        AtomExpr::Bracket(expr) => AtomExpr::Bracket(expr),
+        AtomExpr::Wildcard => {
+            if rng.random_bool(0.5) {
+                random_bare_atom_expr(rng)
+            } else {
+                bracket_atom_expr(AtomPrimitive::Wildcard)
+            }
+        }
+        AtomExpr::Bare { element, aromatic } => match rng.random_range(0..5) {
+            0 => AtomExpr::Wildcard,
+            1 => bracket_atom_expr(if aromatic {
+                AtomPrimitive::AromaticAny
+            } else {
+                AtomPrimitive::AliphaticAny
+            }),
+            2 => bracket_atom_expr(AtomPrimitive::Symbol { element, aromatic }),
+            3 => {
+                let mut expr = BracketExpr {
+                    tree: BracketExprTree::HighAnd(vec![
+                        BracketExprTree::Primitive(AtomPrimitive::Symbol { element, aromatic }),
+                        BracketExprTree::Primitive(random_local_atom_primitive(rng)),
+                    ]),
+                    atom_map: None,
+                };
+                let _ = expr.normalize();
+                AtomExpr::Bracket(expr)
+            }
+            _ => random_bare_atom_expr(rng),
+        },
+    }
+}
+
+fn bracket_atom_expr(primitive: AtomPrimitive) -> AtomExpr {
+    AtomExpr::Bracket(BracketExpr {
+        tree: BracketExprTree::Primitive(primitive),
+        atom_map: None,
+    })
+}
+
 fn random_bare_atom_expr<R: Rng>(rng: &mut R) -> AtomExpr {
     if rng.random_bool(0.35) {
         AtomExpr::Bare {
@@ -745,7 +1170,7 @@ fn random_bracket_expr<R: Rng>(rng: &mut R, recursive_depth: usize) -> BracketEx
     let mut expr = BracketExpr {
         tree: random_bracket_tree(rng, recursive_depth, 0),
         atom_map: rng
-            .random_bool(0.15)
+            .random_bool(0.01)
             .then_some(rng.random_range(1..=MAX_ATOM_MAP)),
     };
     let _ = expr.normalize();
@@ -785,56 +1210,76 @@ fn random_bracket_children<R: Rng>(
 }
 
 fn random_atom_primitive<R: Rng>(rng: &mut R, recursive_depth: usize) -> AtomPrimitive {
-    match rng.random_range(0..20) {
-        0 => AtomPrimitive::Wildcard,
-        1 => AtomPrimitive::AliphaticAny,
-        2 => AtomPrimitive::AromaticAny,
-        3 => random_symbol_primitive(rng),
-        4 => AtomPrimitive::Isotope {
-            isotope: random_isotope(rng),
-            aromatic: rng.random_bool(0.2),
-        },
-        5 => AtomPrimitive::IsotopeWildcard(random_isotope_wildcard(rng)),
-        6 => AtomPrimitive::AtomicNumber(random_atomic_number(rng)),
-        7 => AtomPrimitive::Degree(random_optional_numeric_query(rng, 0, MAX_DEGREE)),
-        8 => AtomPrimitive::Connectivity(random_optional_numeric_query(rng, 0, MAX_CONNECTIVITY)),
-        9 => AtomPrimitive::Valence(random_optional_numeric_query(rng, 0, MAX_VALENCE)),
-        10 if recursive_depth < MAX_RECURSIVE_QUERY_DEPTH => AtomPrimitive::RecursiveQuery(
-            Box::new(random_recursive_query(rng, recursive_depth + 1)),
-        ),
-        10 | 11 => AtomPrimitive::Hydrogen(
-            if rng.random_bool(0.5) {
-                HydrogenKind::Total
-            } else {
-                HydrogenKind::Implicit
-            },
-            random_optional_numeric_query(rng, 0, MAX_HYDROGEN_COUNT),
-        ),
-        12 => AtomPrimitive::RingMembership(random_optional_numeric_query(
+    match rng.random_range(0..100) {
+        0..=5 => AtomPrimitive::Wildcard,
+        6..=10 => AtomPrimitive::AliphaticAny,
+        11..=15 => AtomPrimitive::AromaticAny,
+        16..=38 => random_symbol_primitive(rng),
+        39..=47 => AtomPrimitive::AtomicNumber(random_atomic_number(rng)),
+        48..=52 => AtomPrimitive::Degree(random_optional_numeric_query(rng, 0, MAX_DEGREE)),
+        53..=57 => {
+            AtomPrimitive::Connectivity(random_optional_numeric_query(rng, 0, MAX_CONNECTIVITY))
+        }
+        58..=62 => AtomPrimitive::Valence(random_optional_numeric_query(rng, 0, MAX_VALENCE)),
+        63..=69 => random_hydrogen_primitive(rng, MAX_HYDROGEN_COUNT),
+        70..=74 => AtomPrimitive::RingMembership(random_optional_numeric_query(
             rng,
             0,
             MAX_RING_MEMBERSHIP,
         )),
-        13 => AtomPrimitive::RingSize(random_optional_numeric_query(rng, 3, MAX_RING_SIZE)),
-        14 => AtomPrimitive::RingConnectivity(random_optional_numeric_query(
+        75..=79 => AtomPrimitive::RingSize(random_optional_numeric_query(rng, 3, MAX_RING_SIZE)),
+        80..=83 => AtomPrimitive::RingConnectivity(random_optional_numeric_query(
             rng,
             0,
             MAX_RING_CONNECTIVITY,
         )),
-        15 => AtomPrimitive::Hybridization(random_numeric_query(rng, 1, MAX_HYBRIDIZATION)),
-        16 => AtomPrimitive::HeteroNeighbor(random_optional_numeric_query(
+        84..=86 if recursive_depth < MAX_RECURSIVE_QUERY_DEPTH => AtomPrimitive::RecursiveQuery(
+            Box::new(random_recursive_query(rng, recursive_depth + 1)),
+        ),
+        84..=86 => random_hydrogen_primitive(rng, MAX_HYDROGEN_COUNT),
+        87 => AtomPrimitive::Isotope {
+            isotope: random_isotope(rng),
+            aromatic: rng.random_bool(0.2),
+        },
+        88 => AtomPrimitive::IsotopeWildcard(random_isotope_wildcard(rng)),
+        89 => AtomPrimitive::Hybridization(random_numeric_query(rng, 1, MAX_HYBRIDIZATION)),
+        90 => AtomPrimitive::HeteroNeighbor(random_optional_numeric_query(
             rng,
             0,
             MAX_HETERO_NEIGHBOR,
         )),
-        17 => AtomPrimitive::AliphaticHeteroNeighbor(random_optional_numeric_query(
+        91 => AtomPrimitive::AliphaticHeteroNeighbor(random_optional_numeric_query(
             rng,
             0,
             MAX_ALIPHATIC_HETERO_NEIGHBOR,
         )),
-        18 => AtomPrimitive::Chirality(random_chirality(rng)),
+        92 => AtomPrimitive::Chirality(random_chirality(rng)),
         _ => AtomPrimitive::Charge(random_charge(rng)),
     }
+}
+
+fn random_local_atom_primitive<R: Rng>(rng: &mut R) -> AtomPrimitive {
+    match rng.random_range(0..100) {
+        0..=18 => random_hydrogen_primitive(rng, 4),
+        19..=34 => AtomPrimitive::Degree(random_optional_numeric_query(rng, 0, 6)),
+        35..=50 => AtomPrimitive::Connectivity(random_optional_numeric_query(rng, 0, 6)),
+        51..=63 => AtomPrimitive::Valence(random_optional_numeric_query(rng, 0, 6)),
+        64..=73 => AtomPrimitive::RingMembership(random_optional_numeric_query(rng, 0, 6)),
+        74..=82 => AtomPrimitive::RingSize(random_optional_numeric_query(rng, 3, 8)),
+        83..=90 => AtomPrimitive::RingConnectivity(random_optional_numeric_query(rng, 0, 6)),
+        91..=96 => AtomPrimitive::Charge(rng.random_range(-1..=1)),
+        97..=98 => AtomPrimitive::HeteroNeighbor(random_optional_numeric_query(rng, 0, 4)),
+        _ => AtomPrimitive::AliphaticHeteroNeighbor(random_optional_numeric_query(rng, 0, 4)),
+    }
+}
+
+fn random_hydrogen_primitive<R: Rng>(rng: &mut R, max_count: u16) -> AtomPrimitive {
+    let kind = if rng.random_bool(0.5) {
+        HydrogenKind::Total
+    } else {
+        HydrogenKind::Implicit
+    };
+    AtomPrimitive::Hydrogen(kind, random_optional_numeric_query(rng, 0, max_count))
 }
 
 fn generalize_atom_primitive<R: Rng>(
@@ -978,21 +1423,25 @@ fn random_bond_children<R: Rng>(rng: &mut R, tree_depth: usize) -> Vec<BondExprT
 }
 
 fn random_bond_primitive<R: Rng>(rng: &mut R) -> BondPrimitive {
-    match rng.random_range(0..9) {
-        0 => BondPrimitive::Bond(Bond::Single),
-        1 => BondPrimitive::Bond(Bond::Double),
-        2 => BondPrimitive::Bond(Bond::Triple),
-        3 => BondPrimitive::Bond(Bond::Quadruple),
-        4 => BondPrimitive::Bond(Bond::Aromatic),
-        5 => BondPrimitive::Bond(Bond::Up),
-        6 => BondPrimitive::Bond(Bond::Down),
-        7 => BondPrimitive::Any,
-        _ => BondPrimitive::Ring,
+    match rng.random_range(0..100) {
+        0..=34 => BondPrimitive::Bond(Bond::Single),
+        35..=54 => BondPrimitive::Bond(Bond::Double),
+        55..=66 => BondPrimitive::Bond(Bond::Aromatic),
+        67..=78 => BondPrimitive::Any,
+        79..=88 => BondPrimitive::Ring,
+        89..=93 => BondPrimitive::Bond(Bond::Triple),
+        94 => BondPrimitive::Bond(Bond::Quadruple),
+        95..=97 => BondPrimitive::Bond(Bond::Up),
+        _ => BondPrimitive::Bond(Bond::Down),
     }
 }
 
 fn random_atomic_number<R: Rng>(rng: &mut R) -> u16 {
-    rng.random_range(1..=MAX_ATOMIC_NUMBER)
+    if rng.random_bool(0.90) {
+        *COMMON_ATOMIC_NUMBERS.choose(rng).unwrap()
+    } else {
+        rng.random_range(1..=MAX_ATOMIC_NUMBER)
+    }
 }
 
 fn random_symbol_primitive<R: Rng>(rng: &mut R) -> AtomPrimitive {
@@ -1004,6 +1453,8 @@ fn random_symbol_primitive<R: Rng>(rng: &mut R) -> AtomPrimitive {
 fn random_supported_element<R: Rng>(rng: &mut R, aromatic: bool) -> Element {
     let symbol = if aromatic {
         *AROMATIC_ELEMENT_SYMBOLS.choose(rng).unwrap()
+    } else if rng.random_bool(0.90) {
+        *COMMON_ALIPHATIC_ELEMENT_SYMBOLS.choose(rng).unwrap()
     } else {
         *ALL_ELEMENT_SYMBOLS.choose(rng).unwrap()
     };
@@ -1028,11 +1479,19 @@ fn random_isotope<R: Rng>(rng: &mut R) -> Isotope {
 }
 
 fn random_isotope_wildcard<R: Rng>(rng: &mut R) -> u16 {
-    rng.random_range(0..=MAX_ISOTOPE_WILDCARD)
+    if rng.random_bool(0.90) {
+        rng.random_range(0..=255)
+    } else {
+        rng.random_range(0..=MAX_ISOTOPE_WILDCARD)
+    }
 }
 
 fn random_charge<R: Rng>(rng: &mut R) -> i8 {
-    rng.random_range(-MAX_ABS_CHARGE..=MAX_ABS_CHARGE)
+    if rng.random_bool(0.85) {
+        rng.random_range(-2..=2)
+    } else {
+        rng.random_range(-MAX_ABS_CHARGE..=MAX_ABS_CHARGE)
+    }
 }
 
 fn random_chirality<R: Rng>(rng: &mut R) -> Chirality {
@@ -1082,8 +1541,13 @@ fn random_recursive_query<R: Rng>(rng: &mut R, recursive_depth: usize) -> QueryM
     let mut query = QueryMol::from_str(smarts).unwrap();
     if recursive_depth < MAX_RECURSIVE_QUERY_DEPTH && rng.random_bool(0.35) {
         let mut editable = query.edit();
-        let _ = apply_random_mutation(&mut editable, &[], rng, recursive_depth);
-        query = editable.into_query_mol().unwrap_or(query);
+        let edit = apply_random_mutation(&mut editable, &[], rng, recursive_depth);
+        if edit.changed
+            && let Ok(candidate) = editable.into_query_mol()
+            && genome_from_query(&candidate).is_some()
+        {
+            query = candidate;
+        }
     }
     query
 }
@@ -1161,6 +1625,216 @@ mod tests {
     }
 
     #[test]
+    fn mutation_step_sampler_prefers_local_edits_and_keeps_exploration_tail() {
+        let mut rng = SmallRng::seed_from_u64(8);
+        let mut counts = [0usize; 7];
+
+        for _ in 0..4096 {
+            let steps = sample_mutation_steps(6, &mut rng);
+            assert!((1..=6).contains(&steps));
+            counts[steps] += 1;
+        }
+
+        assert!(counts[1] > counts[2]);
+        assert!(counts[2] > counts[3]);
+        assert!(counts[4] + counts[5] + counts[6] > 0);
+    }
+
+    #[test]
+    fn mutation_operator_metadata_is_consistent() {
+        assert_eq!(MutationOperator::COUNT, MutationOperator::ALL.len());
+        assert_eq!(complexity_sensitive_weight(true, 3, 7), 3);
+        assert_eq!(complexity_sensitive_weight(false, 3, 7), 7);
+
+        for (index, operator) in MutationOperator::ALL.iter().copied().enumerate() {
+            assert_eq!(operator.as_index(), index);
+            assert!(operator.weight(false) <= 22);
+            assert!(operator.weight(true) <= 22);
+        }
+
+        assert!(
+            MutationOperator::AtomRefinement.weight(true)
+                > MutationOperator::AtomRefinement.weight(false)
+        );
+        assert!(
+            MutationOperator::RemoveLeafAtom.weight(true)
+                > MutationOperator::RemoveLeafAtom.weight(false)
+        );
+        assert_eq!(MutationOperator::GraftSeedFragment.weight(true), 0);
+
+        let single_atom = QueryMol::from_str("C").unwrap();
+        let mapped_atom = QueryMol::from_str("[#6:1]").unwrap();
+        let bonded = QueryMol::from_str("CC").unwrap();
+        let ring_closable = QueryMol::from_str("CCC").unwrap();
+        let reset_pool = vec![SmartsGenome::from_smarts("[#6]").unwrap()];
+
+        assert!(MutationOperator::AtomConstraints.is_eligible(&single_atom, &[], 0));
+        assert!(MutationOperator::AtomRefinement.is_eligible(&single_atom, &[], 0));
+        assert!(MutationOperator::AttachLeafAtom.is_eligible(&single_atom, &[], 0));
+        assert!(MutationOperator::RecursiveQuery.is_eligible(&single_atom, &[], 0));
+        assert!(!MutationOperator::RecursiveQuery.is_eligible(
+            &single_atom,
+            &[],
+            MAX_RECURSIVE_QUERY_DEPTH,
+        ));
+
+        assert!(!MutationOperator::AtomMap.is_eligible(&single_atom, &[], 0));
+        assert!(MutationOperator::AtomMap.is_eligible(&mapped_atom, &[], 0));
+        assert!(MutationOperator::InsertAtomOnBond.is_eligible(&bonded, &[], 0));
+        assert!(MutationOperator::BondConstraints.is_eligible(&bonded, &[], 0));
+        assert!(MutationOperator::RemoveLeafAtom.is_eligible(&bonded, &[], 0));
+        assert!(MutationOperator::RingEdit.is_eligible(&ring_closable, &[], 0));
+        assert!(!MutationOperator::ToggleAtomNot.is_eligible(&single_atom, &[], 0));
+        assert!(MutationOperator::ToggleAtomNot.is_eligible(&mapped_atom, &[], 0));
+        assert!(!MutationOperator::GraftSeedFragment.is_eligible(&single_atom, &[], 0));
+        assert!(MutationOperator::GraftSeedFragment.is_eligible(&single_atom, &reset_pool, 0));
+
+        assert_eq!(
+            operator_weight(MutationOperator::AtomMap, &single_atom, &[], 0, false),
+            0
+        );
+        assert_eq!(
+            operator_weight(MutationOperator::AtomMap, &mapped_atom, &[], 0, false),
+            MutationOperator::AtomMap.weight(false)
+        );
+        assert_eq!(
+            operator_weight(
+                MutationOperator::GraftSeedFragment,
+                &single_atom,
+                &reset_pool,
+                0,
+                true,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn mutation_attempt_stats_track_sources_and_operator_counts() {
+        assert_eq!(MutationSource::Parent.as_str(), "parent");
+        assert_eq!(MutationSource::Reset.as_str(), "reset");
+
+        let mut stats = MutationAttemptStats::default();
+        stats.record_edit(MutationEdit {
+            operator: MutationOperator::AtomConstraints,
+            changed: false,
+        });
+        stats.record_edit(MutationEdit {
+            operator: MutationOperator::AtomConstraints,
+            changed: true,
+        });
+        stats.record_edit(MutationEdit {
+            operator: MutationOperator::BondConstraints,
+            changed: true,
+        });
+
+        assert_eq!(stats.steps, 3);
+        assert_eq!(stats.changed_steps, 2);
+        assert_eq!(
+            stats.operator_attempts[MutationOperator::AtomConstraints.as_index()],
+            2
+        );
+        assert_eq!(
+            stats.operator_changes[MutationOperator::AtomConstraints.as_index()],
+            1
+        );
+        assert_eq!(
+            stats.operator_attempts[MutationOperator::BondConstraints.as_index()],
+            1
+        );
+        assert_eq!(
+            stats.operator_changes[MutationOperator::BondConstraints.as_index()],
+            1
+        );
+    }
+
+    #[test]
+    fn mutation_operator_apply_dispatches_to_helpers() {
+        let reset_pool = vec![SmartsGenome::from_smarts("[#6]").unwrap()];
+        let cases = [
+            (MutationOperator::AtomConstraints, "C"),
+            (MutationOperator::AtomRefinement, "C"),
+            (MutationOperator::AtomMap, "[#6:1]"),
+            (MutationOperator::RecursiveQuery, "C"),
+            (MutationOperator::AttachLeafAtom, "C"),
+            (MutationOperator::InsertAtomOnBond, "CC"),
+            (MutationOperator::RemoveLeafAtom, "CC"),
+            (MutationOperator::BondConstraints, "CC"),
+            (MutationOperator::RingEdit, "CCC"),
+            (MutationOperator::ComponentEdit, "C"),
+            (MutationOperator::ToggleAtomNot, "[#6]"),
+            (MutationOperator::GraftSeedFragment, "C"),
+        ];
+
+        for (operator, smarts) in cases {
+            let changed = (0..16).any(|seed| {
+                let mut editable = QueryMol::from_str(smarts).unwrap().edit();
+                let mut rng = SmallRng::seed_from_u64(seed);
+                operator.apply(&mut editable, &reset_pool, &mut rng, 0)
+                    && editable
+                        .into_query_mol()
+                        .map(|query| SmartsGenome::from_query_mol(&query).is_valid())
+                        .unwrap_or(false)
+            });
+
+            assert!(changed, "{operator:?} did not produce a valid change");
+        }
+    }
+
+    #[test]
+    fn operator_sampler_excludes_ineligible_single_atom_operations() {
+        let query = QueryMol::from_str("C").unwrap();
+        let mut rng = SmallRng::seed_from_u64(80);
+
+        for _ in 0..512 {
+            let operator = sample_mutation_operator(&query, &[], &mut rng, 0);
+            assert!(!matches!(
+                operator,
+                MutationOperator::AtomMap
+                    | MutationOperator::InsertAtomOnBond
+                    | MutationOperator::RemoveLeafAtom
+                    | MutationOperator::BondConstraints
+                    | MutationOperator::RingEdit
+                    | MutationOperator::ToggleAtomNot
+                    | MutationOperator::GraftSeedFragment
+            ));
+        }
+    }
+
+    #[test]
+    fn operator_sampler_can_use_existing_atom_maps_without_introducing_them() {
+        let query = QueryMol::from_str("[#6:1]").unwrap();
+        let mut rng = SmallRng::seed_from_u64(81);
+        let mut saw_atom_map = false;
+
+        for _ in 0..4096 {
+            if matches!(
+                sample_mutation_operator(&query, &[], &mut rng, 0),
+                MutationOperator::AtomMap
+            ) {
+                saw_atom_map = true;
+                break;
+            }
+        }
+
+        assert!(saw_atom_map);
+    }
+
+    #[test]
+    fn operator_sampler_disables_grafting_near_complexity_limit() {
+        let over_limit = QueryMol::from_str(&over_limit_smarts_fixture()).unwrap();
+        let reset_pool = vec![SmartsGenome::from_smarts("[#6]").unwrap()];
+        let mut rng = SmallRng::seed_from_u64(82);
+
+        for _ in 0..512 {
+            assert!(!matches!(
+                sample_mutation_operator(&over_limit, &reset_pool, &mut rng, 0),
+                MutationOperator::GraftSeedFragment
+            ));
+        }
+    }
+
+    #[test]
     fn genome_from_query_rejects_overly_complex_queries() {
         let over_limit = over_limit_smarts_fixture();
         let query = QueryMol::from_str(&over_limit).unwrap();
@@ -1228,6 +1902,24 @@ mod tests {
     }
 
     #[test]
+    fn bare_atom_refinement_keeps_single_atom_shape() {
+        let query = QueryMol::from_str("C").unwrap();
+
+        for seed in 0..64 {
+            let mut editable = query.clone().edit();
+            assert!(generalize_specialize_atom(
+                &mut editable,
+                &mut SmallRng::seed_from_u64(seed),
+                0,
+            ));
+            let refined = editable.into_query_mol().unwrap();
+
+            assert_eq!(refined.atom_count(), 1);
+            assert!(SmartsGenome::from_query_mol(&refined).is_valid());
+        }
+    }
+
+    #[test]
     fn specialize_atom_primitive_covers_ring_specific_cases() {
         let mut rng = SmallRng::seed_from_u64(9);
 
@@ -1260,7 +1952,7 @@ mod tests {
         let mut saw_hetero_neighbor = false;
         let mut saw_implicit_h = false;
 
-        for _ in 0..1024 {
+        for _ in 0..4096 {
             match random_atom_primitive(&mut rng, 0) {
                 AtomPrimitive::RecursiveQuery(_) => saw_recursive = true,
                 AtomPrimitive::Isotope { .. } | AtomPrimitive::IsotopeWildcard(_) => {
@@ -1332,6 +2024,15 @@ mod tests {
     }
 
     #[test]
+    fn random_recursive_query_keeps_nested_mutations_valid() {
+        for seed in 0..128 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let query = random_recursive_query(&mut rng, 0);
+            assert!(genome_from_query(&query).is_some());
+        }
+    }
+
+    #[test]
     fn ring_and_component_mutations_are_available() {
         let mut ring_query = QueryMol::from_str("CCC").unwrap().edit();
         assert!(ring_edit(&mut ring_query, &mut SmallRng::seed_from_u64(77)));
@@ -1349,15 +2050,34 @@ mod tests {
     }
 
     #[test]
-    fn atom_map_mutation_can_introduce_maps() {
+    fn atom_map_mutation_only_edits_existing_maps() {
         let mut editable = QueryMol::from_str("C").unwrap().edit();
+        assert!(!mutate_atom_map(
+            &mut editable,
+            &mut SmallRng::seed_from_u64(91)
+        ));
+
+        let mut editable = QueryMol::from_str("[#6:1]~[#7]").unwrap().edit();
         assert!(mutate_atom_map(
             &mut editable,
-            &mut SmallRng::seed_from_u64(91),
-            0
+            &mut SmallRng::seed_from_u64(92)
         ));
-        let query = editable.into_query_mol().unwrap();
-        assert!(query.to_string().contains(':'));
+        let mutated = editable.into_query_mol().unwrap();
+        let mapped_atoms = mutated
+            .atoms()
+            .iter()
+            .filter(|atom| {
+                matches!(
+                    &atom.expr,
+                    AtomExpr::Bracket(BracketExpr {
+                        atom_map: Some(_),
+                        ..
+                    })
+                )
+            })
+            .count();
+
+        assert!(mapped_atoms <= 1);
     }
 
     #[test]
@@ -1394,7 +2114,7 @@ mod tests {
             atom_map: Some(3),
         };
         assert_eq!(
-            atom_expr_to_bracket(AtomExpr::Bracket(bracket.clone()), 0),
+            atom_expr_to_bracket(AtomExpr::Bracket(bracket.clone())),
             bracket
         );
 
@@ -1583,26 +2303,20 @@ mod tests {
     }
 
     #[test]
-    fn reset_pool_can_return_seed_fragment() {
-        let mut rng = SmallRng::seed_from_u64(1);
-        let mutator = SmartsMutation::with_reset_pool(
-            1.0,
-            vec![
-                SmartsGenome::from_smarts("[#6]").unwrap(),
-                SmartsGenome::from_smarts("[#7]").unwrap(),
-            ],
-        );
+    fn reset_pool_restarts_from_seed_and_applies_variation() {
+        let mutator = SmartsMutation {
+            mutation_rate: 1.0,
+            reset_pool: vec![SmartsGenome::from_smarts("[#6]").unwrap()],
+            reset_probability: 1.0,
+            max_mutation_steps: 1,
+            attempt_budget: 128,
+        };
 
-        let mut observed_reset = false;
-        for _ in 0..256 {
+        for seed in 0..16 {
+            let mut rng = SmallRng::seed_from_u64(seed);
             let mutated = mutator.mutate(SmartsGenome::from_smarts("[#8]").unwrap(), &mut rng);
-            if mutated.smarts() == "[#6]" || mutated.smarts() == "[#7]" {
-                observed_reset = true;
-                break;
-            }
+            assert_ne!(mutated.smarts(), "[#6]");
         }
-
-        assert!(observed_reset);
     }
 
     #[test]
