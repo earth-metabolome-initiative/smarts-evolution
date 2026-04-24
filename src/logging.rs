@@ -180,8 +180,19 @@ impl log::Log for FileLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use log::Log;
     use std::fs;
+
+    fn temp_log_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "smarts-evolution-{label}-{}.log",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn file_log_config_defaults_to_warning_file_only_append() {
@@ -207,13 +218,7 @@ mod tests {
 
     #[test]
     fn file_logger_writes_enabled_records() {
-        let path = std::env::temp_dir().join(format!(
-            "smarts-evolution-logger-{}.log",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = temp_log_path("logger");
         let file = File::create(&path).unwrap();
         let logger = FileLogger {
             file: Mutex::new(file),
@@ -234,5 +239,39 @@ mod tests {
         assert!(
             logged.contains(" WARN smarts_evolution::fitness::evaluator - slow SMARTS evaluation")
         );
+    }
+
+    #[test]
+    fn file_logger_ignores_records_above_configured_level() {
+        let path = temp_log_path("filtered");
+        let file = File::create(&path).unwrap();
+        let logger = FileLogger {
+            file: Mutex::new(file),
+            level: LevelFilter::Warn,
+            mirror_to_stderr: false,
+        };
+        let record = log::Record::builder()
+            .args(format_args!("normal evaluation"))
+            .level(log::Level::Debug)
+            .target("smarts_evolution::fitness::evaluator")
+            .build();
+
+        logger.log(&record);
+        logger.flush();
+
+        let logged = fs::read_to_string(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(logged.is_empty());
+    }
+
+    #[test]
+    fn file_log_config_init_reports_open_errors() {
+        let directory = temp_log_path("missing-directory");
+        let path = directory.join("smarts-evolution.log");
+        let error = FileLogConfig::new(path).init().unwrap_err();
+
+        assert!(matches!(error, FileLogInitError::Io(_)));
+        assert!(error.to_string().starts_with("could not open log file: "));
+        assert!(error.source().is_some());
     }
 }
