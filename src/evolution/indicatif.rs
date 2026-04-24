@@ -7,8 +7,8 @@ use ::indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle}
 
 use super::config::EvolutionConfig;
 use super::runner::{
-    EvolutionError, EvolutionEvaluationProgress, EvolutionProgress, EvolutionSession,
-    EvolutionStatus, EvolutionTask, TaskResult,
+    EvolutionError, EvolutionEvaluationProgress, EvolutionProgress, EvolutionProgressObserver,
+    EvolutionSession, EvolutionStatus, EvolutionTask, TaskResult,
 };
 use crate::genome::seed::SeedCorpus;
 
@@ -24,6 +24,7 @@ pub struct IndicatifEvolutionProgress {
     generation_bar: ProgressBar,
     evaluation_bar: ProgressBar,
     best_smarts_width: usize,
+    clear_on_finish: bool,
 }
 
 impl Default for IndicatifEvolutionProgress {
@@ -41,22 +42,30 @@ impl IndicatifEvolutionProgress {
     /// Create progress bars with a custom indicatif draw target.
     pub fn with_draw_target(draw_target: ProgressDrawTarget) -> Self {
         let multi = MultiProgress::with_draw_target(draw_target);
-        let generation_bar = multi.add(
-            ProgressBar::new(1)
-                .with_style(generation_style())
-                .with_prefix("generations"),
-        );
-        let evaluation_bar = multi.add(
-            ProgressBar::new(1)
-                .with_style(evaluation_style())
-                .with_prefix("evaluating"),
-        );
+        Self::attach_to(&multi)
+    }
+
+    /// Create progress bars from caller-owned indicatif bars.
+    pub fn from_bars(generation_bar: ProgressBar, evaluation_bar: ProgressBar) -> Self {
+        generation_bar.set_style(generation_style());
+        generation_bar.set_prefix("generations");
+        evaluation_bar.set_style(evaluation_style());
+        evaluation_bar.set_prefix("evaluating");
 
         Self {
             generation_bar,
             evaluation_bar,
             best_smarts_width: DEFAULT_BEST_SMARTS_WIDTH,
+            clear_on_finish: false,
         }
+    }
+
+    /// Attach evolution progress bars to an existing indicatif multi-progress.
+    pub fn attach_to(multi: &MultiProgress) -> Self {
+        Self::from_bars(
+            multi.add(ProgressBar::new(1)),
+            multi.add(ProgressBar::new(1)),
+        )
     }
 
     /// Create hidden progress bars for tests or callers that want the same code path without I/O.
@@ -67,6 +76,35 @@ impl IndicatifEvolutionProgress {
     /// Limit the SMARTS text shown in the generation bar message.
     pub fn with_best_smarts_width(mut self, width: usize) -> Self {
         self.best_smarts_width = width.max(3);
+        self
+    }
+
+    /// Use a caller-provided style for the generation progress bar.
+    pub fn with_generation_style(self, style: ProgressStyle) -> Self {
+        self.generation_bar.set_style(style);
+        self
+    }
+
+    /// Use a caller-provided style for the SMARTS evaluation progress bar.
+    pub fn with_evaluation_style(self, style: ProgressStyle) -> Self {
+        self.evaluation_bar.set_style(style);
+        self
+    }
+
+    /// Clear both evolution bars when the run finishes or fails.
+    pub fn clear_on_finish(mut self, clear: bool) -> Self {
+        self.clear_on_finish = clear;
+        self
+    }
+
+    /// Set custom prefixes for the generation and evaluation bars.
+    pub fn with_prefixes(
+        self,
+        generation: impl Into<String>,
+        evaluation: impl Into<String>,
+    ) -> Self {
+        self.generation_bar.set_prefix(generation.into());
+        self.evaluation_bar.set_prefix(evaluation.into());
         self
     }
 
@@ -89,13 +127,37 @@ impl IndicatifEvolutionProgress {
             .set_length(progress.total().max(1) as u64);
         self.evaluation_bar
             .set_position(progress.completed() as u64);
-        self.evaluation_bar.set_message(format!(
+        let mut message = format!(
             "generation={}/{} SMARTS={}/{}",
             progress.generation(),
             progress.generation_limit(),
             progress.completed(),
             progress.total()
+        );
+        if let Some(last_mcc) = progress.last_mcc() {
+            message.push_str(&format!(" current_mcc={last_mcc:.3}"));
+        }
+        if let Some(last_smarts) = progress.last_smarts() {
+            message.push_str(&format!(
+                " current={}",
+                truncate_smarts(last_smarts, self.best_smarts_width)
+            ));
+        }
+        if let Some(best_mcc) = progress.generation_best_mcc() {
+            message.push_str(&format!(" gen_best_mcc={best_mcc:.3}"));
+        }
+        if let Some(best_smarts) = progress.generation_best_smarts() {
+            message.push_str(&format!(
+                " gen_best={}",
+                truncate_smarts(best_smarts, self.best_smarts_width)
+            ));
+        }
+        message.push_str(&format!(
+            " incumbent_mcc={:.3} incumbent={}",
+            progress.incumbent_best_mcc(),
+            truncate_smarts(progress.incumbent_best_smarts(), self.best_smarts_width)
         ));
+        self.evaluation_bar.set_message(message);
     }
 
     fn record_generation(&mut self, progress: &EvolutionProgress) {
@@ -107,19 +169,30 @@ impl IndicatifEvolutionProgress {
     }
 
     fn finish(&mut self, result: &TaskResult) {
-        self.evaluation_bar.finish_and_clear();
-        self.generation_bar.finish_with_message(format!(
+        let message = format!(
             "done generations={} best_mcc={:.3} best_smarts={}",
             result.generations(),
             result.best_mcc(),
             truncate_smarts(result.best_smarts(), self.best_smarts_width)
-        ));
+        );
+        if self.clear_on_finish {
+            self.evaluation_bar.finish_and_clear();
+            self.generation_bar.finish_and_clear();
+        } else {
+            self.evaluation_bar.finish_with_message("done");
+            self.generation_bar.finish_with_message(message);
+        }
     }
 
     fn abandon(&mut self, error: &EvolutionError) {
-        self.evaluation_bar.finish_and_clear();
-        self.generation_bar
-            .abandon_with_message(format!("failed: {error}"));
+        if self.clear_on_finish {
+            self.evaluation_bar.finish_and_clear();
+            self.generation_bar.finish_and_clear();
+        } else {
+            self.evaluation_bar.abandon_with_message("failed");
+            self.generation_bar
+                .abandon_with_message(format!("failed: {error}"));
+        }
     }
 
     fn generation_message(&self, progress: &EvolutionProgress) -> String {
@@ -132,6 +205,28 @@ impl IndicatifEvolutionProgress {
             progress.stagnation(),
             truncate_smarts(progress.best_so_far().smarts(), self.best_smarts_width)
         )
+    }
+}
+
+impl EvolutionProgressObserver for IndicatifEvolutionProgress {
+    fn on_start(&mut self, task_id: &str, generation_limit: u64) {
+        self.start(task_id, generation_limit);
+    }
+
+    fn on_evaluation(&mut self, progress: &EvolutionEvaluationProgress) {
+        self.record_evaluation(progress);
+    }
+
+    fn on_generation(&mut self, progress: &EvolutionProgress) {
+        self.record_generation(progress);
+    }
+
+    fn on_finish(&mut self, result: &TaskResult) {
+        self.finish(result);
+    }
+
+    fn on_error(&mut self, error: &EvolutionError) {
+        self.abandon(error);
     }
 }
 
@@ -159,44 +254,51 @@ impl EvolutionTask {
         config: &EvolutionConfig,
         seed_corpus: &SeedCorpus,
         leaderboard_size: usize,
-        mut progress: IndicatifEvolutionProgress,
+        progress: IndicatifEvolutionProgress,
     ) -> Result<TaskResult, EvolutionError> {
-        progress.start(self.task_id(), config.generation_limit());
-        let mut session = match EvolutionSession::new(self, config, seed_corpus, leaderboard_size) {
-            Ok(session) => session,
-            Err(error) => {
-                progress.abandon(&error);
-                return Err(error);
-            }
-        };
+        self.evolve_with_observer(config, seed_corpus, leaderboard_size, progress)
+    }
 
-        while let Some(snapshot) = session
-            .step_with_evaluation_progress(|evaluation| progress.record_evaluation(&evaluation))
-        {
-            progress.record_generation(&snapshot);
-            if session.is_finished() {
-                let result = session.take_result().ok_or_else(|| {
-                    EvolutionError::InvalidConfig(
-                        "finished evolution session did not expose a terminal result".into(),
-                    )
-                })?;
-                progress.finish(&result);
-                return Ok(result);
-            }
-        }
+    /// Evolve this task by moving its folds into the session with default
+    /// terminal progress bars.
+    pub fn evolve_owned_with_indicatif(
+        self,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+    ) -> Result<TaskResult, EvolutionError> {
+        self.evolve_owned_with_indicatif_progress(
+            config,
+            seed_corpus,
+            1,
+            IndicatifEvolutionProgress::new(),
+        )
+    }
 
-        match session.take_result() {
-            Some(result) => {
-                progress.finish(&result);
-                Ok(result)
-            }
-            None => {
-                let error =
-                    EvolutionError::InvalidConfig("evolution session ended unexpectedly".into());
-                progress.abandon(&error);
-                Err(error)
-            }
-        }
+    /// Evolve this task by moving its folds into the session with
+    /// caller-provided indicatif progress bars.
+    pub fn evolve_owned_with_indicatif_progress(
+        self,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+        leaderboard_size: usize,
+        progress: IndicatifEvolutionProgress,
+    ) -> Result<TaskResult, EvolutionError> {
+        self.evolve_owned_with_observer(config, seed_corpus, leaderboard_size, progress)
+    }
+}
+
+impl EvolutionSession {
+    /// Drive this session to completion with default terminal progress bars.
+    pub fn evolve_with_indicatif(self) -> Result<TaskResult, EvolutionError> {
+        self.evolve_with_indicatif_progress(IndicatifEvolutionProgress::new())
+    }
+
+    /// Drive this session to completion with caller-provided indicatif progress bars.
+    pub fn evolve_with_indicatif_progress(
+        self,
+        progress: IndicatifEvolutionProgress,
+    ) -> Result<TaskResult, EvolutionError> {
+        self.evolve_with_observer(progress)
     }
 }
 
@@ -290,5 +392,52 @@ mod tests {
         assert_eq!(result.generations(), 1);
         assert!(result.best_mcc().is_finite());
         assert!(!result.best_smarts().is_empty());
+    }
+
+    #[test]
+    fn owned_and_session_indicatif_methods_accept_caller_bars() {
+        let folds = vec![FoldData::new(vec![
+            sample("CC(=O)N", true),
+            sample("NC(=O)C", true),
+            sample("CCO", false),
+            sample("CCCl", false),
+        ])];
+        let config = EvolutionConfig::builder()
+            .population_size(8)
+            .generation_limit(1)
+            .stagnation_limit(1)
+            .build()
+            .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6](=[#8])[#7]", "[#6]~[#7]", "[#7]"]).unwrap();
+
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let owned_progress = IndicatifEvolutionProgress::from_bars(
+            multi.add(ProgressBar::new(1)),
+            multi.add(ProgressBar::new(1)),
+        )
+        .with_best_smarts_width(16)
+        .with_generation_style(bar_style("{prefix} {pos}/{len} {msg}"))
+        .with_evaluation_style(bar_style("{prefix} {pos}/{len} {msg}"))
+        .with_prefixes("evolution", "SMARTS")
+        .clear_on_finish(true);
+        let owned_result = EvolutionTask::new("owned-indicatif", folds.clone())
+            .evolve_owned_with_indicatif_progress(&config, &seed_corpus, 2, owned_progress)
+            .unwrap();
+
+        let session = EvolutionSession::from_owned_task(
+            EvolutionTask::new("session-indicatif", folds),
+            &config,
+            &seed_corpus,
+            2,
+        )
+        .unwrap();
+        let session_result = session
+            .evolve_with_indicatif_progress(IndicatifEvolutionProgress::attach_to(&multi))
+            .unwrap();
+
+        assert_eq!(owned_result.task_id(), "owned-indicatif");
+        assert_eq!(session_result.task_id(), "session-indicatif");
+        assert!(owned_result.best_mcc().is_finite());
+        assert!(session_result.best_mcc().is_finite());
     }
 }

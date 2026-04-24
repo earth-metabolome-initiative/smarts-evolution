@@ -1,3 +1,4 @@
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -9,6 +10,8 @@ use smarts_rs::{
     CompiledQuery, MatchScratch, PreparedTarget, QueryMol, QueryScreen, TargetCorpusIndex,
     TargetCorpusScratch,
 };
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+use std::sync::Mutex;
 
 use super::mcc::{ConfusionCounts, compute_fold_averaged_mcc};
 use super::objective::ObjectiveFitness;
@@ -50,7 +53,10 @@ impl FoldSample {
     }
 }
 
-/// A single fold's data for MCC evaluation.
+/// A single labeled evaluation set.
+///
+/// The name comes from fold-averaged MCC support. A `FoldData` value does not
+/// imply that the caller is doing cross-validation.
 #[derive(Clone, Debug)]
 pub struct FoldData {
     /// Test-set prepared targets in this fold.
@@ -104,10 +110,103 @@ impl FoldData {
     }
 }
 
+/// Alias for callers that are not modeling cross-validation folds.
+pub type EvaluationSet = FoldData;
+
+/// Alias for callers that use one labeled corpus per task.
+pub type LabeledCorpus = FoldData;
+
 /// Evaluates SMARTS genomes using fold-averaged MCC.
 #[derive(Clone)]
 pub struct SmartsEvaluator {
     folds: Vec<FoldData>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvaluatedSmarts {
+    smarts: String,
+    mcc: f64,
+    complexity: usize,
+}
+
+impl EvaluatedSmarts {
+    fn new(genome: &SmartsGenome, fitness: ObjectiveFitness) -> Self {
+        Self {
+            smarts: genome.smarts().to_string(),
+            mcc: fitness.mcc(),
+            complexity: genome.complexity(),
+        }
+    }
+
+    pub fn smarts(&self) -> &str {
+        &self.smarts
+    }
+
+    pub fn mcc(&self) -> f64 {
+        self.mcc
+    }
+
+    pub fn complexity(&self) -> usize {
+        self.complexity
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvaluationProgress {
+    completed: usize,
+    total: usize,
+    last: Option<EvaluatedSmarts>,
+    best: Option<EvaluatedSmarts>,
+}
+
+impl EvaluationProgress {
+    fn new(
+        completed: usize,
+        total: usize,
+        last: Option<EvaluatedSmarts>,
+        best: Option<EvaluatedSmarts>,
+    ) -> Self {
+        Self {
+            completed,
+            total: total.max(1),
+            last,
+            best,
+        }
+    }
+
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Last evaluated SMARTS. With parallel evaluation this follows completion
+    /// order, not input order.
+    pub fn last(&self) -> Option<&EvaluatedSmarts> {
+        self.last.as_ref()
+    }
+
+    pub fn last_smarts(&self) -> Option<&str> {
+        self.last().map(EvaluatedSmarts::smarts)
+    }
+
+    pub fn last_mcc(&self) -> Option<f64> {
+        self.last().map(EvaluatedSmarts::mcc)
+    }
+
+    pub fn best(&self) -> Option<&EvaluatedSmarts> {
+        self.best.as_ref()
+    }
+
+    pub fn best_smarts(&self) -> Option<&str> {
+        self.best().map(EvaluatedSmarts::smarts)
+    }
+
+    pub fn best_mcc(&self) -> Option<f64> {
+        self.best().map(EvaluatedSmarts::mcc)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,6 +319,65 @@ impl SmartsEvaluator {
             .collect()
     }
 
+    /// Evaluate a batch of genomes and report completion progress.
+    ///
+    /// On std non-wasm targets this keeps the same Rayon path as
+    /// [`Self::evaluate_many`] for large batches. Progress callbacks can arrive
+    /// in completion order rather than input order.
+    pub fn evaluate_many_with_progress(
+        &self,
+        genomes: Vec<SmartsGenome>,
+        mut on_progress: impl FnMut(EvaluationProgress) + Send,
+    ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
+        let total = genomes.len().max(1);
+        if genomes.is_empty() {
+            on_progress(EvaluationProgress::new(0, total, None, None));
+            return Vec::new();
+        }
+
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        if genomes.len() >= MIN_PARALLEL_GENOMES {
+            let progress_state = Mutex::new((0usize, None::<EvaluatedSmarts>, on_progress));
+            return genomes
+                .into_par_iter()
+                .map(|genome| {
+                    let evaluation = self.evaluate(&genome);
+                    let last = EvaluatedSmarts::new(&genome, evaluation.fitness());
+                    let mut progress_state = progress_state.lock().unwrap();
+                    progress_state.0 += 1;
+                    update_best_evaluated(&mut progress_state.1, &last);
+                    let event = EvaluationProgress::new(
+                        progress_state.0,
+                        total,
+                        Some(last),
+                        progress_state.1.clone(),
+                    );
+                    (progress_state.2)(event);
+                    (genome, evaluation)
+                })
+                .collect();
+        }
+
+        let mut completed = 0usize;
+        let mut best = None::<EvaluatedSmarts>;
+        genomes
+            .into_iter()
+            .map(|genome| {
+                let evaluation = self.evaluate(&genome);
+                let last = EvaluatedSmarts::new(&genome, evaluation.fitness());
+                update_best_evaluated(&mut best, &last);
+                completed += 1;
+                on_progress(EvaluationProgress::new(
+                    completed,
+                    total,
+                    Some(last),
+                    best.clone(),
+                ));
+                (genome, evaluation)
+            })
+            .collect()
+    }
+
     pub fn fitness_of_many(
         &self,
         genomes: Vec<SmartsGenome>,
@@ -229,6 +387,23 @@ impl SmartsEvaluator {
             .map(|(genome, evaluation)| (genome, evaluation.fitness()))
             .collect()
     }
+}
+
+fn update_best_evaluated(best: &mut Option<EvaluatedSmarts>, candidate: &EvaluatedSmarts) {
+    let should_update = best
+        .as_ref()
+        .is_none_or(|current| evaluated_is_better(candidate, current));
+    if should_update {
+        *best = Some(candidate.clone());
+    }
+}
+
+fn evaluated_is_better(candidate: &EvaluatedSmarts, current: &EvaluatedSmarts) -> bool {
+    candidate.mcc() > current.mcc()
+        || (candidate.mcc() == current.mcc()
+            && (candidate.smarts().len() < current.smarts().len()
+                || (candidate.smarts().len() == current.smarts().len()
+                    && candidate.smarts() < current.smarts())))
 }
 
 fn count_matches_in_fold(
@@ -306,6 +481,9 @@ mod tests {
         assert_eq!(fold.len(), 2);
         assert!(!fold.is_empty());
         assert!(FoldData::new(Vec::new()).is_empty());
+
+        let _: EvaluationSet = FoldData::new(Vec::new());
+        let _: LabeledCorpus = FoldData::new(Vec::new());
     }
 
     #[test]
@@ -384,6 +562,52 @@ mod tests {
                 left_genome == right_genome && left_eval.fitness() == *right_fitness
             }
         ));
+    }
+
+    #[test]
+    fn evaluate_many_with_progress_matches_batch_results_and_reports_scores() {
+        let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
+            FoldSample::positive(prepared("CN")),
+            FoldSample::positive(prepared("CCN")),
+            FoldSample::negative(prepared("CC")),
+            FoldSample::negative(prepared("CO")),
+        ])]);
+        let genomes = vec![
+            SmartsGenome::from_smarts("[#6]").unwrap(),
+            SmartsGenome::from_smarts("[#7]").unwrap(),
+            SmartsGenome::from_smarts("[#8]").unwrap(),
+            SmartsGenome::from_smarts("[#6]~[#7]").unwrap(),
+            SmartsGenome::from_smarts("[#6]~[#8]").unwrap(),
+            SmartsGenome::from_smarts("[#6]=[#8]").unwrap(),
+            SmartsGenome::from_smarts("[#6]-[#6]").unwrap(),
+            SmartsGenome::from_smarts("[#6]-[#7]").unwrap(),
+        ];
+        let expected = evaluator.evaluate_many(genomes.clone());
+        let mut progress_events = Vec::new();
+
+        let actual = evaluator.evaluate_many_with_progress(genomes, |progress| {
+            progress_events.push(progress);
+        });
+
+        assert_eq!(actual, expected);
+        assert_eq!(progress_events.len(), expected.len());
+        let mut completed = progress_events
+            .iter()
+            .map(EvaluationProgress::completed)
+            .collect::<Vec<_>>();
+        completed.sort_unstable();
+        assert_eq!(completed, (1..=expected.len()).collect::<Vec<_>>());
+        assert!(
+            progress_events
+                .iter()
+                .all(|progress| progress.total() == expected.len()
+                    && progress.last().is_some()
+                    && progress.last_smarts().is_some()
+                    && progress.last_mcc().is_some_and(f64::is_finite)
+                    && progress.best().is_some()
+                    && progress.best_smarts().is_some()
+                    && progress.best_mcc().is_some_and(f64::is_finite))
+        );
     }
 
     #[test]

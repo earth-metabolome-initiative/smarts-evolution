@@ -13,7 +13,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use super::config::EvolutionConfig;
-use crate::fitness::evaluator::{FoldData, GenomeEvaluation, SmartsEvaluator};
+use crate::fitness::evaluator::{EvaluatedSmarts, FoldData, GenomeEvaluation, SmartsEvaluator};
 use crate::fitness::objective::ObjectiveFitness;
 use crate::genome::SmartsGenome;
 use crate::genome::seed::{SeedCorpus, SmartsGenomeBuilder};
@@ -243,7 +243,7 @@ impl EvolutionTask {
         config: &EvolutionConfig,
         seed_corpus: &SeedCorpus,
     ) -> Result<TaskResult, EvolutionError> {
-        self.evolve_with_progress(config, seed_corpus, 1, |_| {})
+        EvolutionSession::new(self, config, seed_corpus, 1)?.evolve()
     }
 
     /// Evolve this task while emitting one snapshot after each scored generation.
@@ -252,24 +252,70 @@ impl EvolutionTask {
         config: &EvolutionConfig,
         seed_corpus: &SeedCorpus,
         leaderboard_size: usize,
-        mut on_progress: impl FnMut(EvolutionProgress),
+        on_progress: impl FnMut(EvolutionProgress),
     ) -> Result<TaskResult, EvolutionError> {
-        let mut session = EvolutionSession::new(self, config, seed_corpus, leaderboard_size)?;
-        while let Some(progress) = session.step() {
-            on_progress(progress);
-            if session.is_finished() {
-                if let Some(result) = session.take_result() {
-                    return Ok(result);
-                }
-                return Err(EvolutionError::InvalidConfig(
-                    "finished evolution session did not expose a terminal result".into(),
-                ));
+        EvolutionSession::new(self, config, seed_corpus, leaderboard_size)?
+            .evolve_with_progress(on_progress)
+    }
+
+    /// Evolve this task while reporting full lifecycle and progress events.
+    pub fn evolve_with_observer(
+        &self,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+        leaderboard_size: usize,
+        mut observer: impl EvolutionProgressObserver + Send,
+    ) -> Result<TaskResult, EvolutionError> {
+        match EvolutionSession::new(self, config, seed_corpus, leaderboard_size) {
+            Ok(session) => session.evolve_with_observer(observer),
+            Err(error) => {
+                observer.on_start(self.task_id(), config.generation_limit());
+                observer.on_error(&error);
+                Err(error)
             }
         }
+    }
 
-        session.take_result().ok_or_else(|| {
-            EvolutionError::InvalidConfig("evolution session ended unexpectedly".into())
-        })
+    /// Evolve this task by moving its folds directly into the session.
+    pub fn evolve_owned(
+        self,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+    ) -> Result<TaskResult, EvolutionError> {
+        EvolutionSession::from_owned_task(self, config, seed_corpus, 1)?.evolve()
+    }
+
+    /// Evolve this task by moving its folds into the session while reporting
+    /// generation snapshots.
+    pub fn evolve_owned_with_progress(
+        self,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+        leaderboard_size: usize,
+        on_progress: impl FnMut(EvolutionProgress),
+    ) -> Result<TaskResult, EvolutionError> {
+        EvolutionSession::from_owned_task(self, config, seed_corpus, leaderboard_size)?
+            .evolve_with_progress(on_progress)
+    }
+
+    /// Evolve this task by moving its folds into the session while reporting
+    /// full lifecycle and progress events.
+    pub fn evolve_owned_with_observer(
+        self,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+        leaderboard_size: usize,
+        mut observer: impl EvolutionProgressObserver + Send,
+    ) -> Result<TaskResult, EvolutionError> {
+        let task_id = self.task_id().to_string();
+        match EvolutionSession::from_owned_task(self, config, seed_corpus, leaderboard_size) {
+            Ok(session) => session.evolve_with_observer(observer),
+            Err(error) => {
+                observer.on_start(&task_id, config.generation_limit());
+                observer.on_error(&error);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -315,11 +361,27 @@ pub struct RankedSmarts {
 
 impl RankedSmarts {
     fn new(genome: &SmartsGenome, fitness: ObjectiveFitness) -> Self {
+        Self::from_parts(
+            genome.smarts().to_string(),
+            fitness.mcc(),
+            genome.complexity(),
+        )
+    }
+
+    fn from_parts(smarts: String, mcc: f64, complexity: usize) -> Self {
         Self {
-            smarts: genome.smarts().to_string(),
-            mcc: fitness.mcc(),
-            complexity: genome.complexity(),
+            smarts,
+            mcc,
+            complexity,
         }
+    }
+
+    fn from_evaluated(evaluated: &EvaluatedSmarts) -> Self {
+        Self::from_parts(
+            evaluated.smarts().to_string(),
+            evaluated.mcc(),
+            evaluated.complexity(),
+        )
     }
 
     pub fn smarts(&self) -> &str {
@@ -363,14 +425,32 @@ pub struct EvolutionProgress {
 }
 
 /// Progress while the current generation is being scored.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EvolutionEvaluationProgress {
     task_id: String,
     generation: u64,
     generation_limit: u64,
     completed: usize,
     total: usize,
+    last: Option<RankedSmarts>,
+    generation_best: Option<RankedSmarts>,
+    incumbent_best: RankedSmarts,
 }
+
+/// Observer for evolution progress without imposing a rendering backend.
+pub trait EvolutionProgressObserver {
+    fn on_start(&mut self, _task_id: &str, _generation_limit: u64) {}
+
+    fn on_evaluation(&mut self, _progress: &EvolutionEvaluationProgress) {}
+
+    fn on_generation(&mut self, _progress: &EvolutionProgress) {}
+
+    fn on_finish(&mut self, _result: &TaskResult) {}
+
+    fn on_error(&mut self, _error: &EvolutionError) {}
+}
+
+impl EvolutionProgressObserver for () {}
 
 struct ProgressSnapshot<'a> {
     task_id: &'a str,
@@ -384,20 +464,28 @@ struct ProgressSnapshot<'a> {
     stagnation: u64,
 }
 
+struct EvaluationProgressSnapshot<'a> {
+    task_id: &'a str,
+    generation: u64,
+    generation_limit: u64,
+    completed: usize,
+    total: usize,
+    last: Option<RankedSmarts>,
+    generation_best: Option<RankedSmarts>,
+    incumbent_best: RankedSmarts,
+}
+
 impl EvolutionEvaluationProgress {
-    fn new(
-        task_id: &str,
-        generation: u64,
-        generation_limit: u64,
-        completed: usize,
-        total: usize,
-    ) -> Self {
+    fn from_snapshot(snapshot: EvaluationProgressSnapshot<'_>) -> Self {
         Self {
-            task_id: task_id.to_string(),
-            generation,
-            generation_limit,
-            completed,
-            total: total.max(1),
+            task_id: snapshot.task_id.to_string(),
+            generation: snapshot.generation,
+            generation_limit: snapshot.generation_limit,
+            completed: snapshot.completed,
+            total: snapshot.total.max(1),
+            last: snapshot.last,
+            generation_best: snapshot.generation_best,
+            incumbent_best: snapshot.incumbent_best,
         }
     }
 
@@ -419,6 +507,44 @@ impl EvolutionEvaluationProgress {
 
     pub fn total(&self) -> usize {
         self.total
+    }
+
+    /// Last evaluated SMARTS. With parallel scoring this follows completion
+    /// order, not input order.
+    pub fn last(&self) -> Option<&RankedSmarts> {
+        self.last.as_ref()
+    }
+
+    pub fn last_smarts(&self) -> Option<&str> {
+        self.last().map(RankedSmarts::smarts)
+    }
+
+    pub fn last_mcc(&self) -> Option<f64> {
+        self.last().map(RankedSmarts::mcc)
+    }
+
+    pub fn generation_best(&self) -> Option<&RankedSmarts> {
+        self.generation_best.as_ref()
+    }
+
+    pub fn generation_best_smarts(&self) -> Option<&str> {
+        self.generation_best().map(RankedSmarts::smarts)
+    }
+
+    pub fn generation_best_mcc(&self) -> Option<f64> {
+        self.generation_best().map(RankedSmarts::mcc)
+    }
+
+    pub fn incumbent_best(&self) -> &RankedSmarts {
+        &self.incumbent_best
+    }
+
+    pub fn incumbent_best_smarts(&self) -> &str {
+        self.incumbent_best.smarts()
+    }
+
+    pub fn incumbent_best_mcc(&self) -> f64 {
+        self.incumbent_best.mcc()
     }
 }
 
@@ -530,25 +656,49 @@ impl EvolutionSession {
         seed_corpus: &SeedCorpus,
         leaderboard_size: usize,
     ) -> Result<Self, EvolutionError> {
+        Self::from_task_parts(
+            task.task_id().to_string(),
+            task.folds().to_vec(),
+            config,
+            seed_corpus,
+            leaderboard_size,
+        )
+    }
+
+    /// Build one resumable evolution session by moving a task's folds into the evaluator.
+    pub fn from_owned_task(
+        task: EvolutionTask,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+        leaderboard_size: usize,
+    ) -> Result<Self, EvolutionError> {
+        let EvolutionTask { task_id, folds } = task;
+        Self::from_task_parts(task_id, folds, config, seed_corpus, leaderboard_size)
+    }
+
+    fn from_task_parts(
+        task_id: String,
+        folds: Vec<FoldData>,
+        config: &EvolutionConfig,
+        seed_corpus: &SeedCorpus,
+        leaderboard_size: usize,
+    ) -> Result<Self, EvolutionError> {
         config.validate().map_err(EvolutionError::InvalidConfig)?;
-        if task.folds().is_empty() {
+        if folds.is_empty() {
             return Err(EvolutionError::EmptyFolds);
         }
-        let total_targets: usize = task.folds().iter().map(FoldData::len).sum();
+        let total_targets: usize = folds.iter().map(FoldData::len).sum();
         if total_targets == 0 {
-            return Err(EvolutionError::NoEvaluationTargets(
-                task.task_id().to_string(),
-            ));
+            return Err(EvolutionError::NoEvaluationTargets(task_id));
         }
+        let fold_count = folds.len();
 
         info!(
             "Evolving task '{}' over {} folds ({} evaluation targets)",
-            task.task_id(),
-            task.folds().len(),
-            total_targets
+            task_id, fold_count, total_targets
         );
 
-        let evaluator = SmartsEvaluator::new(task.folds().to_vec());
+        let evaluator = SmartsEvaluator::new(folds);
         let genome_builder = SmartsGenomeBuilder::new(seed_corpus.clone());
         let mut rng = build_rng(config);
         let population: Vec<SmartsGenome> = (0..config.population_size())
@@ -556,7 +706,7 @@ impl EvolutionSession {
             .collect();
         info!(
             "Built initial population for task '{}' ({} genomes)",
-            task.task_id(),
+            task_id,
             population.len(),
         );
 
@@ -565,7 +715,7 @@ impl EvolutionSession {
         let mutator = SmartsMutation::with_reset_pool(config.mutation_rate(), reset_pool);
 
         Ok(Self {
-            task_id: task.task_id().to_string(),
+            task_id,
             config: config.clone(),
             evaluator,
             genome_builder,
@@ -586,6 +736,78 @@ impl EvolutionSession {
         })
     }
 
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn generation_limit(&self) -> u64 {
+        self.config.generation_limit()
+    }
+
+    /// Drive this session to completion without reporting generation snapshots.
+    pub fn evolve(self) -> Result<TaskResult, EvolutionError> {
+        self.evolve_with_progress(|_| {})
+    }
+
+    /// Drive this session to completion while reporting generation snapshots.
+    pub fn evolve_with_progress(
+        mut self,
+        mut on_progress: impl FnMut(EvolutionProgress),
+    ) -> Result<TaskResult, EvolutionError> {
+        while let Some(progress) = self.step() {
+            on_progress(progress);
+            if self.is_finished() {
+                if let Some(result) = self.take_result() {
+                    return Ok(result);
+                }
+                return Err(EvolutionError::InvalidConfig(
+                    "finished evolution session did not expose a terminal result".into(),
+                ));
+            }
+        }
+
+        self.take_result().ok_or_else(|| {
+            EvolutionError::InvalidConfig("evolution session ended unexpectedly".into())
+        })
+    }
+
+    /// Drive this session to completion while reporting lifecycle and progress events.
+    pub fn evolve_with_observer(
+        mut self,
+        mut observer: impl EvolutionProgressObserver + Send,
+    ) -> Result<TaskResult, EvolutionError> {
+        observer.on_start(self.task_id(), self.generation_limit());
+        while let Some(progress) =
+            self.step_with_evaluation_progress(|evaluation| observer.on_evaluation(&evaluation))
+        {
+            observer.on_generation(&progress);
+            if self.is_finished() {
+                if let Some(result) = self.take_result() {
+                    observer.on_finish(&result);
+                    return Ok(result);
+                }
+                let error = EvolutionError::InvalidConfig(
+                    "finished evolution session did not expose a terminal result".into(),
+                );
+                observer.on_error(&error);
+                return Err(error);
+            }
+        }
+
+        match self.take_result() {
+            Some(result) => {
+                observer.on_finish(&result);
+                Ok(result)
+            }
+            None => {
+                let error =
+                    EvolutionError::InvalidConfig("evolution session ended unexpectedly".into());
+                observer.on_error(&error);
+                Err(error)
+            }
+        }
+    }
+
     /// Advance the search by one scored generation.
     pub fn step(&mut self) -> Option<EvolutionProgress> {
         self.step_internal(None)
@@ -594,14 +816,14 @@ impl EvolutionSession {
     /// Advance the search by one generation and report scoring progress.
     pub fn step_with_evaluation_progress(
         &mut self,
-        mut on_evaluation_progress: impl FnMut(EvolutionEvaluationProgress),
+        mut on_evaluation_progress: impl FnMut(EvolutionEvaluationProgress) + Send,
     ) -> Option<EvolutionProgress> {
         self.step_internal(Some(&mut on_evaluation_progress))
     }
 
     fn step_internal(
         &mut self,
-        mut on_evaluation_progress: Option<&mut dyn FnMut(EvolutionEvaluationProgress)>,
+        mut on_evaluation_progress: Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
     ) -> Option<EvolutionProgress> {
         if self.finished_result.is_some() || self.generation >= self.config.generation_limit() {
             return None;
@@ -612,35 +834,26 @@ impl EvolutionSession {
         let generation_limit = self.config.generation_limit();
         let total_count = self.population.len();
         let evaluation_total = total_count.max(1);
-        let mut evaluation_completed = 0usize;
         let average_complexity = average_complexity(&self.population);
         let mut seen_population = HashSet::with_capacity(total_count);
         let mut duplicate_count = 0usize;
         let mut cache_hits = 0usize;
         let mut unique_population = Vec::with_capacity(total_count);
-
-        emit_evaluation_progress(
-            &self.task_id,
+        let mut evaluation_progress = EvaluationProgressTracker::new(
+            self.task_id.clone(),
             generation_number,
             generation_limit,
-            evaluation_completed,
             evaluation_total,
-            &mut on_evaluation_progress,
+            self.incumbent_best(),
         );
+
+        evaluation_progress.emit(None, &mut on_evaluation_progress);
 
         for genome in self.population.drain(..) {
             let smarts = genome.smarts_shared().clone();
             if !seen_population.insert(smarts.clone()) {
                 duplicate_count += 1;
-                evaluation_completed += 1;
-                emit_evaluation_progress(
-                    &self.task_id,
-                    generation_number,
-                    generation_limit,
-                    evaluation_completed,
-                    evaluation_total,
-                    &mut on_evaluation_progress,
-                );
+                evaluation_progress.record_completed(None, &mut on_evaluation_progress);
                 continue;
             }
 
@@ -654,42 +867,31 @@ impl EvolutionSession {
             let smarts = genome.smarts_shared().clone();
             if let Some((fitness, phenotype)) = self.fitness_cache.get(&smarts) {
                 cache_hits += 1;
+                let ranked = RankedSmarts::new(&genome, fitness);
                 unique_scored.push(ScoredGenome {
                     genome,
                     fitness,
                     phenotype,
                 });
-                evaluation_completed += 1;
-                emit_evaluation_progress(
-                    &self.task_id,
-                    generation_number,
-                    generation_limit,
-                    evaluation_completed,
-                    evaluation_total,
-                    &mut on_evaluation_progress,
-                );
+                evaluation_progress.record_completed(Some(ranked), &mut on_evaluation_progress);
             } else {
                 uncached_genomes.push(genome);
             }
         }
 
         if on_evaluation_progress.is_some() {
-            for genome in uncached_genomes {
-                let evaluation = self.evaluator.evaluate(&genome);
+            let freshly_scored =
+                self.evaluator
+                    .evaluate_many_with_progress(uncached_genomes, |progress| {
+                        let last = progress.last().map(RankedSmarts::from_evaluated);
+                        evaluation_progress.record_completed(last, &mut on_evaluation_progress);
+                    });
+            for (genome, evaluation) in freshly_scored {
                 unique_scored.push(build_scored_genome(
                     &mut self.fitness_cache,
                     genome,
                     evaluation,
                 ));
-                evaluation_completed += 1;
-                emit_evaluation_progress(
-                    &self.task_id,
-                    generation_number,
-                    generation_limit,
-                    evaluation_completed,
-                    evaluation_total,
-                    &mut on_evaluation_progress,
-                );
             }
         } else {
             let freshly_scored = self.evaluator.evaluate_many(uncached_genomes);
@@ -868,25 +1070,94 @@ impl EvolutionSession {
     pub fn take_result(&mut self) -> Option<TaskResult> {
         self.finished_result.take()
     }
+
+    fn incumbent_best(&self) -> RankedSmarts {
+        RankedSmarts::from_parts(
+            self.best_smarts.clone(),
+            self.best_fitness.mcc(),
+            self.best_complexity,
+        )
+    }
 }
 
-fn emit_evaluation_progress(
-    task_id: &str,
+struct EvaluationProgressTracker {
+    task_id: String,
     generation: u64,
     generation_limit: u64,
     completed: usize,
     total: usize,
-    on_evaluation_progress: &mut Option<&mut dyn FnMut(EvolutionEvaluationProgress)>,
-) {
-    if let Some(callback) = on_evaluation_progress.as_deref_mut() {
-        callback(EvolutionEvaluationProgress::new(
+    generation_best: Option<RankedSmarts>,
+    incumbent_best: RankedSmarts,
+}
+
+impl EvaluationProgressTracker {
+    fn new(
+        task_id: String,
+        generation: u64,
+        generation_limit: u64,
+        total: usize,
+        incumbent_best: RankedSmarts,
+    ) -> Self {
+        Self {
             task_id,
             generation,
             generation_limit,
-            completed,
-            total,
-        ));
+            completed: 0,
+            total: total.max(1),
+            generation_best: None,
+            incumbent_best,
+        }
     }
+
+    fn record_completed(
+        &mut self,
+        last: Option<RankedSmarts>,
+        on_evaluation_progress: &mut Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
+    ) {
+        self.completed += 1;
+        if let Some(candidate) = last.as_ref() {
+            update_ranked_best(&mut self.generation_best, candidate);
+        }
+        self.emit(last, on_evaluation_progress);
+    }
+
+    fn emit(
+        &self,
+        last: Option<RankedSmarts>,
+        on_evaluation_progress: &mut Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
+    ) {
+        if let Some(callback) = on_evaluation_progress.as_deref_mut() {
+            callback(EvolutionEvaluationProgress::from_snapshot(
+                EvaluationProgressSnapshot {
+                    task_id: &self.task_id,
+                    generation: self.generation,
+                    generation_limit: self.generation_limit,
+                    completed: self.completed,
+                    total: self.total,
+                    last,
+                    generation_best: self.generation_best.clone(),
+                    incumbent_best: self.incumbent_best.clone(),
+                },
+            ));
+        }
+    }
+}
+
+fn update_ranked_best(best: &mut Option<RankedSmarts>, candidate: &RankedSmarts) {
+    let should_update = best
+        .as_ref()
+        .is_none_or(|current| ranked_is_better(candidate, current));
+    if should_update {
+        *best = Some(candidate.clone());
+    }
+}
+
+fn ranked_is_better(candidate: &RankedSmarts, current: &RankedSmarts) -> bool {
+    candidate.mcc() > current.mcc()
+        || (candidate.mcc() == current.mcc()
+            && (candidate.smarts().len() < current.smarts().len()
+                || (candidate.smarts().len() == current.smarts().len()
+                    && candidate.smarts() < current.smarts())))
 }
 
 fn build_task_result(
@@ -1193,6 +1464,7 @@ fn phenotype_distance(left: &[u64], right: &[u64]) -> u32 {
 #[cfg(test)]
 mod regression_tests {
     use std::str::FromStr;
+    use std::sync::{Arc as StdArc, Mutex};
     use std::vec;
 
     use crate::fitness::evaluator::FoldSample;
@@ -1219,6 +1491,55 @@ mod regression_tests {
 
     fn sample(smiles: &str, is_positive: bool) -> FoldSample {
         FoldSample::new(target(smiles), is_positive)
+    }
+
+    #[derive(Default)]
+    struct RecordedObserverEvents {
+        starts: Vec<(String, u64)>,
+        evaluations: usize,
+        generations: usize,
+        finishes: Vec<String>,
+        errors: Vec<String>,
+    }
+
+    struct RecordingObserver {
+        events: StdArc<Mutex<RecordedObserverEvents>>,
+    }
+
+    impl RecordingObserver {
+        fn new(events: StdArc<Mutex<RecordedObserverEvents>>) -> Self {
+            Self { events }
+        }
+    }
+
+    impl EvolutionProgressObserver for RecordingObserver {
+        fn on_start(&mut self, task_id: &str, generation_limit: u64) {
+            self.events
+                .lock()
+                .unwrap()
+                .starts
+                .push((task_id.to_string(), generation_limit));
+        }
+
+        fn on_evaluation(&mut self, _progress: &EvolutionEvaluationProgress) {
+            self.events.lock().unwrap().evaluations += 1;
+        }
+
+        fn on_generation(&mut self, _progress: &EvolutionProgress) {
+            self.events.lock().unwrap().generations += 1;
+        }
+
+        fn on_finish(&mut self, result: &TaskResult) {
+            self.events
+                .lock()
+                .unwrap()
+                .finishes
+                .push(result.task_id().to_string());
+        }
+
+        fn on_error(&mut self, error: &EvolutionError) {
+            self.events.lock().unwrap().errors.push(error.to_string());
+        }
     }
 
     #[test]
@@ -1298,6 +1619,43 @@ mod regression_tests {
     }
 
     #[test]
+    fn task_evolve_owned_and_owned_session_run_end_to_end() {
+        let folds = vec![FoldData::new(vec![
+            sample("CC(=O)N", true),
+            sample("NC(=O)C", true),
+            sample("CCO", false),
+            sample("CCCl", false),
+        ])];
+        let config = EvolutionConfig::builder()
+            .population_size(8)
+            .generation_limit(2)
+            .stagnation_limit(2)
+            .rng_seed(17)
+            .build()
+            .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6](=[#8])[#7]", "[#6]~[#7]", "[#7]"]).unwrap();
+
+        let task_result = EvolutionTask::new("owned-task", folds.clone())
+            .evolve_owned(&config, &seed_corpus)
+            .unwrap();
+        let session_result = EvolutionSession::from_owned_task(
+            EvolutionTask::new("owned-session", folds),
+            &config,
+            &seed_corpus,
+            2,
+        )
+        .unwrap()
+        .evolve()
+        .unwrap();
+
+        assert_eq!(task_result.task_id(), "owned-task");
+        assert_eq!(session_result.task_id(), "owned-session");
+        assert!(task_result.best_mcc().is_finite());
+        assert!(session_result.best_mcc().is_finite());
+        assert!(!session_result.leaders().is_empty());
+    }
+
+    #[test]
     fn task_evolve_handles_static_population() {
         let task = EvolutionTask {
             task_id: "stagnation".to_string(),
@@ -1372,6 +1730,71 @@ mod regression_tests {
     }
 
     #[test]
+    fn task_evolve_with_observer_reports_lifecycle_events() {
+        let task = EvolutionTask::new(
+            "amide-observer",
+            vec![FoldData::new(vec![
+                sample("CC(=O)N", true),
+                sample("NC(=O)C", true),
+                sample("CCO", false),
+                sample("CCCl", false),
+            ])],
+        );
+        let config = EvolutionConfig::builder()
+            .population_size(8)
+            .generation_limit(2)
+            .stagnation_limit(2)
+            .build()
+            .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6](=[#8])[#7]", "[#6]~[#7]", "[#7]"]).unwrap();
+        let events = StdArc::new(Mutex::new(RecordedObserverEvents::default()));
+
+        let result = task
+            .evolve_with_observer(
+                &config,
+                &seed_corpus,
+                2,
+                RecordingObserver::new(events.clone()),
+            )
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.starts, vec![("amide-observer".to_string(), 2)]);
+        assert!(events.evaluations > 0);
+        assert_eq!(events.generations, result.generations() as usize);
+        assert_eq!(events.finishes, vec!["amide-observer".to_string()]);
+        assert!(events.errors.is_empty());
+    }
+
+    #[test]
+    fn task_evolve_with_observer_reports_setup_errors() {
+        let task = EvolutionTask::new("empty-observer", Vec::new());
+        let config = EvolutionConfig::default();
+        let events = StdArc::new(Mutex::new(RecordedObserverEvents::default()));
+
+        let error = task
+            .evolve_with_observer(
+                &config,
+                &SeedCorpus::builtin(),
+                1,
+                RecordingObserver::new(events.clone()),
+            )
+            .unwrap_err();
+
+        let events = events.lock().unwrap();
+        assert_eq!(error, EvolutionError::EmptyFolds);
+        assert_eq!(
+            events.starts,
+            vec![("empty-observer".to_string(), config.generation_limit())]
+        );
+        assert!(events.finishes.is_empty());
+        assert_eq!(
+            events.errors,
+            vec!["evolution task requires at least one fold".to_string()]
+        );
+    }
+
+    #[test]
     fn evolution_session_reports_within_generation_evaluation_progress() {
         let task = EvolutionTask::new(
             "amide-evaluation-progress",
@@ -1398,21 +1821,44 @@ mod regression_tests {
 
         assert_eq!(progress.generation(), 1);
         assert!(!evaluations.is_empty());
-        assert_eq!(evaluations.first().unwrap().completed(), 0);
+        let first = evaluations.first().unwrap();
+        assert_eq!(first.completed(), 0);
+        assert!(first.last().is_none());
+        assert!(first.generation_best().is_none());
+        assert_eq!(first.incumbent_best_smarts(), "[#6]");
+        assert_eq!(first.incumbent_best_mcc(), -1.0);
+        let mut completed = evaluations
+            .iter()
+            .map(EvolutionEvaluationProgress::completed)
+            .collect::<Vec<_>>();
+        completed.sort_unstable();
         assert_eq!(
-            evaluations.last().unwrap().completed(),
-            config.population_size()
+            completed,
+            (0..=config.population_size()).collect::<Vec<_>>()
         );
-        assert_eq!(
-            evaluations.last().unwrap().total(),
-            config.population_size()
-        );
+        assert!(evaluations.iter().all(|progress| progress.task_id()
+            == "amide-evaluation-progress"
+            && progress.generation() == 1
+            && progress.generation_limit() == 1
+            && progress.total() == config.population_size()));
         assert!(
             evaluations
                 .iter()
-                .all(|progress| progress.task_id() == "amide-evaluation-progress"
-                    && progress.generation() == 1
-                    && progress.generation_limit() == 1)
+                .all(|progress| progress.incumbent_best_smarts() == "[#6]"
+                    && progress.incumbent_best_mcc() == -1.0)
+        );
+        let scored_events = evaluations
+            .iter()
+            .filter(|progress| progress.last().is_some())
+            .collect::<Vec<_>>();
+        assert!(!scored_events.is_empty());
+        assert!(
+            scored_events
+                .iter()
+                .all(|progress| progress.last_smarts().is_some()
+                    && progress.last_mcc().is_some_and(f64::is_finite)
+                    && progress.generation_best_smarts().is_some()
+                    && progress.generation_best_mcc().is_some_and(f64::is_finite))
         );
     }
 
@@ -1654,6 +2100,35 @@ mod regression_tests {
         assert_eq!(progress.lead_complexity(), 4);
         assert_eq!(progress.average_complexity(), 2.5);
         assert_eq!(progress.stagnation(), 2);
+
+        let evaluation_progress =
+            EvolutionEvaluationProgress::from_snapshot(EvaluationProgressSnapshot {
+                task_id: "task-1",
+                generation: 4,
+                generation_limit: 7,
+                completed: 2,
+                total: 5,
+                last: Some(ranked.clone()),
+                generation_best: Some(ranked.clone()),
+                incumbent_best: ranked.clone(),
+            });
+        assert_eq!(evaluation_progress.task_id(), "task-1");
+        assert_eq!(evaluation_progress.generation(), 4);
+        assert_eq!(evaluation_progress.generation_limit(), 7);
+        assert_eq!(evaluation_progress.completed(), 2);
+        assert_eq!(evaluation_progress.total(), 5);
+        assert_eq!(evaluation_progress.last().unwrap().smarts(), "[#6]");
+        assert_eq!(evaluation_progress.last_smarts(), Some("[#6]"));
+        assert_eq!(evaluation_progress.last_mcc(), Some(0.5));
+        assert_eq!(
+            evaluation_progress.generation_best().unwrap().smarts(),
+            "[#6]"
+        );
+        assert_eq!(evaluation_progress.generation_best_smarts(), Some("[#6]"));
+        assert_eq!(evaluation_progress.generation_best_mcc(), Some(0.5));
+        assert_eq!(evaluation_progress.incumbent_best().smarts(), "[#6]");
+        assert_eq!(evaluation_progress.incumbent_best_smarts(), "[#6]");
+        assert_eq!(evaluation_progress.incumbent_best_mcc(), 0.5);
 
         let result =
             build_task_result("task-1", "[#7]".to_string(), fitness(0.75), 4, vec![ranked]);

@@ -14,9 +14,12 @@ pub use evolution::config::{EvolutionConfig, EvolutionConfigBuilder};
 #[cfg(feature = "indicatif")]
 pub use evolution::indicatif::IndicatifEvolutionProgress;
 pub use evolution::runner::{
-    EvolutionError, EvolutionEvaluationProgress, EvolutionProgress, EvolutionSession,
-    EvolutionStatus, EvolutionTask, RankedSmarts, TaskResult,
+    EvolutionError, EvolutionEvaluationProgress, EvolutionProgress, EvolutionProgressObserver,
+    EvolutionSession, EvolutionStatus, EvolutionTask, RankedSmarts, TaskResult,
 };
-pub use fitness::evaluator::{FoldData, FoldSample, SmartsEvaluator};
+pub use fitness::evaluator::{
+    EvaluatedSmarts, EvaluationProgress as SmartsEvaluationProgress, EvaluationSet, FoldData,
+    FoldSample, LabeledCorpus, SmartsEvaluator,
+};
 pub use genome::SmartsGenome;
 pub use genome::seed::SeedCorpus;
