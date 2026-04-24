@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::time::Duration;
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use rayon::prelude::*;
@@ -12,10 +13,15 @@ use smarts_rs::{
 };
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::sync::Mutex;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+use std::time::Instant;
 
 use super::mcc::{ConfusionCounts, compute_fold_averaged_mcc};
 use super::objective::ObjectiveFitness;
 use crate::genome::SmartsGenome;
+use log::debug;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+use log::warn;
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 const MIN_PARALLEL_GENOMES: usize = 8;
@@ -120,6 +126,38 @@ pub type LabeledCorpus = FoldData;
 #[derive(Clone)]
 pub struct SmartsEvaluator {
     folds: Vec<FoldData>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EvaluationLogSettings {
+    task_id: String,
+    generation: u64,
+    fold_count: usize,
+    target_count: usize,
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    slow_log_threshold: Option<Duration>,
+}
+
+impl EvaluationLogSettings {
+    pub(crate) fn new(
+        task_id: String,
+        generation: u64,
+        fold_count: usize,
+        target_count: usize,
+        slow_log_threshold: Option<Duration>,
+    ) -> Self {
+        #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+        let _ = slow_log_threshold;
+
+        Self {
+            task_id,
+            generation,
+            fold_count,
+            target_count,
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+            slow_log_threshold,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -239,6 +277,14 @@ impl SmartsEvaluator {
         Self { folds }
     }
 
+    pub(crate) fn fold_count(&self) -> usize {
+        self.folds.len()
+    }
+
+    pub(crate) fn target_count(&self) -> usize {
+        self.folds.iter().map(FoldData::len).sum()
+    }
+
     fn fold_counts_and_behavior_for_query(
         &self,
         query: &QueryMol,
@@ -293,18 +339,61 @@ impl SmartsEvaluator {
         }
     }
 
+    fn evaluate_with_logging(
+        &self,
+        genome: &SmartsGenome,
+        settings: Option<&EvaluationLogSettings>,
+    ) -> GenomeEvaluation {
+        if let Some(settings) = settings {
+            log_evaluation_start(genome, settings);
+        }
+
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        let started = Instant::now();
+
+        let evaluation = self.evaluate(genome);
+
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        if let Some(settings) = settings {
+            log_slow_evaluation_if_needed(
+                genome,
+                evaluation.fitness(),
+                settings,
+                started.elapsed(),
+            );
+        }
+
+        evaluation
+    }
+
     /// Evaluate a batch of genomes, using Rayon on std targets when the batch
     /// is large enough to amortize scheduling overhead.
     pub fn evaluate_many(
         &self,
         genomes: Vec<SmartsGenome>,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
+        self.evaluate_many_with_optional_logging(genomes, None)
+    }
+
+    pub(crate) fn evaluate_many_with_logging(
+        &self,
+        genomes: Vec<SmartsGenome>,
+        settings: &EvaluationLogSettings,
+    ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
+        self.evaluate_many_with_optional_logging(genomes, Some(settings))
+    }
+
+    fn evaluate_many_with_optional_logging(
+        &self,
+        genomes: Vec<SmartsGenome>,
+        settings: Option<&EvaluationLogSettings>,
+    ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         if genomes.len() >= MIN_PARALLEL_GENOMES {
             return genomes
                 .into_par_iter()
                 .map(|genome| {
-                    let evaluation = self.evaluate(&genome);
+                    let evaluation = self.evaluate_with_logging(&genome, settings);
                     (genome, evaluation)
                 })
                 .collect();
@@ -313,7 +402,7 @@ impl SmartsEvaluator {
         genomes
             .into_iter()
             .map(|genome| {
-                let evaluation = self.evaluate(&genome);
+                let evaluation = self.evaluate_with_logging(&genome, settings);
                 (genome, evaluation)
             })
             .collect()
@@ -327,6 +416,24 @@ impl SmartsEvaluator {
     pub fn evaluate_many_with_progress(
         &self,
         genomes: Vec<SmartsGenome>,
+        on_progress: impl FnMut(EvaluationProgress) + Send,
+    ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
+        self.evaluate_many_with_progress_and_optional_logging(genomes, None, on_progress)
+    }
+
+    pub(crate) fn evaluate_many_with_progress_and_logging(
+        &self,
+        genomes: Vec<SmartsGenome>,
+        settings: &EvaluationLogSettings,
+        on_progress: impl FnMut(EvaluationProgress) + Send,
+    ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
+        self.evaluate_many_with_progress_and_optional_logging(genomes, Some(settings), on_progress)
+    }
+
+    fn evaluate_many_with_progress_and_optional_logging(
+        &self,
+        genomes: Vec<SmartsGenome>,
+        settings: Option<&EvaluationLogSettings>,
         mut on_progress: impl FnMut(EvaluationProgress) + Send,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
         let total = genomes.len().max(1);
@@ -341,7 +448,7 @@ impl SmartsEvaluator {
             return genomes
                 .into_par_iter()
                 .map(|genome| {
-                    let evaluation = self.evaluate(&genome);
+                    let evaluation = self.evaluate_with_logging(&genome, settings);
                     let last = EvaluatedSmarts::new(&genome, evaluation.fitness());
                     let mut progress_state = progress_state.lock().unwrap();
                     progress_state.0 += 1;
@@ -363,7 +470,7 @@ impl SmartsEvaluator {
         genomes
             .into_iter()
             .map(|genome| {
-                let evaluation = self.evaluate(&genome);
+                let evaluation = self.evaluate_with_logging(&genome, settings);
                 let last = EvaluatedSmarts::new(&genome, evaluation.fitness());
                 update_best_evaluated(&mut best, &last);
                 completed += 1;
@@ -387,6 +494,50 @@ impl SmartsEvaluator {
             .map(|(genome, evaluation)| (genome, evaluation.fitness()))
             .collect()
     }
+}
+
+fn log_evaluation_start(genome: &SmartsGenome, settings: &EvaluationLogSettings) {
+    debug!(
+        target: "smarts_evolution::fitness::evaluator",
+        "starting SMARTS evaluation task_id={} generation={} folds={} targets={} complexity={} smarts_len={} smarts={}",
+        settings.task_id,
+        settings.generation,
+        settings.fold_count,
+        settings.target_count,
+        genome.complexity(),
+        genome.smarts().len(),
+        genome.smarts(),
+    );
+}
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+fn log_slow_evaluation_if_needed(
+    genome: &SmartsGenome,
+    fitness: ObjectiveFitness,
+    settings: &EvaluationLogSettings,
+    elapsed: Duration,
+) {
+    let Some(threshold) = settings.slow_log_threshold else {
+        return;
+    };
+    if elapsed < threshold {
+        return;
+    }
+
+    warn!(
+        target: "smarts_evolution::fitness::evaluator",
+        "slow SMARTS evaluation task_id={} generation={} elapsed_ms={} threshold_ms={} folds={} targets={} complexity={} smarts_len={} mcc={:.3} smarts={}",
+        settings.task_id,
+        settings.generation,
+        elapsed.as_millis(),
+        threshold.as_millis(),
+        settings.fold_count,
+        settings.target_count,
+        genome.complexity(),
+        genome.smarts().len(),
+        fitness.mcc(),
+        genome.smarts(),
+    );
 }
 
 fn update_best_evaluated(best: &mut Option<EvaluatedSmarts>, candidate: &EvaluatedSmarts) {

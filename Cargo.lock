@@ -766,7 +766,7 @@ dependencies = [
 [[package]]
 name = "smarts-rs"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#e0e4e1b1337abab9e27f09dfd1cffded00b487a8"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#70b680327cf95bd122f7673fd67c69b83f0d0df5"
 dependencies = [
  "elements_rs",
  "geometric-traits",
