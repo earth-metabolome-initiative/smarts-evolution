@@ -13,6 +13,8 @@ use super::runner::{
 use crate::genome::seed::SeedCorpus;
 
 const DEFAULT_BEST_SMARTS_WIDTH: usize = 96;
+const GENERATION_STYLE_TEMPLATE: &str = "{prefix} [{wide_bar}] {pos}/{len} ETA {eta_precise} {msg}";
+const EVALUATION_STYLE_TEMPLATE: &str = "{prefix} [{wide_bar}] {pos}/{len} SMARTS{msg}";
 
 /// Indicatif-backed progress bars for one evolution run.
 ///
@@ -127,25 +129,11 @@ impl IndicatifEvolutionProgress {
             .set_length(progress.total().max(1) as u64);
         self.evaluation_bar
             .set_position(progress.completed() as u64);
-        let mut message = format!(
-            "generation={}/{} SMARTS={}/{}",
-            progress.generation(),
-            progress.generation_limit(),
-            progress.completed(),
-            progress.total()
+        let message = evaluation_detail_message(
+            progress.last_mcc(),
+            progress.last_smarts(),
+            self.best_smarts_width,
         );
-        if let Some(last_mcc) = progress.last_mcc() {
-            message.push_str(&format!(" current_mcc={last_mcc:.3}"));
-        }
-        if let Some(last_smarts) = progress.last_smarts() {
-            message.push_str(&format!(
-                " current={}",
-                truncate_smarts(last_smarts, self.best_smarts_width)
-            ));
-        }
-        if let Some(best_mcc) = progress.generation_best_mcc() {
-            message.push_str(&format!(" gen_best_mcc={best_mcc:.3}"));
-        }
         self.evaluation_bar.set_message(message);
     }
 
@@ -290,11 +278,11 @@ impl EvolutionSession {
 }
 
 fn generation_style() -> ProgressStyle {
-    bar_style("{prefix} [{wide_bar}] {pos}/{len} ETA {eta_precise} {msg}")
+    bar_style(GENERATION_STYLE_TEMPLATE)
 }
 
 fn evaluation_style() -> ProgressStyle {
-    bar_style("{prefix} [{wide_bar}] {pos}/{len} {msg}")
+    bar_style(EVALUATION_STYLE_TEMPLATE)
 }
 
 fn bar_style(template: &str) -> ProgressStyle {
@@ -311,6 +299,24 @@ fn truncate_smarts(smarts: &str, max_width: usize) -> String {
 
     let prefix: String = smarts.chars().take(max_width.saturating_sub(3)).collect();
     format!("{prefix}...")
+}
+
+fn evaluation_detail_message(
+    last_mcc: Option<f64>,
+    last_smarts: Option<&str>,
+    best_smarts_width: usize,
+) -> String {
+    let mut message = String::new();
+    if let Some(last_mcc) = last_mcc {
+        message.push_str(&format!(" current_mcc={last_mcc:.3}"));
+    }
+    if let Some(last_smarts) = last_smarts {
+        message.push_str(&format!(
+            " current={}",
+            truncate_smarts(last_smarts, best_smarts_width)
+        ));
+    }
+    message
 }
 
 #[cfg(test)]
@@ -337,6 +343,21 @@ mod tests {
         assert_eq!(truncate_smarts("[#6]", 8), "[#6]");
         assert_eq!(truncate_smarts("[#6]~[#7]", 7), "[#6]...");
         assert_eq!(truncate_smarts("[#6]", 1), "...");
+    }
+
+    #[test]
+    fn evaluation_bar_uses_smarts_as_counter_unit_without_message_counter() {
+        assert_eq!(
+            EVALUATION_STYLE_TEMPLATE,
+            "{prefix} [{wide_bar}] {pos}/{len} SMARTS{msg}"
+        );
+        assert!(!EVALUATION_STYLE_TEMPLATE.contains("generation="));
+        assert!(!EVALUATION_STYLE_TEMPLATE.contains("SMARTS="));
+        assert_eq!(evaluation_detail_message(None, None, 16), "");
+        assert_eq!(
+            evaluation_detail_message(Some(0.478), Some("[#7;R&+0:27651]"), 12),
+            " current_mcc=0.478 current=[#7;R&+0:..."
+        );
     }
 
     #[test]
