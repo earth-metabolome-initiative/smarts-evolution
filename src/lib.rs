@@ -8,6 +8,8 @@ extern crate std;
 pub mod evolution;
 pub mod fitness;
 pub mod genome;
+#[cfg(feature = "std")]
+pub mod logging;
 pub mod operators;
 
 pub use evolution::config::{EvolutionConfig, EvolutionConfigBuilder};
@@ -23,3 +25,5 @@ pub use fitness::evaluator::{
 };
 pub use genome::SmartsGenome;
 pub use genome::seed::SeedCorpus;
+#[cfg(feature = "std")]
+pub use logging::{FileLogConfig, FileLogInitError, LevelFilter, init_file_logger};

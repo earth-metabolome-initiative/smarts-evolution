@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = ["std"]
 indicatif = ["std", "dep:indicatif"]
-std = ["dep:rayon"]
+std = ["dep:rayon", "log/std"]
 
 [profile.release]
 opt-level = 3
