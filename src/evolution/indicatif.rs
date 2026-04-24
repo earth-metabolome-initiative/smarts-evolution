@@ -152,11 +152,6 @@ impl IndicatifEvolutionProgress {
                 truncate_smarts(best_smarts, self.best_smarts_width)
             ));
         }
-        message.push_str(&format!(
-            " incumbent_mcc={:.3} incumbent={}",
-            progress.incumbent_best_mcc(),
-            truncate_smarts(progress.incumbent_best_smarts(), self.best_smarts_width)
-        ));
         self.evaluation_bar.set_message(message);
     }
 
