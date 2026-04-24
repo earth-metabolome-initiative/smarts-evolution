@@ -155,6 +155,25 @@ mod tests {
     }
 
     #[test]
+    fn genome_uses_upstream_canonicalization_for_boolean_simplifications() {
+        for (source, expected) in [
+            ("[#6&#6]", "[#6]"),
+            ("[#6;#6]", "[#6]"),
+            ("[#6,#6]", "[#6]"),
+            ("[!#6&!#6]", "[!#6]"),
+            ("[#6,!#6]", "*"),
+            ("[#6&!#6]", "[!*]"),
+            ("[#6]-&~[#7]", "[#6]-[#7]"),
+            ("[$([!!#6;*])]", "[$([#6])]"),
+        ] {
+            let genome = SmartsGenome::from_smarts(source).unwrap();
+
+            assert_eq!(genome.smarts(), expected, "{source}");
+            assert!(genome.query().is_canonical(), "{source}");
+        }
+    }
+
+    #[test]
     fn genome_rejects_queries_past_structural_limit() {
         let over_limit = over_limit_smarts_fixture();
         let genome = SmartsGenome::from_smarts(&over_limit).unwrap();
