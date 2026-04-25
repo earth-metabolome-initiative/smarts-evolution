@@ -326,31 +326,75 @@ impl SmartsMutation {
             .unwrap_or(genome)
     }
 
+    pub(crate) fn mutate_guided<R, F>(
+        &self,
+        genome: SmartsGenome,
+        candidate_count: usize,
+        rng: &mut R,
+        mut select_candidate: F,
+    ) -> SmartsGenome
+    where
+        R: Rng + Sized,
+        F: FnMut(&SmartsGenome, &[SmartsGenome]) -> usize,
+    {
+        if !rng.random_bool(self.mutation_rate) {
+            return genome;
+        }
+
+        let candidate_count = candidate_count.max(1);
+        let mut candidates = Vec::with_capacity(candidate_count);
+
+        if !self.reset_pool.is_empty() && rng.random_bool(self.reset_probability) {
+            candidates.extend(self.mutated_reset_candidates(candidate_count, rng));
+        }
+        if candidates.is_empty() {
+            candidates.extend(self.mutated_candidates(
+                &genome,
+                MutationSource::Parent,
+                candidate_count,
+                rng,
+            ));
+        }
+        if candidates.is_empty() {
+            return genome;
+        }
+
+        let selected = select_candidate(&genome, &candidates).min(candidates.len() - 1);
+        candidates.swap_remove(selected)
+    }
+
     fn mutated_reset_candidate<R>(&self, rng: &mut R) -> Option<SmartsGenome>
     where
         R: Rng + Sized,
     {
+        self.mutated_reset_candidates(1, rng).into_iter().next()
+    }
+
+    fn mutated_reset_candidates<R>(&self, max_candidates: usize, rng: &mut R) -> Vec<SmartsGenome>
+    where
+        R: Rng + Sized,
+    {
+        let mut candidates: Vec<SmartsGenome> = Vec::with_capacity(max_candidates.max(1));
         let mut remaining_budget = self.attempt_budget;
         for restart in 0..RESET_RESTART_ATTEMPTS {
-            if remaining_budget == 0 {
+            if remaining_budget == 0 || candidates.len() >= max_candidates {
                 break;
             }
             let restarts_left = RESET_RESTART_ATTEMPTS - restart;
             let restart_budget = remaining_budget.div_ceil(restarts_left);
             let reset_idx = rng.random_range(0..self.reset_pool.len());
             let reset = &self.reset_pool[reset_idx];
-            if let Some(candidate) = self.mutated_candidate_with_budget(
+            candidates.extend(self.mutated_candidates_with_budget(
                 reset,
                 MutationSource::Reset,
                 restart_budget,
+                max_candidates - candidates.len(),
                 rng,
-            ) {
-                return Some(candidate);
-            }
+            ));
             remaining_budget = remaining_budget.saturating_sub(restart_budget);
         }
 
-        None
+        candidates
     }
 
     fn mutated_candidate<R>(
@@ -362,22 +406,48 @@ impl SmartsMutation {
     where
         R: Rng + Sized,
     {
-        self.mutated_candidate_with_budget(genome, source, self.attempt_budget, rng)
+        self.mutated_candidates(genome, source, 1, rng)
+            .into_iter()
+            .next()
     }
 
-    fn mutated_candidate_with_budget<R>(
+    fn mutated_candidates<R>(
+        &self,
+        genome: &SmartsGenome,
+        source: MutationSource,
+        max_candidates: usize,
+        rng: &mut R,
+    ) -> Vec<SmartsGenome>
+    where
+        R: Rng + Sized,
+    {
+        self.mutated_candidates_with_budget(
+            genome,
+            source,
+            self.attempt_budget,
+            max_candidates,
+            rng,
+        )
+    }
+
+    fn mutated_candidates_with_budget<R>(
         &self,
         genome: &SmartsGenome,
         source: MutationSource,
         attempt_budget: usize,
+        max_candidates: usize,
         rng: &mut R,
-    ) -> Option<SmartsGenome>
+    ) -> Vec<SmartsGenome>
     where
         R: Rng + Sized,
     {
         let mut stats = MutationAttemptStats::default();
+        let mut candidates: Vec<SmartsGenome> = Vec::with_capacity(max_candidates.max(1));
 
         for _ in 0..attempt_budget {
+            if candidates.len() >= max_candidates {
+                break;
+            }
             stats.attempts += 1;
             let mut editable = genome.query().edit();
             let mutation_steps = sample_mutation_steps(self.max_mutation_steps, rng);
@@ -405,12 +475,21 @@ impl SmartsMutation {
                 stats.canonical_noops += 1;
                 continue;
             }
+            if candidates
+                .iter()
+                .any(|existing| existing.smarts() == candidate.smarts())
+            {
+                stats.canonical_noops += 1;
+                continue;
+            }
             stats.log_accepted(source, genome, &candidate);
-            return Some(candidate);
+            candidates.push(candidate);
         }
 
-        stats.log_rejected(source, genome);
-        None
+        if candidates.is_empty() {
+            stats.log_rejected(source, genome);
+        }
+        candidates
     }
 }
 

@@ -284,6 +284,35 @@ impl EvaluationProgress {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScreeningProxyFitness {
+    mcc: f64,
+    positive_candidates: u64,
+    negative_candidates: u64,
+}
+
+impl ScreeningProxyFitness {
+    fn new(mcc: f64, positive_candidates: u64, negative_candidates: u64) -> Self {
+        Self {
+            mcc,
+            positive_candidates,
+            negative_candidates,
+        }
+    }
+
+    pub(crate) fn mcc(self) -> f64 {
+        self.mcc
+    }
+
+    pub(crate) fn positive_candidates(self) -> u64 {
+        self.positive_candidates
+    }
+
+    pub(crate) fn negative_candidates(self) -> u64 {
+        self.negative_candidates
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenomeEvaluation {
     fitness: ObjectiveFitness,
@@ -370,6 +399,45 @@ impl SmartsEvaluator {
 
     pub fn fitness_of(&self, genome: &SmartsGenome) -> ObjectiveFitness {
         self.objective_of(genome)
+    }
+
+    pub(crate) fn screening_proxy_of(&self, genome: &SmartsGenome) -> ScreeningProxyFitness {
+        let screen = QueryScreen::new(genome.query());
+        let mut fold_counts = Vec::with_capacity(self.folds.len());
+        let mut positive_candidates = 0u64;
+        let mut negative_candidates = 0u64;
+
+        for fold in &self.folds {
+            let mut candidates = Vec::new();
+            let mut scratch = TargetCorpusScratch::new();
+            fold.index()
+                .candidate_ids_with_scratch_into(&screen, &mut scratch, &mut candidates);
+
+            let mut true_positives = 0u64;
+            let mut false_positives = 0u64;
+            for target_id in candidates {
+                if fold.samples()[target_id].is_positive() {
+                    true_positives += 1;
+                } else {
+                    false_positives += 1;
+                }
+            }
+
+            positive_candidates += true_positives;
+            negative_candidates += false_positives;
+            fold_counts.push(ConfusionCounts::new(
+                true_positives,
+                false_positives,
+                fold.negative_count() as u64 - false_positives,
+                fold.positive_count() as u64 - true_positives,
+            ));
+        }
+
+        ScreeningProxyFitness::new(
+            compute_fold_averaged_mcc(&fold_counts),
+            positive_candidates,
+            negative_candidates,
+        )
     }
 
     pub fn evaluate(&self, genome: &SmartsGenome) -> GenomeEvaluation {
@@ -922,6 +990,27 @@ mod tests {
         let via_trait = evaluator.fitness_of(&genome);
         let direct = evaluator.objective_of(&genome);
         assert!((via_trait.mcc() - direct.mcc()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn screening_proxy_counts_indexed_positive_and_negative_candidates() {
+        let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
+            sample("CN", true),
+            sample("CO", true),
+            sample("CC", false),
+            sample("OO", false),
+        ])]);
+        let nitrogen = SmartsGenome::from_smarts("[#7]").unwrap();
+        let sulfur = SmartsGenome::from_smarts("[#16]").unwrap();
+
+        let nitrogen_proxy = evaluator.screening_proxy_of(&nitrogen);
+        let sulfur_proxy = evaluator.screening_proxy_of(&sulfur);
+
+        assert_eq!(nitrogen_proxy.positive_candidates(), 1);
+        assert_eq!(nitrogen_proxy.negative_candidates(), 0);
+        assert!(nitrogen_proxy.mcc() > 0.0);
+        assert_eq!(sulfur_proxy.positive_candidates(), 0);
+        assert_eq!(sulfur_proxy.negative_candidates(), 0);
     }
 
     #[test]

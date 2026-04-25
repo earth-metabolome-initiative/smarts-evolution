@@ -14,7 +14,8 @@ use rand::rngs::SmallRng;
 
 use super::config::EvolutionConfig;
 use crate::fitness::evaluator::{
-    EvaluatedSmarts, EvaluationLogSettings, FoldData, GenomeEvaluation, SmartsEvaluator,
+    EvaluatedSmarts, EvaluationLogSettings, FoldData, GenomeEvaluation, ScreeningProxyFitness,
+    SmartsEvaluator,
 };
 use crate::fitness::objective::ObjectiveFitness;
 use crate::genome::SmartsGenome;
@@ -24,6 +25,7 @@ use crate::operators::mutation::SmartsMutation;
 
 const RESET_POOL_SIZE: usize = 32;
 const DIVERSE_ELITE_POOL_FACTOR: usize = 4;
+const GUIDED_MUTATION_PROPOSAL_COUNT: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvolutionError {
@@ -1232,11 +1234,13 @@ impl EvolutionSession {
             pi += 2;
 
             let (child_a, child_b) = self.crossover.crossover_pair(p1, p2, &mut self.rng);
-            offspring.push(self.mutator.mutate(child_a, &mut self.rng));
+            let child_a = self.mutate_offspring(child_a);
+            offspring.push(child_a);
             if offspring.len() >= self.config.population_size() {
                 break;
             }
-            offspring.push(self.mutator.mutate(child_b, &mut self.rng));
+            let child_b = self.mutate_offspring(child_b);
+            offspring.push(child_b);
         }
 
         let elite_count = self
@@ -1264,6 +1268,16 @@ impl EvolutionSession {
                 genome
             },
         );
+    }
+
+    fn mutate_offspring(&mut self, genome: SmartsGenome) -> SmartsGenome {
+        let evaluator = &self.evaluator;
+        self.mutator.mutate_guided(
+            genome,
+            GUIDED_MUTATION_PROPOSAL_COUNT,
+            &mut self.rng,
+            |_, candidates| select_screened_mutation_candidate(evaluator, candidates),
+        )
     }
 
     /// Returns true once the session has reached a terminal state.
@@ -1604,6 +1618,48 @@ fn is_better_candidate(
         || (candidate_fitness == best_fitness
             && (candidate.smarts_len() < best_smarts_len
                 || (candidate.smarts_len() == best_smarts_len && candidate.smarts() < best_smarts)))
+}
+
+fn select_screened_mutation_candidate(
+    evaluator: &SmartsEvaluator,
+    candidates: &[SmartsGenome],
+) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_score = evaluator.screening_proxy_of(&candidates[0]);
+    for (idx, candidate) in candidates.iter().enumerate().skip(1) {
+        let score = evaluator.screening_proxy_of(candidate);
+        if screened_mutation_candidate_is_better(
+            candidate,
+            score,
+            &candidates[best_idx],
+            best_score,
+        ) {
+            best_idx = idx;
+            best_score = score;
+        }
+    }
+    best_idx
+}
+
+fn screened_mutation_candidate_is_better(
+    candidate: &SmartsGenome,
+    candidate_score: ScreeningProxyFitness,
+    current: &SmartsGenome,
+    current_score: ScreeningProxyFitness,
+) -> bool {
+    let candidate_hits_positive = candidate_score.positive_candidates() > 0;
+    let current_hits_positive = current_score.positive_candidates() > 0;
+    if candidate_hits_positive != current_hits_positive {
+        return candidate_hits_positive;
+    }
+
+    candidate_score.mcc() > current_score.mcc()
+        || (candidate_score.mcc() == current_score.mcc()
+            && (candidate_score.negative_candidates() < current_score.negative_candidates()
+                || (candidate_score.negative_candidates() == current_score.negative_candidates()
+                    && (candidate.smarts_len() < current.smarts_len()
+                        || (candidate.smarts_len() == current.smarts_len()
+                            && candidate.smarts() < current.smarts())))))
 }
 
 fn tournament_select(
@@ -2466,6 +2522,25 @@ mod regression_tests {
         assert!(select_diverse_elites(&[], 2).is_empty());
         assert!(select_diverse_elites(&[scored("[#6]", 0.8, &[0b1])], 0).is_empty());
         assert_eq!(phenotype_distance(&[0b1010], &[0b0011]), 2);
+    }
+
+    #[test]
+    fn screened_mutation_selector_prefers_positive_enriched_candidates() {
+        let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
+            sample("CN", true),
+            sample("CCN", true),
+            sample("CC", false),
+            sample("CO", false),
+        ])]);
+        let candidates = vec![
+            SmartsGenome::from_smarts("[#16]").unwrap(),
+            SmartsGenome::from_smarts("[#6]").unwrap(),
+            SmartsGenome::from_smarts("[#7]").unwrap(),
+        ];
+
+        let selected = select_screened_mutation_candidate(&evaluator, &candidates);
+
+        assert_eq!(candidates[selected].smarts(), "[#7]");
     }
 
     #[test]
