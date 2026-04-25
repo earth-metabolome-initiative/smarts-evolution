@@ -97,6 +97,14 @@ impl MutationSource {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum MutationDirection {
+    #[default]
+    Balanced,
+    Generalize,
+    Specialize,
+}
+
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MutationOperator {
@@ -135,21 +143,46 @@ impl MutationOperator {
         self as usize
     }
 
-    fn weight(self, near_smarts_len_limit: bool) -> u32 {
-        match self {
-            Self::AtomConstraints => length_sensitive_weight(near_smarts_len_limit, 10, 12),
-            Self::AtomRefinement => length_sensitive_weight(near_smarts_len_limit, 18, 11),
-            Self::AtomMap => 1,
-            Self::RecursiveQuery => length_sensitive_weight(near_smarts_len_limit, 2, 10),
-            Self::AttachLeafAtom => length_sensitive_weight(near_smarts_len_limit, 2, 13),
-            Self::InsertAtomOnBond => length_sensitive_weight(near_smarts_len_limit, 1, 9),
-            Self::RemoveLeafAtom => length_sensitive_weight(near_smarts_len_limit, 22, 10),
-            Self::BondConstraints => 12,
-            Self::RingEdit => 8,
-            Self::ComponentEdit => length_sensitive_weight(near_smarts_len_limit, 3, 7),
-            Self::ToggleAtomNot => 5,
-            Self::GraftSeedFragment => length_sensitive_weight(near_smarts_len_limit, 0, 2),
-        }
+    fn weight(self, near_smarts_len_limit: bool, direction: MutationDirection) -> u32 {
+        let (near_limit, normal) = match (direction, self) {
+            (_, Self::AtomMap) => return 1,
+            (MutationDirection::Balanced, Self::AtomConstraints) => (10, 12),
+            (MutationDirection::Balanced, Self::AtomRefinement) => (18, 11),
+            (MutationDirection::Balanced, Self::RecursiveQuery) => (2, 10),
+            (MutationDirection::Balanced, Self::AttachLeafAtom) => (2, 13),
+            (MutationDirection::Balanced, Self::InsertAtomOnBond) => (1, 9),
+            (MutationDirection::Balanced, Self::RemoveLeafAtom) => (22, 10),
+            (MutationDirection::Balanced, Self::BondConstraints) => (12, 12),
+            (MutationDirection::Balanced, Self::RingEdit) => (8, 8),
+            (MutationDirection::Balanced, Self::ComponentEdit) => (3, 7),
+            (MutationDirection::Balanced, Self::ToggleAtomNot) => (5, 5),
+            (MutationDirection::Balanced, Self::GraftSeedFragment) => (0, 2),
+
+            (MutationDirection::Generalize, Self::AtomConstraints) => (12, 8),
+            (MutationDirection::Generalize, Self::AtomRefinement) => (24, 22),
+            (MutationDirection::Generalize, Self::RecursiveQuery) => (1, 2),
+            (MutationDirection::Generalize, Self::AttachLeafAtom) => (1, 2),
+            (MutationDirection::Generalize, Self::InsertAtomOnBond) => (1, 2),
+            (MutationDirection::Generalize, Self::RemoveLeafAtom) => (24, 20),
+            (MutationDirection::Generalize, Self::BondConstraints) => (8, 8),
+            (MutationDirection::Generalize, Self::RingEdit) => (10, 10),
+            (MutationDirection::Generalize, Self::ComponentEdit) => (4, 4),
+            (MutationDirection::Generalize, Self::ToggleAtomNot) => (2, 2),
+            (MutationDirection::Generalize, Self::GraftSeedFragment) => (0, 1),
+
+            (MutationDirection::Specialize, Self::AtomConstraints) => (10, 18),
+            (MutationDirection::Specialize, Self::AtomRefinement) => (18, 16),
+            (MutationDirection::Specialize, Self::RecursiveQuery) => (2, 8),
+            (MutationDirection::Specialize, Self::AttachLeafAtom) => (2, 8),
+            (MutationDirection::Specialize, Self::InsertAtomOnBond) => (1, 5),
+            (MutationDirection::Specialize, Self::RemoveLeafAtom) => (22, 4),
+            (MutationDirection::Specialize, Self::BondConstraints) => (12, 18),
+            (MutationDirection::Specialize, Self::RingEdit) => (8, 8),
+            (MutationDirection::Specialize, Self::ComponentEdit) => (3, 4),
+            (MutationDirection::Specialize, Self::ToggleAtomNot) => (5, 5),
+            (MutationDirection::Specialize, Self::GraftSeedFragment) => (0, 6),
+        };
+        length_sensitive_weight(near_smarts_len_limit, near_limit, normal)
     }
 
     fn is_eligible(
@@ -181,13 +214,16 @@ impl MutationOperator {
         reset_pool: &[SmartsGenome],
         rng: &mut R,
         recursive_depth: usize,
+        direction: MutationDirection,
     ) -> bool {
         match self {
             Self::AtomConstraints => mutate_atom_constraints(editable, rng, recursive_depth),
-            Self::AtomRefinement => generalize_specialize_atom(editable, rng, recursive_depth),
+            Self::AtomRefinement => {
+                generalize_specialize_atom(editable, rng, recursive_depth, direction)
+            }
             Self::AtomMap => mutate_atom_map(editable, rng),
             Self::RecursiveQuery => {
-                mutate_recursive_query(editable, reset_pool, rng, recursive_depth)
+                mutate_recursive_query(editable, reset_pool, rng, recursive_depth, direction)
             }
             Self::AttachLeafAtom => attach_leaf_atom(editable, rng),
             Self::InsertAtomOnBond => insert_atom_on_bond(editable, rng),
@@ -322,14 +358,20 @@ impl SmartsMutation {
             return candidate;
         }
 
-        self.mutated_candidate(&genome, MutationSource::Parent, rng)
-            .unwrap_or(genome)
+        self.mutated_candidate(
+            &genome,
+            MutationSource::Parent,
+            MutationDirection::Balanced,
+            rng,
+        )
+        .unwrap_or(genome)
     }
 
     pub(crate) fn mutate_guided<R, F>(
         &self,
         genome: SmartsGenome,
         candidate_count: usize,
+        direction: MutationDirection,
         rng: &mut R,
         mut select_candidate: F,
     ) -> SmartsGenome
@@ -351,6 +393,7 @@ impl SmartsMutation {
             candidates.extend(self.mutated_candidates(
                 &genome,
                 MutationSource::Parent,
+                direction,
                 candidate_count,
                 rng,
             ));
@@ -387,6 +430,7 @@ impl SmartsMutation {
             candidates.extend(self.mutated_candidates_with_budget(
                 reset,
                 MutationSource::Reset,
+                MutationDirection::Balanced,
                 restart_budget,
                 max_candidates - candidates.len(),
                 rng,
@@ -401,12 +445,13 @@ impl SmartsMutation {
         &self,
         genome: &SmartsGenome,
         source: MutationSource,
+        direction: MutationDirection,
         rng: &mut R,
     ) -> Option<SmartsGenome>
     where
         R: Rng + Sized,
     {
-        self.mutated_candidates(genome, source, 1, rng)
+        self.mutated_candidates(genome, source, direction, 1, rng)
             .into_iter()
             .next()
     }
@@ -415,6 +460,7 @@ impl SmartsMutation {
         &self,
         genome: &SmartsGenome,
         source: MutationSource,
+        direction: MutationDirection,
         max_candidates: usize,
         rng: &mut R,
     ) -> Vec<SmartsGenome>
@@ -424,6 +470,7 @@ impl SmartsMutation {
         self.mutated_candidates_with_budget(
             genome,
             source,
+            direction,
             self.attempt_budget,
             max_candidates,
             rng,
@@ -434,6 +481,7 @@ impl SmartsMutation {
         &self,
         genome: &SmartsGenome,
         source: MutationSource,
+        direction: MutationDirection,
         attempt_budget: usize,
         max_candidates: usize,
         rng: &mut R,
@@ -454,7 +502,8 @@ impl SmartsMutation {
             let mut mutated = false;
 
             for _ in 0..mutation_steps {
-                let edit = apply_random_mutation(&mut editable, &self.reset_pool, rng, 0);
+                let edit =
+                    apply_random_mutation(&mut editable, &self.reset_pool, rng, 0, direction);
                 stats.record_edit(edit);
                 mutated |= edit.changed;
             }
@@ -517,10 +566,16 @@ fn apply_random_mutation<R: Rng>(
     reset_pool: &[SmartsGenome],
     rng: &mut R,
     recursive_depth: usize,
+    direction: MutationDirection,
 ) -> MutationEdit {
-    let operator =
-        sample_mutation_operator(editable.as_query_mol(), reset_pool, rng, recursive_depth);
-    let changed = operator.apply(editable, reset_pool, rng, recursive_depth);
+    let operator = sample_mutation_operator(
+        editable.as_query_mol(),
+        reset_pool,
+        rng,
+        recursive_depth,
+        direction,
+    );
+    let changed = operator.apply(editable, reset_pool, rng, recursive_depth, direction);
 
     MutationEdit { operator, changed }
 }
@@ -530,6 +585,7 @@ fn sample_mutation_operator<R: Rng>(
     reset_pool: &[SmartsGenome],
     rng: &mut R,
     recursive_depth: usize,
+    direction: MutationDirection,
 ) -> MutationOperator {
     let near_smarts_len_limit = is_near_smarts_len_limit(query);
     let total_weight = MutationOperator::ALL
@@ -541,6 +597,7 @@ fn sample_mutation_operator<R: Rng>(
                 reset_pool,
                 recursive_depth,
                 near_smarts_len_limit,
+                direction,
             )
         })
         .sum();
@@ -557,6 +614,7 @@ fn sample_mutation_operator<R: Rng>(
             reset_pool,
             recursive_depth,
             near_smarts_len_limit,
+            direction,
         );
         if roll < weight {
             return operator;
@@ -577,9 +635,10 @@ fn operator_weight(
     reset_pool: &[SmartsGenome],
     recursive_depth: usize,
     near_smarts_len_limit: bool,
+    direction: MutationDirection,
 ) -> u32 {
     if operator.is_eligible(query, reset_pool, recursive_depth) {
-        operator.weight(near_smarts_len_limit)
+        operator.weight(near_smarts_len_limit, direction)
     } else {
         0
     }
@@ -729,6 +788,7 @@ fn generalize_specialize_atom<R: Rng>(
     editable: &mut EditableQueryMol,
     rng: &mut R,
     recursive_depth: usize,
+    direction: MutationDirection,
 ) -> bool {
     let (atom_id, atom_expr) = random_atom(editable, rng);
 
@@ -744,7 +804,12 @@ fn generalize_specialize_atom<R: Rng>(
     let Some(BracketExprTree::Primitive(current)) = expr.tree.get(path) else {
         return false;
     };
-    let replacement = if rng.random_bool(0.5) {
+    let should_generalize = match direction {
+        MutationDirection::Balanced => rng.random_bool(0.5),
+        MutationDirection::Generalize => rng.random_bool(0.80),
+        MutationDirection::Specialize => rng.random_bool(0.20),
+    };
+    let replacement = if should_generalize {
         generalize_atom_primitive(current, rng, recursive_depth)
     } else {
         specialize_atom_primitive(current, rng, recursive_depth)
@@ -777,6 +842,7 @@ fn mutate_recursive_query<R: Rng>(
     reset_pool: &[SmartsGenome],
     rng: &mut R,
     recursive_depth: usize,
+    direction: MutationDirection,
 ) -> bool {
     if recursive_depth >= MAX_RECURSIVE_QUERY_DEPTH {
         return false;
@@ -845,7 +911,9 @@ fn mutate_recursive_query<R: Rng>(
         }
     } else {
         let mut nested = inner.edit();
-        if !apply_random_mutation(&mut nested, reset_pool, rng, recursive_depth + 1).changed {
+        if !apply_random_mutation(&mut nested, reset_pool, rng, recursive_depth + 1, direction)
+            .changed
+        {
             false
         } else {
             let Ok(query) = nested.into_query_mol() else {
@@ -1649,7 +1717,13 @@ fn random_recursive_query<R: Rng>(rng: &mut R, recursive_depth: usize) -> QueryM
     let mut query = query_from_known_valid_smarts(smarts);
     if recursive_depth < MAX_RECURSIVE_QUERY_DEPTH && rng.random_bool(0.35) {
         let mut editable = query.edit();
-        let edit = apply_random_mutation(&mut editable, &[], rng, recursive_depth);
+        let edit = apply_random_mutation(
+            &mut editable,
+            &[],
+            rng,
+            recursive_depth,
+            MutationDirection::Balanced,
+        );
         if edit.changed
             && let Ok(candidate) = editable.into_query_mol()
             && genome_from_query(&candidate).is_some()
@@ -1756,19 +1830,34 @@ mod tests {
 
         for (index, operator) in MutationOperator::ALL.iter().copied().enumerate() {
             assert_eq!(operator.as_index(), index);
-            assert!(operator.weight(false) <= 22);
-            assert!(operator.weight(true) <= 22);
+            assert!(operator.weight(false, MutationDirection::Balanced) <= 22);
+            assert!(operator.weight(true, MutationDirection::Balanced) <= 22);
         }
 
         assert!(
-            MutationOperator::AtomRefinement.weight(true)
-                > MutationOperator::AtomRefinement.weight(false)
+            MutationOperator::AtomRefinement.weight(true, MutationDirection::Balanced)
+                > MutationOperator::AtomRefinement.weight(false, MutationDirection::Balanced)
         );
         assert!(
-            MutationOperator::RemoveLeafAtom.weight(true)
-                > MutationOperator::RemoveLeafAtom.weight(false)
+            MutationOperator::RemoveLeafAtom.weight(true, MutationDirection::Balanced)
+                > MutationOperator::RemoveLeafAtom.weight(false, MutationDirection::Balanced)
         );
-        assert_eq!(MutationOperator::GraftSeedFragment.weight(true), 0);
+        assert_eq!(
+            MutationOperator::GraftSeedFragment.weight(true, MutationDirection::Balanced),
+            0
+        );
+        assert!(
+            MutationOperator::AtomRefinement.weight(false, MutationDirection::Generalize)
+                > MutationOperator::AtomRefinement.weight(false, MutationDirection::Balanced)
+        );
+        assert!(
+            MutationOperator::BondConstraints.weight(false, MutationDirection::Specialize)
+                > MutationOperator::BondConstraints.weight(false, MutationDirection::Balanced)
+        );
+        assert!(
+            MutationOperator::RemoveLeafAtom.weight(false, MutationDirection::Generalize)
+                > MutationOperator::RemoveLeafAtom.weight(false, MutationDirection::Specialize)
+        );
 
         let single_atom = QueryMol::from_str("C").unwrap();
         let mapped_atom = QueryMol::from_str("[#6:1]").unwrap();
@@ -1798,12 +1887,26 @@ mod tests {
         assert!(MutationOperator::GraftSeedFragment.is_eligible(&single_atom, &reset_pool, 0));
 
         assert_eq!(
-            operator_weight(MutationOperator::AtomMap, &single_atom, &[], 0, false),
+            operator_weight(
+                MutationOperator::AtomMap,
+                &single_atom,
+                &[],
+                0,
+                false,
+                MutationDirection::Balanced,
+            ),
             0
         );
         assert_eq!(
-            operator_weight(MutationOperator::AtomMap, &mapped_atom, &[], 0, false),
-            MutationOperator::AtomMap.weight(false)
+            operator_weight(
+                MutationOperator::AtomMap,
+                &mapped_atom,
+                &[],
+                0,
+                false,
+                MutationDirection::Balanced,
+            ),
+            MutationOperator::AtomMap.weight(false, MutationDirection::Balanced)
         );
         assert_eq!(
             operator_weight(
@@ -1812,6 +1915,7 @@ mod tests {
                 &reset_pool,
                 0,
                 true,
+                MutationDirection::Balanced,
             ),
             0
         );
@@ -1878,11 +1982,16 @@ mod tests {
             let changed = (0..16).any(|seed| {
                 let mut editable = QueryMol::from_str(smarts).unwrap().edit();
                 let mut rng = SmallRng::seed_from_u64(seed);
-                operator.apply(&mut editable, &reset_pool, &mut rng, 0)
-                    && editable
-                        .into_query_mol()
-                        .map(|query| SmartsGenome::from_query_mol(&query).is_valid())
-                        .unwrap_or(false)
+                operator.apply(
+                    &mut editable,
+                    &reset_pool,
+                    &mut rng,
+                    0,
+                    MutationDirection::Balanced,
+                ) && editable
+                    .into_query_mol()
+                    .map(|query| SmartsGenome::from_query_mol(&query).is_valid())
+                    .unwrap_or(false)
             });
 
             assert!(changed, "{operator:?} did not produce a valid change");
@@ -1895,7 +2004,8 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(80);
 
         for _ in 0..512 {
-            let operator = sample_mutation_operator(&query, &[], &mut rng, 0);
+            let operator =
+                sample_mutation_operator(&query, &[], &mut rng, 0, MutationDirection::Balanced);
             assert!(!matches!(
                 operator,
                 MutationOperator::AtomMap
@@ -1917,7 +2027,7 @@ mod tests {
 
         for _ in 0..4096 {
             if matches!(
-                sample_mutation_operator(&query, &[], &mut rng, 0),
+                sample_mutation_operator(&query, &[], &mut rng, 0, MutationDirection::Balanced),
                 MutationOperator::AtomMap
             ) {
                 saw_atom_map = true;
@@ -1936,7 +2046,13 @@ mod tests {
 
         for _ in 0..512 {
             assert!(!matches!(
-                sample_mutation_operator(&over_limit, &reset_pool, &mut rng, 0),
+                sample_mutation_operator(
+                    &over_limit,
+                    &reset_pool,
+                    &mut rng,
+                    0,
+                    MutationDirection::Balanced,
+                ),
                 MutationOperator::GraftSeedFragment
             ));
         }
@@ -1981,6 +2097,7 @@ mod tests {
             &mut editable,
             &mut SmallRng::seed_from_u64(4),
             0,
+            MutationDirection::Balanced,
         ));
 
         let mut editable = query.edit();
@@ -2019,6 +2136,7 @@ mod tests {
                 &mut editable,
                 &mut SmallRng::seed_from_u64(seed),
                 0,
+                MutationDirection::Balanced,
             ));
             let refined = editable.into_query_mol().unwrap();
 
@@ -2124,7 +2242,8 @@ mod tests {
             &mut editable,
             &[],
             &mut SmallRng::seed_from_u64(55),
-            0
+            0,
+            MutationDirection::Balanced,
         ));
         let query = editable.into_query_mol().unwrap();
         assert!(query.to_string().contains("$("));
@@ -2232,6 +2351,7 @@ mod tests {
             &[],
             &mut SmallRng::seed_from_u64(100),
             MAX_RECURSIVE_QUERY_DEPTH,
+            MutationDirection::Balanced,
         ));
 
         let mut editable = QueryMol::from_str("C").unwrap().edit();

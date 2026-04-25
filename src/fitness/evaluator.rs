@@ -440,6 +440,18 @@ impl SmartsEvaluator {
         )
     }
 
+    pub(crate) fn confusion_for_phenotype(&self, phenotype: &[u64]) -> ConfusionCounts {
+        let mut counts = ConfusionCounts::default();
+        let mut bit_index = 0usize;
+        for fold in &self.folds {
+            for sample in fold.samples() {
+                counts.record_match(phenotype_bit(phenotype, bit_index), sample.is_positive());
+                bit_index += 1;
+            }
+        }
+        counts
+    }
+
     pub fn evaluate(&self, genome: &SmartsGenome) -> GenomeEvaluation {
         self.evaluate_with_limit(genome, EvaluationMatchLimit::None)
     }
@@ -915,6 +927,14 @@ fn record_behavior_match(behavior_words: &mut [u64], bit_index: usize, matched: 
     behavior_words[word_index] |= 1u64 << bit_offset;
 }
 
+fn phenotype_bit(phenotype: &[u64], bit_index: usize) -> bool {
+    let word_index = bit_index / 64;
+    let bit_offset = bit_index % 64;
+    phenotype
+        .get(word_index)
+        .is_some_and(|word| word & (1u64 << bit_offset) != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -1011,6 +1031,25 @@ mod tests {
         assert!(nitrogen_proxy.mcc() > 0.0);
         assert_eq!(sulfur_proxy.positive_candidates(), 0);
         assert_eq!(sulfur_proxy.negative_candidates(), 0);
+    }
+
+    #[test]
+    fn confusion_for_phenotype_reconstructs_label_counts() {
+        let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
+            sample("CN", true),
+            sample("CO", true),
+            sample("CC", false),
+            sample("OO", false),
+        ])]);
+
+        assert_eq!(
+            evaluator.confusion_for_phenotype(&[0b0101]),
+            ConfusionCounts::new(1, 1, 1, 1)
+        );
+        assert_eq!(
+            evaluator.confusion_for_phenotype(&[]),
+            ConfusionCounts::new(0, 0, 2, 2)
+        );
     }
 
     #[test]

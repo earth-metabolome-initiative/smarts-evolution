@@ -17,11 +17,12 @@ use crate::fitness::evaluator::{
     EvaluatedSmarts, EvaluationLogSettings, FoldData, GenomeEvaluation, ScreeningProxyFitness,
     SmartsEvaluator,
 };
+use crate::fitness::mcc::ConfusionCounts;
 use crate::fitness::objective::ObjectiveFitness;
 use crate::genome::SmartsGenome;
 use crate::genome::seed::{SeedCorpus, SmartsGenomeBuilder};
 use crate::operators::crossover::SmartsCrossover;
-use crate::operators::mutation::SmartsMutation;
+use crate::operators::mutation::{MutationDirection, SmartsMutation};
 
 const RESET_POOL_SIZE: usize = 32;
 const DIVERSE_ELITE_POOL_FACTOR: usize = 4;
@@ -1233,13 +1234,17 @@ impl EvolutionSession {
             let p2 = &parents[(pi + 1) % parents.len()];
             pi += 2;
 
-            let (child_a, child_b) = self.crossover.crossover_pair(p1, p2, &mut self.rng);
-            let child_a = self.mutate_offspring(child_a);
+            let p1_direction = self.mutation_direction_for_parent(p1);
+            let p2_direction = self.mutation_direction_for_parent(p2);
+            let (child_a, child_b) =
+                self.crossover
+                    .crossover_pair(&p1.genome, &p2.genome, &mut self.rng);
+            let child_a = self.mutate_offspring(child_a, p1_direction);
             offspring.push(child_a);
             if offspring.len() >= self.config.population_size() {
                 break;
             }
-            let child_b = self.mutate_offspring(child_b);
+            let child_b = self.mutate_offspring(child_b, p2_direction);
             offspring.push(child_b);
         }
 
@@ -1270,13 +1275,25 @@ impl EvolutionSession {
         );
     }
 
-    fn mutate_offspring(&mut self, genome: SmartsGenome) -> SmartsGenome {
+    fn mutate_offspring(
+        &mut self,
+        genome: SmartsGenome,
+        direction: MutationDirection,
+    ) -> SmartsGenome {
         let evaluator = &self.evaluator;
         self.mutator.mutate_guided(
             genome,
             GUIDED_MUTATION_PROPOSAL_COUNT,
+            direction,
             &mut self.rng,
             |_, candidates| select_screened_mutation_candidate(evaluator, candidates),
+        )
+    }
+
+    fn mutation_direction_for_parent(&self, parent: &ScoredGenome) -> MutationDirection {
+        mutation_direction_from_counts(
+            self.evaluator
+                .confusion_for_phenotype(parent.phenotype.as_ref()),
         )
     }
 
@@ -1662,12 +1679,42 @@ fn screened_mutation_candidate_is_better(
                             && candidate.smarts() < current.smarts())))))
 }
 
+fn mutation_direction_from_counts(counts: ConfusionCounts) -> MutationDirection {
+    let false_positive_rate = rate(
+        counts.false_positives(),
+        counts.false_positives() + counts.true_negatives(),
+    );
+    let false_negative_rate = rate(
+        counts.false_negatives(),
+        counts.false_negatives() + counts.true_positives(),
+    );
+    const DIRECTION_MARGIN: f64 = 1.20;
+
+    if false_positive_rate > 0.0 && false_positive_rate > false_negative_rate * DIRECTION_MARGIN {
+        MutationDirection::Specialize
+    } else if false_negative_rate > 0.0
+        && false_negative_rate > false_positive_rate * DIRECTION_MARGIN
+    {
+        MutationDirection::Generalize
+    } else {
+        MutationDirection::Balanced
+    }
+}
+
+fn rate(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
 fn tournament_select(
     scored: &[ScoredGenome],
     count: usize,
     tournament_size: usize,
     rng: &mut impl rand::Rng,
-) -> Vec<SmartsGenome> {
+) -> Vec<ScoredGenome> {
     let mut parents = Vec::with_capacity(count);
     for _ in 0..count {
         let mut best_idx = rng.random_range(0..scored.len());
@@ -1677,7 +1724,7 @@ fn tournament_select(
                 best_idx = idx;
             }
         }
-        parents.push(scored[best_idx].genome.clone());
+        parents.push(scored[best_idx].clone());
     }
     parents
 }
@@ -2308,6 +2355,22 @@ mod regression_tests {
                 .map(|genome| genome.smarts())
                 .collect::<Vec<_>>(),
             vec!["[#6]", "[#8]"]
+        );
+    }
+
+    #[test]
+    fn mutation_direction_tracks_parent_error_profile() {
+        assert_eq!(
+            mutation_direction_from_counts(ConfusionCounts::new(8, 4, 0, 0)),
+            MutationDirection::Specialize
+        );
+        assert_eq!(
+            mutation_direction_from_counts(ConfusionCounts::new(0, 0, 8, 4)),
+            MutationDirection::Generalize
+        );
+        assert_eq!(
+            mutation_direction_from_counts(ConfusionCounts::new(9, 1, 9, 1)),
+            MutationDirection::Balanced
         );
     }
 

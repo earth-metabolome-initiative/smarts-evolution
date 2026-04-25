@@ -15,6 +15,22 @@ impl ConfusionCounts {
         self.tp + self.fp + self.tn + self.fn_
     }
 
+    pub fn true_positives(self) -> u64 {
+        self.tp
+    }
+
+    pub fn false_positives(self) -> u64 {
+        self.fp
+    }
+
+    pub fn true_negatives(self) -> u64 {
+        self.tn
+    }
+
+    pub fn false_negatives(self) -> u64 {
+        self.fn_
+    }
+
     pub fn record_match(&mut self, matched: bool, is_positive: bool) {
         match (matched, is_positive) {
             (true, true) => self.tp += 1,
@@ -115,6 +131,10 @@ mod tests {
         total += ConfusionCounts::new(5, 6, 7, 8);
 
         assert_eq!(total, ConfusionCounts::new(6, 8, 10, 12));
+        assert_eq!(total.true_positives(), 6);
+        assert_eq!(total.false_positives(), 8);
+        assert_eq!(total.true_negatives(), 10);
+        assert_eq!(total.false_negatives(), 12);
 
         let mcc = compute_fold_averaged_mcc(&[
             ConfusionCounts::default(),
