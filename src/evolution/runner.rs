@@ -1,4 +1,4 @@
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -11,22 +11,25 @@ use log::{debug, info, warn};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use smarts_rs::BondLabel;
 
 use super::config::EvolutionConfig;
 use crate::fitness::evaluator::{
     EvaluatedSmarts, EvaluationLogSettings, FoldData, GenomeEvaluation, ScreeningProxyFitness,
     SmartsEvaluator,
 };
-use crate::fitness::mcc::ConfusionCounts;
+use crate::fitness::mcc::{ConfusionCounts, compute_mcc_from_counts};
 use crate::fitness::objective::ObjectiveFitness;
 use crate::genome::SmartsGenome;
 use crate::genome::seed::{SeedCorpus, SmartsGenomeBuilder};
 use crate::operators::crossover::SmartsCrossover;
 use crate::operators::mutation::{MutationDirection, SmartsMutation};
+use elements_rs::AtomicNumber;
 
 const RESET_POOL_SIZE: usize = 32;
 const DIVERSE_ELITE_POOL_FACTOR: usize = 4;
 const GUIDED_MUTATION_PROPOSAL_COUNT: usize = 4;
+const DATASET_SEED_LIMIT: usize = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvolutionError {
@@ -754,8 +757,9 @@ impl EvolutionSession {
             task_id, fold_count, total_targets
         );
 
+        let task_seed_corpus = task_seed_corpus(seed_corpus, &folds);
         let evaluator = SmartsEvaluator::new(folds);
-        let genome_builder = SmartsGenomeBuilder::new(seed_corpus.clone());
+        let genome_builder = SmartsGenomeBuilder::new(task_seed_corpus.clone());
         let mut rng = build_rng(config);
         let population: Vec<SmartsGenome> = (0..config.population_size())
             .map(|i| genome_builder.build_genome(i, &mut rng))
@@ -767,7 +771,7 @@ impl EvolutionSession {
         );
 
         let crossover = SmartsCrossover::new(config.crossover_rate());
-        let reset_pool = build_reset_pool(seed_corpus, &population, RESET_POOL_SIZE);
+        let reset_pool = build_reset_pool(&task_seed_corpus, &population, RESET_POOL_SIZE);
         let mutator = SmartsMutation::with_reset_pool(config.mutation_rate(), reset_pool);
 
         Ok(Self {
@@ -1571,6 +1575,228 @@ fn build_reset_pool(
     reset_pool
 }
 
+fn task_seed_corpus(seed_corpus: &SeedCorpus, folds: &[FoldData]) -> SeedCorpus {
+    let mut corpus = dataset_seed_corpus(folds, DATASET_SEED_LIMIT);
+    corpus.extend(seed_corpus.clone());
+    corpus
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum DatasetSeedFeature {
+    Atom(u16),
+    RingAtom(u16),
+    TotalHydrogen {
+        atomic_number: u16,
+        hydrogens: u8,
+    },
+    Bond {
+        left_atomic_number: u16,
+        bond: DatasetSeedBond,
+        right_atomic_number: u16,
+    },
+}
+
+impl DatasetSeedFeature {
+    fn smarts(self) -> String {
+        match self {
+            Self::Atom(atomic_number) => format!("[#{atomic_number}]"),
+            Self::RingAtom(atomic_number) => format!("[#{atomic_number};R]"),
+            Self::TotalHydrogen {
+                atomic_number,
+                hydrogens,
+            } => {
+                format!("[#{atomic_number};H{hydrogens}]")
+            }
+            Self::Bond {
+                left_atomic_number,
+                bond,
+                right_atomic_number,
+            } => {
+                format!(
+                    "[#{left_atomic_number}]{}[#{right_atomic_number}]",
+                    bond.smarts()
+                )
+            }
+        }
+    }
+
+    fn smarts_len(self) -> usize {
+        self.smarts().len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum DatasetSeedBond {
+    Any,
+    Single,
+    Double,
+    Triple,
+    Aromatic,
+}
+
+impl DatasetSeedBond {
+    fn from_label(label: BondLabel) -> Self {
+        match label {
+            BondLabel::Single | BondLabel::Up | BondLabel::Down => Self::Single,
+            BondLabel::Double => Self::Double,
+            BondLabel::Triple => Self::Triple,
+            BondLabel::Aromatic => Self::Aromatic,
+            BondLabel::Any => Self::Any,
+        }
+    }
+
+    fn smarts(self) -> &'static str {
+        match self {
+            Self::Any => "~",
+            Self::Single => "-",
+            Self::Double => "=",
+            Self::Triple => "#",
+            Self::Aromatic => ":",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DatasetSeedFeatureCounts {
+    positive_targets: u64,
+    negative_targets: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DatasetSeedFeatureScore {
+    mcc: f64,
+    positive_targets: u64,
+    negative_targets: u64,
+}
+
+fn dataset_seed_corpus(folds: &[FoldData], limit: usize) -> SeedCorpus {
+    if limit == 0 {
+        return SeedCorpus::default();
+    }
+
+    let positive_total = folds.iter().map(FoldData::positive_count).sum::<usize>() as u64;
+    let negative_total = folds.iter().map(FoldData::negative_count).sum::<usize>() as u64;
+    if positive_total == 0 || negative_total == 0 {
+        return SeedCorpus::default();
+    }
+
+    let mut counts: BTreeMap<DatasetSeedFeature, DatasetSeedFeatureCounts> = BTreeMap::new();
+    for fold in folds {
+        for sample in fold.samples() {
+            for feature in target_dataset_seed_features(sample.target()) {
+                let entry = counts.entry(feature).or_default();
+                if sample.is_positive() {
+                    entry.positive_targets += 1;
+                } else {
+                    entry.negative_targets += 1;
+                }
+            }
+        }
+    }
+
+    let mut ranked = counts
+        .into_iter()
+        .filter_map(|(feature, counts)| {
+            let score = dataset_seed_feature_score(counts, positive_total, negative_total)?;
+            Some((feature, score))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(compare_dataset_seed_features);
+
+    let mut corpus = SeedCorpus::default();
+    for (feature, _) in ranked.into_iter().take(limit) {
+        let _ = corpus.insert_smarts(&feature.smarts());
+    }
+    corpus
+}
+
+fn target_dataset_seed_features(target: &smarts_rs::PreparedTarget) -> Vec<DatasetSeedFeature> {
+    let mut features = BTreeSet::new();
+    for atom_id in 0..target.atom_count() {
+        let Some(atomic_number) = target_atomic_number(target, atom_id) else {
+            continue;
+        };
+        features.insert(DatasetSeedFeature::Atom(atomic_number));
+        if target.is_ring_atom(atom_id) {
+            features.insert(DatasetSeedFeature::RingAtom(atomic_number));
+        }
+        if let Some(hydrogens @ 1..=4) = target.total_hydrogen_count(atom_id) {
+            features.insert(DatasetSeedFeature::TotalHydrogen {
+                atomic_number,
+                hydrogens,
+            });
+        }
+
+        for (left, right, _, _) in target.target().edges_for_node(atom_id) {
+            let other_atom_id = if left == atom_id { right } else { left };
+            if other_atom_id < atom_id {
+                continue;
+            }
+            let Some(other_atomic_number) = target_atomic_number(target, other_atom_id) else {
+                continue;
+            };
+            let Some(label) = target.bond(atom_id, other_atom_id) else {
+                continue;
+            };
+            let (left_atomic_number, right_atomic_number) =
+                ordered_pair(atomic_number, other_atomic_number);
+            features.insert(DatasetSeedFeature::Bond {
+                left_atomic_number,
+                bond: DatasetSeedBond::from_label(label),
+                right_atomic_number,
+            });
+        }
+    }
+    features.into_iter().collect()
+}
+
+fn target_atomic_number(target: &smarts_rs::PreparedTarget, atom_id: usize) -> Option<u16> {
+    target
+        .atom(atom_id)?
+        .element()
+        .map(|element| u16::from(element.atomic_number()))
+}
+
+fn ordered_pair(left: u16, right: u16) -> (u16, u16) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn dataset_seed_feature_score(
+    counts: DatasetSeedFeatureCounts,
+    positive_total: u64,
+    negative_total: u64,
+) -> Option<DatasetSeedFeatureScore> {
+    let mcc = compute_mcc_from_counts(
+        counts.positive_targets,
+        counts.negative_targets,
+        negative_total.saturating_sub(counts.negative_targets),
+        positive_total.saturating_sub(counts.positive_targets),
+    );
+    (mcc > 0.0).then_some(DatasetSeedFeatureScore {
+        mcc,
+        positive_targets: counts.positive_targets,
+        negative_targets: counts.negative_targets,
+    })
+}
+
+fn compare_dataset_seed_features(
+    left: &(DatasetSeedFeature, DatasetSeedFeatureScore),
+    right: &(DatasetSeedFeature, DatasetSeedFeatureScore),
+) -> Ordering {
+    right
+        .1
+        .mcc
+        .total_cmp(&left.1.mcc)
+        .then_with(|| right.1.positive_targets.cmp(&left.1.positive_targets))
+        .then_with(|| left.1.negative_targets.cmp(&right.1.negative_targets))
+        .then_with(|| left.0.smarts_len().cmp(&right.0.smarts_len()))
+        .then_with(|| left.0.cmp(&right.0))
+}
+
 fn average_smarts_len(population: &[SmartsGenome]) -> f64 {
     if population.is_empty() {
         return 0.0;
@@ -2307,6 +2533,44 @@ mod regression_tests {
                 .map(|genome| genome.smarts())
                 .collect::<Vec<_>>(),
             vec!["[#9]"]
+        );
+    }
+
+    #[test]
+    fn dataset_seed_corpus_prefers_positive_enriched_features() {
+        let folds = vec![FoldData::new(vec![
+            sample("CN", true),
+            sample("CCN", true),
+            sample("CC", false),
+            sample("CO", false),
+        ])];
+        let corpus = dataset_seed_corpus(&folds, 8);
+        let smarts = corpus
+            .entries()
+            .iter()
+            .map(|genome| genome.smarts())
+            .collect::<Vec<_>>();
+
+        assert!(smarts.contains(&"[#7]"));
+        assert!(!smarts.contains(&"[#8]"));
+    }
+
+    #[test]
+    fn task_seed_corpus_preserves_user_seeds_and_adds_dataset_seeds() {
+        let user = SeedCorpus::try_from(["[#16]"]).unwrap();
+        let folds = vec![FoldData::new(vec![sample("CN", true), sample("CC", false)])];
+        let corpus = task_seed_corpus(&user, &folds);
+        let smarts = corpus
+            .entries()
+            .iter()
+            .map(|genome| genome.smarts())
+            .collect::<Vec<_>>();
+
+        assert!(smarts.contains(&"[#16]"));
+        assert!(smarts.contains(&"[#7]"));
+        assert!(
+            smarts.iter().position(|smarts| *smarts == "[#7]")
+                < smarts.iter().position(|smarts| *smarts == "[#16]")
         );
     }
 
