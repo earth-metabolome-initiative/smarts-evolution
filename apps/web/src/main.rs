@@ -1173,11 +1173,9 @@ fn current_best(view: &RunView) -> Option<&RankedCandidate> {
 
 fn start_button_label(phase: RunPhase) -> &'static str {
     match phase {
-        RunPhase::Idle => "Start",
-        RunPhase::Completed => "Restart",
-        RunPhase::Stopped => "Restart",
+        RunPhase::Idle | RunPhase::Running => "Start",
+        RunPhase::Completed | RunPhase::Stopped => "Restart",
         RunPhase::Failed => "Retry",
-        RunPhase::Running => "Start",
     }
 }
 
@@ -1243,18 +1241,18 @@ fn build_run_request(run_id: u64, draft: &RunDraft) -> Result<RunRequest, String
     let normalized_negative_smiles = compact_smiles_lines("negative SMILES", &draft.negative_smiles)?;
 
     let config = EvolutionConfigInput::default()
-        .population_size_mut(parse_usize("population size", &draft.population_size)?)
-        .generation_limit_mut(parse_u64("generation limit", &draft.generation_limit)?)
-        .mutation_rate_mut(parse_f64("mutation rate", &draft.mutation_rate)?)
-        .crossover_rate_mut(parse_f64("crossover rate", &draft.crossover_rate)?)
-        .selection_ratio_mut(parse_f64("selection ratio", &draft.selection_ratio)?)
-        .tournament_size_mut(parse_usize("tournament size", &draft.tournament_size)?)
-        .elite_count_mut(parse_usize("elite count", &draft.elite_count)?)
-        .random_immigrant_ratio_mut(parse_f64(
+        .with_population_size(parse_usize("population size", &draft.population_size)?)
+        .with_generation_limit(parse_u64("generation limit", &draft.generation_limit)?)
+        .with_mutation_rate(parse_f64("mutation rate", &draft.mutation_rate)?)
+        .with_crossover_rate(parse_f64("crossover rate", &draft.crossover_rate)?)
+        .with_selection_ratio(parse_f64("selection ratio", &draft.selection_ratio)?)
+        .with_tournament_size(parse_usize("tournament size", &draft.tournament_size)?)
+        .with_elite_count(parse_usize("elite count", &draft.elite_count)?)
+        .with_random_immigrant_ratio(parse_f64(
             "random immigrant ratio",
             &draft.random_immigrant_ratio,
         )?)
-        .stagnation_limit_mut(parse_u64("stagnation limit", &draft.stagnation_limit)?);
+        .with_stagnation_limit(parse_u64("stagnation limit", &draft.stagnation_limit)?);
 
     Ok(RunRequest::new(
         run_id,

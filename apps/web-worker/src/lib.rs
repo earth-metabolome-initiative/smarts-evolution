@@ -256,8 +256,7 @@ fn completed_run_from_result(run_id: u64, result: &TaskResult) -> CompletedRun {
             result
                 .leaders()
                 .first()
-                .map(RankedSmarts::complexity)
-                .unwrap_or(0),
+                .map_or(0, RankedSmarts::complexity),
         ),
         result.leaders().iter().map(ranked_candidate).collect(),
         result.generations(),
@@ -395,7 +394,7 @@ fn ranked_candidate(candidate: &RankedSmarts) -> RankedCandidate {
     RankedCandidate::new(candidate.smarts(), candidate.mcc(), candidate.complexity())
 }
 
-fn run_status(status: EvolutionStatus) -> RunStatus {
+const fn run_status(status: EvolutionStatus) -> RunStatus {
     match status {
         EvolutionStatus::Running => RunStatus::Running,
         EvolutionStatus::Stagnated => RunStatus::Stagnated,
@@ -445,11 +444,11 @@ fn count_seed_units(input: &str) -> usize {
     count.max(1)
 }
 
-fn should_report_progress(completed: usize, total: usize) -> bool {
+const fn should_report_progress(completed: usize, total: usize) -> bool {
     completed == total || completed <= 4 || completed.is_multiple_of(STARTUP_PROGRESS_BATCH)
 }
 
-fn should_report_evaluation_progress(completed: usize, total: usize) -> bool {
+const fn should_report_evaluation_progress(completed: usize, total: usize) -> bool {
     completed == 0 || completed == total || completed <= 4 || completed.is_multiple_of(8)
 }
 

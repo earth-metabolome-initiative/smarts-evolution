@@ -75,47 +75,56 @@ impl EvolutionConfigInput {
         self.stagnation_limit
     }
 
-    pub fn population_size_mut(mut self, population_size: usize) -> Self {
+    #[must_use]
+    pub const fn with_population_size(mut self, population_size: usize) -> Self {
         self.population_size = population_size;
         self
     }
 
-    pub fn generation_limit_mut(mut self, generation_limit: u64) -> Self {
+    #[must_use]
+    pub const fn with_generation_limit(mut self, generation_limit: u64) -> Self {
         self.generation_limit = generation_limit;
         self
     }
 
-    pub fn mutation_rate_mut(mut self, mutation_rate: f64) -> Self {
+    #[must_use]
+    pub const fn with_mutation_rate(mut self, mutation_rate: f64) -> Self {
         self.mutation_rate = mutation_rate;
         self
     }
 
-    pub fn crossover_rate_mut(mut self, crossover_rate: f64) -> Self {
+    #[must_use]
+    pub const fn with_crossover_rate(mut self, crossover_rate: f64) -> Self {
         self.crossover_rate = crossover_rate;
         self
     }
 
-    pub fn selection_ratio_mut(mut self, selection_ratio: f64) -> Self {
+    #[must_use]
+    pub const fn with_selection_ratio(mut self, selection_ratio: f64) -> Self {
         self.selection_ratio = selection_ratio;
         self
     }
 
-    pub fn tournament_size_mut(mut self, tournament_size: usize) -> Self {
+    #[must_use]
+    pub const fn with_tournament_size(mut self, tournament_size: usize) -> Self {
         self.tournament_size = tournament_size;
         self
     }
 
-    pub fn elite_count_mut(mut self, elite_count: usize) -> Self {
+    #[must_use]
+    pub const fn with_elite_count(mut self, elite_count: usize) -> Self {
         self.elite_count = elite_count;
         self
     }
 
-    pub fn random_immigrant_ratio_mut(mut self, random_immigrant_ratio: f64) -> Self {
+    #[must_use]
+    pub const fn with_random_immigrant_ratio(mut self, random_immigrant_ratio: f64) -> Self {
         self.random_immigrant_ratio = random_immigrant_ratio;
         self
     }
 
-    pub fn stagnation_limit_mut(mut self, stagnation_limit: u64) -> Self {
+    #[must_use]
+    pub const fn with_stagnation_limit(mut self, stagnation_limit: u64) -> Self {
         self.stagnation_limit = stagnation_limit;
         self
     }

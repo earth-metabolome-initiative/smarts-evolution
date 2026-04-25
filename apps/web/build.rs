@@ -134,7 +134,7 @@ fn copy_file(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn worker_loader_script() -> &'static str {
+const fn worker_loader_script() -> &'static str {
     r#"import init from "./smarts_evolution_web_worker.js";
 
 await init({ module_or_path: new URL("./smarts_evolution_web_worker_bg.wasm", import.meta.url) });
