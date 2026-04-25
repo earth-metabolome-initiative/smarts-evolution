@@ -1,8 +1,5 @@
-use alloc::format;
 use alloc::string::String;
 use core::time::Duration;
-
-use crate::genome::limits::MAX_SMARTS_COMPLEXITY;
 
 const DEFAULT_POPULATION_SIZE: usize = 200;
 const DEFAULT_GENERATION_LIMIT: u64 = 500;
@@ -15,7 +12,7 @@ const DEFAULT_RANDOM_IMMIGRANT_RATIO: f64 = 0.10;
 const DEFAULT_STAGNATION_LIMIT: u64 = 50;
 const DEFAULT_FITNESS_CACHE_CAPACITY: usize = 100_000;
 const DEFAULT_SLOW_EVALUATION_LOG_THRESHOLD: Duration = Duration::from_secs(30);
-const DEFAULT_MAX_EVALUATION_SMARTS_COMPLEXITY: usize = 1_536;
+const DEFAULT_MATCH_TIME_LIMIT: Duration = Duration::from_secs(30);
 
 /// Configuration for the evolutionary algorithm.
 #[derive(Clone, Debug)]
@@ -31,8 +28,8 @@ pub struct EvolutionConfig {
     stagnation_limit: u64,
     rng_seed: Option<u64>,
     fitness_cache_capacity: usize,
-    max_evaluation_smarts_complexity: usize,
     max_evaluation_smarts_len: Option<usize>,
+    match_time_limit: Option<Duration>,
     slow_evaluation_log_threshold: Option<Duration>,
 }
 
@@ -50,8 +47,8 @@ pub struct EvolutionConfigBuilder {
     stagnation_limit: u64,
     rng_seed: Option<u64>,
     fitness_cache_capacity: usize,
-    max_evaluation_smarts_complexity: usize,
     max_evaluation_smarts_len: Option<usize>,
+    match_time_limit: Option<Duration>,
     slow_evaluation_log_threshold: Option<Duration>,
 }
 
@@ -75,8 +72,8 @@ impl Default for EvolutionConfigBuilder {
             stagnation_limit: DEFAULT_STAGNATION_LIMIT,
             rng_seed: None,
             fitness_cache_capacity: DEFAULT_FITNESS_CACHE_CAPACITY,
-            max_evaluation_smarts_complexity: DEFAULT_MAX_EVALUATION_SMARTS_COMPLEXITY,
             max_evaluation_smarts_len: None,
+            match_time_limit: Some(DEFAULT_MATCH_TIME_LIMIT),
             slow_evaluation_log_threshold: Some(DEFAULT_SLOW_EVALUATION_LOG_THRESHOLD),
         }
     }
@@ -133,16 +130,14 @@ impl EvolutionConfig {
         if self.elite_count > self.population_size {
             return Err("elite_count must not exceed population_size".into());
         }
-        if self.max_evaluation_smarts_complexity == 0 {
-            return Err("max_evaluation_smarts_complexity must be greater than zero".into());
-        }
-        if self.max_evaluation_smarts_complexity > MAX_SMARTS_COMPLEXITY {
-            return Err(format!(
-                "max_evaluation_smarts_complexity must not exceed {MAX_SMARTS_COMPLEXITY}"
-            ));
-        }
         if self.max_evaluation_smarts_len == Some(0) {
             return Err("max_evaluation_smarts_len must be greater than zero".into());
+        }
+        if self
+            .match_time_limit
+            .is_some_and(|threshold| threshold.is_zero())
+        {
+            return Err("match_time_limit must be greater than zero".into());
         }
         if self
             .slow_evaluation_log_threshold
@@ -197,12 +192,12 @@ impl EvolutionConfig {
         self.fitness_cache_capacity
     }
 
-    pub fn max_evaluation_smarts_complexity(&self) -> usize {
-        self.max_evaluation_smarts_complexity
-    }
-
     pub fn max_evaluation_smarts_len(&self) -> Option<usize> {
         self.max_evaluation_smarts_len
+    }
+
+    pub fn match_time_limit(&self) -> Option<Duration> {
+        self.match_time_limit
     }
 
     pub fn slow_evaluation_log_threshold(&self) -> Option<Duration> {
@@ -266,11 +261,6 @@ impl EvolutionConfigBuilder {
         self
     }
 
-    pub fn max_evaluation_smarts_complexity(mut self, max_complexity: usize) -> Self {
-        self.max_evaluation_smarts_complexity = max_complexity;
-        self
-    }
-
     pub fn max_evaluation_smarts_len(mut self, max_len: usize) -> Self {
         self.max_evaluation_smarts_len = Some(max_len);
         self
@@ -278,6 +268,16 @@ impl EvolutionConfigBuilder {
 
     pub fn no_max_evaluation_smarts_len(mut self) -> Self {
         self.max_evaluation_smarts_len = None;
+        self
+    }
+
+    pub fn match_time_limit(mut self, threshold: Duration) -> Self {
+        self.match_time_limit = Some(threshold);
+        self
+    }
+
+    pub fn disable_match_time_limit(mut self) -> Self {
+        self.match_time_limit = None;
         self
     }
 
@@ -310,8 +310,8 @@ impl EvolutionConfigBuilder {
             stagnation_limit: self.stagnation_limit,
             rng_seed: self.rng_seed,
             fitness_cache_capacity: self.fitness_cache_capacity,
-            max_evaluation_smarts_complexity: self.max_evaluation_smarts_complexity,
             max_evaluation_smarts_len: self.max_evaluation_smarts_len,
+            match_time_limit: self.match_time_limit,
             slow_evaluation_log_threshold: self.slow_evaluation_log_threshold,
         }
     }
@@ -320,18 +320,13 @@ impl EvolutionConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SeedCorpus, SmartsGenome};
 
     #[test]
     fn default_config_is_valid() {
         let config = EvolutionConfig::default();
         assert!(config.validate().is_ok());
-        assert_eq!(
-            config.max_evaluation_smarts_complexity(),
-            DEFAULT_MAX_EVALUATION_SMARTS_COMPLEXITY
-        );
-        assert!(config.max_evaluation_smarts_complexity() < MAX_SMARTS_COMPLEXITY);
         assert_eq!(config.max_evaluation_smarts_len(), None);
+        assert_eq!(config.match_time_limit(), Some(DEFAULT_MATCH_TIME_LIMIT));
         assert_eq!(
             config.slow_evaluation_log_threshold(),
             Some(DEFAULT_SLOW_EVALUATION_LOG_THRESHOLD)
@@ -339,20 +334,11 @@ mod tests {
     }
 
     #[test]
-    fn default_complexity_threshold_has_seed_headroom_and_rejects_known_pathology() {
+    fn default_match_time_limit_is_independent_from_length_limit() {
         let config = EvolutionConfig::default();
-        let default_limit = config.max_evaluation_smarts_complexity();
-        let builtin_max = SeedCorpus::builtin()
-            .entries()
-            .iter()
-            .map(SmartsGenome::complexity)
-            .max()
-            .unwrap();
-        let pathology = SmartsGenome::from_smarts("[!r6&$([#6,#7])].[R]").unwrap();
 
-        assert!(builtin_max * 10 < default_limit);
-        assert!(pathology.complexity() > default_limit);
-        assert!(pathology.complexity() < MAX_SMARTS_COMPLEXITY);
+        assert_eq!(config.match_time_limit(), Some(Duration::from_secs(30)));
+        assert_eq!(config.max_evaluation_smarts_len(), None);
     }
 
     #[test]
@@ -384,8 +370,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_invalid_probabilities_and_sizes() {
-        let expected_max_complexity_error =
-            format!("max_evaluation_smarts_complexity must not exceed {MAX_SMARTS_COMPLEXITY}");
         let invalid_cases = [
             (
                 EvolutionConfig::builder().mutation_rate(-0.1).build(),
@@ -417,21 +401,15 @@ mod tests {
             ),
             (
                 EvolutionConfig::builder()
-                    .max_evaluation_smarts_complexity(0)
-                    .build(),
-                "max_evaluation_smarts_complexity must be greater than zero",
-            ),
-            (
-                EvolutionConfig::builder()
-                    .max_evaluation_smarts_complexity(MAX_SMARTS_COMPLEXITY + 1)
-                    .build(),
-                expected_max_complexity_error.as_str(),
-            ),
-            (
-                EvolutionConfig::builder()
                     .max_evaluation_smarts_len(0)
                     .build(),
                 "max_evaluation_smarts_len must be greater than zero",
+            ),
+            (
+                EvolutionConfig::builder()
+                    .match_time_limit(Duration::ZERO)
+                    .build(),
+                "match_time_limit must be greater than zero",
             ),
             (
                 EvolutionConfig::builder()
@@ -451,16 +429,16 @@ mod tests {
         let config = EvolutionConfig::builder()
             .rng_seed(7)
             .fitness_cache_capacity(1234)
-            .max_evaluation_smarts_complexity(128)
             .max_evaluation_smarts_len(256)
+            .match_time_limit(Duration::from_millis(100))
             .slow_evaluation_log_threshold(Duration::from_millis(250))
             .build()
             .unwrap();
 
         assert_eq!(config.rng_seed(), Some(7));
         assert_eq!(config.fitness_cache_capacity(), 1234);
-        assert_eq!(config.max_evaluation_smarts_complexity(), 128);
         assert_eq!(config.max_evaluation_smarts_len(), Some(256));
+        assert_eq!(config.match_time_limit(), Some(Duration::from_millis(100)));
         assert_eq!(
             config.slow_evaluation_log_threshold(),
             Some(Duration::from_millis(250))
@@ -469,10 +447,12 @@ mod tests {
         let config = EvolutionConfig::builder()
             .max_evaluation_smarts_len(10)
             .no_max_evaluation_smarts_len()
+            .disable_match_time_limit()
             .disable_slow_evaluation_logging()
             .build()
             .unwrap();
         assert_eq!(config.max_evaluation_smarts_len(), None);
+        assert_eq!(config.match_time_limit(), None);
         assert_eq!(config.slow_evaluation_log_threshold(), None);
     }
 }

@@ -55,7 +55,7 @@ Enable the `indicatif` feature and call `task.evolve_with_indicatif(&config, &se
 
 ## Pathological SMARTS Evaluation
 
-The GA logs each SMARTS evaluation at `debug` level and emits a `warn` log when an evaluation exceeds `EvolutionConfig::slow_evaluation_log_threshold`, which defaults to 30 seconds. Use `max_evaluation_smarts_complexity` and `max_evaluation_smarts_len` to reject over-budget genomes before matching; the default SMARTS complexity evaluation cap is 1536, with a hard genome validity ceiling of 4096.
+The GA logs each SMARTS evaluation at `debug` level, applies `EvolutionConfig::match_time_limit` as a cooperative per-match safety fuse, and emits a `warn` log when matching exceeds that limit. `MatchLimitResult::Exceeded` is treated as unknown, so the affected genome receives invalid fitness instead of counting the sample as a non-match. SMARTS length is used only for deterministic tie-breaking and optional `max_evaluation_smarts_len` filtering.
 
 For a standalone `.log` file, initialize the built-in file logger before starting evolution:
 

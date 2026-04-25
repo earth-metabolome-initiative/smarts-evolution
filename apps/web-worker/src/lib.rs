@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::str::FromStr;
 
-use js_sys::global;
+use js_sys::{Date, global};
 use smarts_evolution::{
     EvolutionConfig, EvolutionEvaluationProgress, EvolutionProgress, EvolutionSession,
     EvolutionStatus, EvolutionTask, FoldData, FoldSample, RankedSmarts, SeedCorpus, TaskResult,
@@ -228,8 +228,9 @@ fn progress_update_from_snapshot(run_id: u64, snapshot: &EvolutionProgress) -> P
         snapshot.total_count(),
         snapshot.duplicate_count(),
         snapshot.cache_hits(),
-        snapshot.lead_complexity(),
-        snapshot.average_complexity(),
+        snapshot.match_timeout_count(),
+        snapshot.lead_smarts_len(),
+        snapshot.average_smarts_len(),
         snapshot.stagnation(),
     )
 }
@@ -253,10 +254,7 @@ fn completed_run_from_result(run_id: u64, result: &TaskResult) -> CompletedRun {
         RankedCandidate::new(
             result.best_smarts(),
             result.best_mcc(),
-            result
-                .leaders()
-                .first()
-                .map_or(0, RankedSmarts::complexity),
+            result.best_smarts_len(),
         ),
         result.leaders().iter().map(ranked_candidate).collect(),
         result.generations(),
@@ -349,7 +347,7 @@ fn drive_active_run() {
         let Some(progress) =
             active_run
                 .session
-                .step_with_evaluation_progress(|progress| {
+                .step_with_evaluation_progress_and_clock(&worker_now_ms, |progress| {
                     if should_report_evaluation_progress(progress.completed(), progress.total()) {
                         let _ = post_response(&WorkerResponse::Evaluation(
                             evaluation_update_from_snapshot(run_id, &progress),
@@ -391,7 +389,7 @@ fn drive_active_run() {
 }
 
 fn ranked_candidate(candidate: &RankedSmarts) -> RankedCandidate {
-    RankedCandidate::new(candidate.smarts(), candidate.mcc(), candidate.complexity())
+    RankedCandidate::new(candidate.smarts(), candidate.mcc(), candidate.smarts_len())
 }
 
 const fn run_status(status: EvolutionStatus) -> RunStatus {
@@ -410,6 +408,12 @@ fn post_response(response: &WorkerResponse) -> Result<(), JsValue> {
 
 fn worker_scope() -> DedicatedWorkerGlobalScope {
     global().unchecked_into::<DedicatedWorkerGlobalScope>()
+}
+
+fn worker_now_ms() -> f64 {
+    worker_scope()
+        .performance()
+        .map_or_else(Date::now, |performance| performance.now())
 }
 
 fn js_error(error: JsValue) -> String {

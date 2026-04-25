@@ -4,7 +4,7 @@ use core::fmt;
 use core::str::FromStr;
 use smarts_rs::QueryMol;
 
-use super::limits::MAX_SMARTS_COMPLEXITY;
+use super::limits::MAX_SMARTS_LEN;
 
 /// A SMARTS pattern genome for evolutionary optimization.
 ///
@@ -13,7 +13,6 @@ use super::limits::MAX_SMARTS_COMPLEXITY;
 pub struct SmartsGenome {
     query: QueryMol,
     smarts_string: Arc<str>,
-    complexity: usize,
 }
 
 impl SmartsGenome {
@@ -42,20 +41,15 @@ impl SmartsGenome {
         let query = query.canonicalize();
         let smarts_string: Arc<str> = query.to_string().into();
         Self {
-            complexity: query.complexity(),
             query,
             smarts_string,
         }
     }
 
-    /// Returns a target-independent estimate of SMARTS matching cost.
-    ///
-    /// This delegates to the upstream `smarts-rs` query complexity heuristic
-    /// after canonicalization. It is used for size limits and progress
-    /// reporting, not as a semantic property of the SMARTS.
+    /// Returns the length of the canonical SMARTS string.
     #[inline]
-    pub fn complexity(&self) -> usize {
-        self.complexity
+    pub fn smarts_len(&self) -> usize {
+        self.smarts_string.len()
     }
 
     #[inline]
@@ -76,7 +70,7 @@ impl SmartsGenome {
     /// Validate this genome using simple structural limits.
     #[inline]
     pub fn is_valid(&self) -> bool {
-        !self.smarts_string.is_empty() && self.complexity <= MAX_SMARTS_COMPLEXITY
+        !self.smarts_string.is_empty() && self.smarts_len() <= MAX_SMARTS_LEN
     }
 }
 
@@ -100,13 +94,12 @@ mod tests {
     use crate::genome::over_limit_smarts_fixture;
 
     #[test]
-    fn genome_round_trips_complex_smarts() {
+    fn genome_round_trips_branched_smarts() {
         let smarts = "[#6](=[#8])[#7]";
         let genome = SmartsGenome::from_smarts(smarts).unwrap();
 
         assert_eq!(genome.smarts(), "[#6]([#7])=[#8]");
-        assert_eq!(genome.complexity(), genome.query().complexity());
-        assert!(genome.complexity() > genome.query().atom_count() + genome.query().bonds().len());
+        assert_eq!(genome.smarts_len(), genome.smarts().len());
         assert!(genome.is_valid());
     }
 
@@ -164,7 +157,7 @@ mod tests {
             ("[#6,!#6]", "*"),
             ("[#6&!#6]", "[!*]"),
             ("[#6]-&~[#7]", "[#6]-[#7]"),
-            ("[$([!!#6;*])]", "[$([#6])]"),
+            ("[$([!!#6;*])]", "[#6]"),
         ] {
             let genome = SmartsGenome::from_smarts(source).unwrap();
 
@@ -174,11 +167,11 @@ mod tests {
     }
 
     #[test]
-    fn genome_rejects_queries_past_structural_limit() {
+    fn genome_rejects_queries_past_length_limit() {
         let over_limit = over_limit_smarts_fixture();
         let genome = SmartsGenome::from_smarts(&over_limit).unwrap();
 
-        assert!(genome.complexity() > MAX_SMARTS_COMPLEXITY);
+        assert!(genome.smarts_len() > MAX_SMARTS_LEN);
         assert!(!genome.is_valid());
     }
 }

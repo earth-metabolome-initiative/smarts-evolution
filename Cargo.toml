@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = ["std"]
 indicatif = ["std", "dep:indicatif"]
-std = ["dep:rayon", "log/std"]
+std = ["dep:rayon", "log/std", "smarts-rs/std"]
 
 [profile.release]
 opt-level = 3

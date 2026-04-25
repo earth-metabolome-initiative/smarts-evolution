@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::str::FromStr;
@@ -21,7 +22,7 @@ use smiles_parser::atom::bracketed::chirality::Chirality;
 use smiles_parser::bond::Bond;
 
 use crate::genome::SmartsGenome;
-use crate::genome::limits::{MAX_PRIMITIVES_PER_BRACKET, MAX_SMARTS_COMPLEXITY};
+use crate::genome::limits::{MAX_PRIMITIVES_PER_BRACKET, MAX_SMARTS_LEN};
 
 const ALL_ELEMENT_SYMBOLS: &[&str] = &[
     "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl",
@@ -57,7 +58,7 @@ const RESET_RESTART_ATTEMPTS: usize = 4;
 const DEFAULT_RESET_PROBABILITY: f64 = 0.20;
 const DEFAULT_MAX_MUTATION_STEPS: usize = 6;
 const DEFAULT_ATTEMPT_BUDGET: usize = 24;
-const NEAR_COMPLEXITY_LIMIT_PERCENT: usize = 85;
+const NEAR_SMARTS_LEN_LIMIT_PERCENT: usize = 85;
 const ONE_STEP_MUTATION_PROBABILITY: f64 = 0.62;
 const TWO_STEP_MUTATION_PROBABILITY: f64 = 0.84;
 const THREE_STEP_MUTATION_PROBABILITY: f64 = 0.95;
@@ -134,20 +135,20 @@ impl MutationOperator {
         self as usize
     }
 
-    fn weight(self, near_complexity_limit: bool) -> u32 {
+    fn weight(self, near_smarts_len_limit: bool) -> u32 {
         match self {
-            Self::AtomConstraints => complexity_sensitive_weight(near_complexity_limit, 10, 12),
-            Self::AtomRefinement => complexity_sensitive_weight(near_complexity_limit, 18, 11),
+            Self::AtomConstraints => length_sensitive_weight(near_smarts_len_limit, 10, 12),
+            Self::AtomRefinement => length_sensitive_weight(near_smarts_len_limit, 18, 11),
             Self::AtomMap => 1,
-            Self::RecursiveQuery => complexity_sensitive_weight(near_complexity_limit, 2, 10),
-            Self::AttachLeafAtom => complexity_sensitive_weight(near_complexity_limit, 2, 13),
-            Self::InsertAtomOnBond => complexity_sensitive_weight(near_complexity_limit, 1, 9),
-            Self::RemoveLeafAtom => complexity_sensitive_weight(near_complexity_limit, 22, 10),
+            Self::RecursiveQuery => length_sensitive_weight(near_smarts_len_limit, 2, 10),
+            Self::AttachLeafAtom => length_sensitive_weight(near_smarts_len_limit, 2, 13),
+            Self::InsertAtomOnBond => length_sensitive_weight(near_smarts_len_limit, 1, 9),
+            Self::RemoveLeafAtom => length_sensitive_weight(near_smarts_len_limit, 22, 10),
             Self::BondConstraints => 12,
             Self::RingEdit => 8,
-            Self::ComponentEdit => complexity_sensitive_weight(near_complexity_limit, 3, 7),
+            Self::ComponentEdit => length_sensitive_weight(near_smarts_len_limit, 3, 7),
             Self::ToggleAtomNot => 5,
-            Self::GraftSeedFragment => complexity_sensitive_weight(near_complexity_limit, 0, 2),
+            Self::GraftSeedFragment => length_sensitive_weight(near_smarts_len_limit, 0, 2),
         }
     }
 
@@ -200,8 +201,8 @@ impl MutationOperator {
     }
 }
 
-fn complexity_sensitive_weight(near_complexity_limit: bool, near_limit: u32, normal: u32) -> u32 {
-    if near_complexity_limit {
+fn length_sensitive_weight(near_smarts_len_limit: bool, near_limit: u32, normal: u32) -> u32 {
+    if near_smarts_len_limit {
         near_limit
     } else {
         normal
@@ -245,7 +246,7 @@ impl MutationAttemptStats {
     ) {
         debug!(
             target: MUTATION_LOG_TARGET,
-            "mutation accepted source={} attempts={} steps={} changed_steps={} query_errors={} rejected_genomes={} canonical_noops={} before_complexity={} after_complexity={} operator_attempts={:?} operator_changes={:?}",
+            "mutation accepted source={} attempts={} steps={} changed_steps={} query_errors={} rejected_genomes={} canonical_noops={} before_smarts_len={} after_smarts_len={} operator_attempts={:?} operator_changes={:?}",
             source.as_str(),
             self.attempts,
             self.steps,
@@ -253,8 +254,8 @@ impl MutationAttemptStats {
             self.query_errors,
             self.rejected_genomes,
             self.canonical_noops,
-            parent.complexity(),
-            candidate.complexity(),
+            parent.smarts_len(),
+            candidate.smarts_len(),
             self.operator_attempts,
             self.operator_changes,
         );
@@ -263,7 +264,7 @@ impl MutationAttemptStats {
     fn log_rejected(&self, source: MutationSource, parent: &SmartsGenome) {
         debug!(
             target: MUTATION_LOG_TARGET,
-            "mutation rejected source={} attempts={} steps={} changed_steps={} query_errors={} rejected_genomes={} canonical_noops={} before_complexity={} operator_attempts={:?} operator_changes={:?}",
+            "mutation rejected source={} attempts={} steps={} changed_steps={} query_errors={} rejected_genomes={} canonical_noops={} before_smarts_len={} operator_attempts={:?} operator_changes={:?}",
             source.as_str(),
             self.attempts,
             self.steps,
@@ -271,7 +272,7 @@ impl MutationAttemptStats {
             self.query_errors,
             self.rejected_genomes,
             self.canonical_noops,
-            parent.complexity(),
+            parent.smarts_len(),
             self.operator_attempts,
             self.operator_changes,
         );
@@ -429,7 +430,7 @@ fn sample_mutation_steps<R: Rng>(max_mutation_steps: usize, rng: &mut R) -> usiz
 
 fn genome_from_query(query: &QueryMol) -> Option<SmartsGenome> {
     let genome = SmartsGenome::from_query_mol(query);
-    (genome.complexity() <= MAX_SMARTS_COMPLEXITY && genome.is_valid()).then_some(genome)
+    (genome.smarts_len() <= MAX_SMARTS_LEN && genome.is_valid()).then_some(genome)
 }
 
 fn apply_random_mutation<R: Rng>(
@@ -451,7 +452,7 @@ fn sample_mutation_operator<R: Rng>(
     rng: &mut R,
     recursive_depth: usize,
 ) -> MutationOperator {
-    let near_complexity_limit = is_near_complexity_limit(query);
+    let near_smarts_len_limit = is_near_smarts_len_limit(query);
     let total_weight = MutationOperator::ALL
         .into_iter()
         .map(|operator| {
@@ -460,7 +461,7 @@ fn sample_mutation_operator<R: Rng>(
                 query,
                 reset_pool,
                 recursive_depth,
-                near_complexity_limit,
+                near_smarts_len_limit,
             )
         })
         .sum();
@@ -476,7 +477,7 @@ fn sample_mutation_operator<R: Rng>(
             query,
             reset_pool,
             recursive_depth,
-            near_complexity_limit,
+            near_smarts_len_limit,
         );
         if roll < weight {
             return operator;
@@ -487,8 +488,8 @@ fn sample_mutation_operator<R: Rng>(
     MutationOperator::AtomConstraints
 }
 
-fn is_near_complexity_limit(query: &QueryMol) -> bool {
-    query.complexity() * 100 >= MAX_SMARTS_COMPLEXITY * NEAR_COMPLEXITY_LIMIT_PERCENT
+fn is_near_smarts_len_limit(query: &QueryMol) -> bool {
+    query.to_string().len() * 100 >= MAX_SMARTS_LEN * NEAR_SMARTS_LEN_LIMIT_PERCENT
 }
 
 fn operator_weight(
@@ -496,10 +497,10 @@ fn operator_weight(
     query: &QueryMol,
     reset_pool: &[SmartsGenome],
     recursive_depth: usize,
-    near_complexity_limit: bool,
+    near_smarts_len_limit: bool,
 ) -> u32 {
     if operator.is_eligible(query, reset_pool, recursive_depth) {
-        operator.weight(near_complexity_limit)
+        operator.weight(near_smarts_len_limit)
     } else {
         0
     }
@@ -1671,8 +1672,8 @@ mod tests {
     #[test]
     fn mutation_operator_metadata_is_consistent() {
         assert_eq!(MutationOperator::COUNT, MutationOperator::ALL.len());
-        assert_eq!(complexity_sensitive_weight(true, 3, 7), 3);
-        assert_eq!(complexity_sensitive_weight(false, 3, 7), 7);
+        assert_eq!(length_sensitive_weight(true, 3, 7), 3);
+        assert_eq!(length_sensitive_weight(false, 3, 7), 7);
 
         for (index, operator) in MutationOperator::ALL.iter().copied().enumerate() {
             assert_eq!(operator.as_index(), index);
@@ -1849,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_sampler_disables_grafting_near_complexity_limit() {
+    fn operator_sampler_disables_grafting_near_smarts_len_limit() {
         let over_limit = QueryMol::from_str(&over_limit_smarts_fixture()).unwrap();
         let reset_pool = vec![SmartsGenome::from_smarts("[#6]").unwrap()];
         let mut rng = SmallRng::seed_from_u64(82);
@@ -1863,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn genome_from_query_rejects_overly_complex_queries() {
+    fn genome_from_query_rejects_overly_long_queries() {
         let over_limit = over_limit_smarts_fixture();
         let query = QueryMol::from_str(&over_limit).unwrap();
 
@@ -2358,7 +2359,7 @@ mod tests {
             let mutated = mutator.mutate(genome.clone(), &mut rng);
             if mutated.is_valid()
                 && mutated.smarts() != genome.smarts()
-                && mutated.complexity().abs_diff(genome.complexity()) >= 2
+                && mutated.smarts_len().abs_diff(genome.smarts_len()) >= 2
             {
                 observed_large_change = true;
                 break;

@@ -188,15 +188,15 @@ impl RunRequest {
 pub struct RankedCandidate {
     smarts: String,
     mcc: f64,
-    complexity: usize,
+    smarts_len: usize,
 }
 
 impl RankedCandidate {
-    pub fn new(smarts: impl Into<String>, mcc: f64, complexity: usize) -> Self {
+    pub fn new(smarts: impl Into<String>, mcc: f64, smarts_len: usize) -> Self {
         Self {
             smarts: smarts.into(),
             mcc,
-            complexity,
+            smarts_len,
         }
     }
 
@@ -208,8 +208,8 @@ impl RankedCandidate {
         self.mcc
     }
 
-    pub fn complexity(&self) -> usize {
-        self.complexity
+    pub fn smarts_len(&self) -> usize {
+        self.smarts_len
     }
 }
 
@@ -314,8 +314,9 @@ pub struct ProgressUpdate {
     total_count: usize,
     duplicate_count: usize,
     cache_hits: usize,
-    lead_complexity: usize,
-    average_complexity: f64,
+    match_timeout_count: usize,
+    lead_smarts_len: usize,
+    average_smarts_len: f64,
     stagnation: u64,
 }
 
@@ -332,8 +333,9 @@ impl ProgressUpdate {
         total_count: usize,
         duplicate_count: usize,
         cache_hits: usize,
-        lead_complexity: usize,
-        average_complexity: f64,
+        match_timeout_count: usize,
+        lead_smarts_len: usize,
+        average_smarts_len: f64,
         stagnation: u64,
     ) -> Self {
         Self {
@@ -347,8 +349,9 @@ impl ProgressUpdate {
             total_count,
             duplicate_count,
             cache_hits,
-            lead_complexity,
-            average_complexity,
+            match_timeout_count,
+            lead_smarts_len,
+            average_smarts_len,
             stagnation,
         }
     }
@@ -393,12 +396,16 @@ impl ProgressUpdate {
         self.cache_hits
     }
 
-    pub fn lead_complexity(&self) -> usize {
-        self.lead_complexity
+    pub fn match_timeout_count(&self) -> usize {
+        self.match_timeout_count
     }
 
-    pub fn average_complexity(&self) -> f64 {
-        self.average_complexity
+    pub fn lead_smarts_len(&self) -> usize {
+        self.lead_smarts_len
+    }
+
+    pub fn average_smarts_len(&self) -> f64 {
+        self.average_smarts_len
     }
 
     pub fn stagnation(&self) -> u64 {

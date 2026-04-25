@@ -52,26 +52,25 @@ struct GenerationStats {
     duplicate_count: usize,
     cache_hits: usize,
     rejection_counts: EvaluationRejectionCounts,
-    lead_complexity: usize,
-    average_complexity: f64,
+    match_timeout_count: usize,
+    lead_smarts_len: usize,
+    average_smarts_len: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct EvaluationRejectionCounts {
-    complexity: usize,
     smarts_length: usize,
 }
 
 impl EvaluationRejectionCounts {
     fn record(&mut self, rejection: GenomeEvaluationRejection) {
         match rejection {
-            GenomeEvaluationRejection::Complexity { .. } => self.complexity += 1,
             GenomeEvaluationRejection::SmartsLength { .. } => self.smarts_length += 1,
         }
     }
 
     fn total(self) -> usize {
-        self.complexity + self.smarts_length
+        self.smarts_length
     }
 }
 
@@ -193,6 +192,11 @@ struct PreparedPopulationScores {
     uncached: Vec<SmartsGenome>,
     cache_hits: usize,
     rejection_counts: EvaluationRejectionCounts,
+}
+
+struct FreshPopulationScores {
+    scored: Vec<ScoredGenome>,
+    match_timeout_count: usize,
 }
 
 /// One generic evolution task.
@@ -354,7 +358,7 @@ pub struct TaskResult {
     task_id: String,
     best_smarts: String,
     best_mcc: f64,
-    best_complexity: usize,
+    best_smarts_len: usize,
     generations: u64,
     leaders: Vec<RankedSmarts>,
 }
@@ -372,8 +376,8 @@ impl TaskResult {
         self.best_mcc
     }
 
-    pub fn best_complexity(&self) -> usize {
-        self.best_complexity
+    pub fn best_smarts_len(&self) -> usize {
+        self.best_smarts_len
     }
 
     pub fn generations(&self) -> u64 {
@@ -390,7 +394,7 @@ impl TaskResult {
 pub struct RankedSmarts {
     smarts: String,
     mcc: f64,
-    complexity: usize,
+    smarts_len: usize,
 }
 
 impl RankedSmarts {
@@ -398,15 +402,15 @@ impl RankedSmarts {
         Self::from_parts(
             genome.smarts().to_string(),
             fitness.mcc(),
-            genome.complexity(),
+            genome.smarts_len(),
         )
     }
 
-    fn from_parts(smarts: String, mcc: f64, complexity: usize) -> Self {
+    fn from_parts(smarts: String, mcc: f64, smarts_len: usize) -> Self {
         Self {
             smarts,
             mcc,
-            complexity,
+            smarts_len,
         }
     }
 
@@ -414,7 +418,7 @@ impl RankedSmarts {
         Self::from_parts(
             evaluated.smarts().to_string(),
             evaluated.mcc(),
-            evaluated.complexity(),
+            evaluated.smarts_len(),
         )
     }
 
@@ -426,8 +430,8 @@ impl RankedSmarts {
         self.mcc
     }
 
-    pub fn complexity(&self) -> usize {
-        self.complexity
+    pub fn smarts_len(&self) -> usize {
+        self.smarts_len
     }
 }
 
@@ -453,10 +457,10 @@ pub struct EvolutionProgress {
     total_count: usize,
     duplicate_count: usize,
     cache_hits: usize,
-    complexity_rejection_count: usize,
     smarts_length_rejection_count: usize,
-    lead_complexity: usize,
-    average_complexity: f64,
+    match_timeout_count: usize,
+    lead_smarts_len: usize,
+    average_smarts_len: f64,
     stagnation: u64,
 }
 
@@ -598,10 +602,10 @@ impl EvolutionProgress {
             total_count: snapshot.stats.total_count,
             duplicate_count: snapshot.stats.duplicate_count,
             cache_hits: snapshot.stats.cache_hits,
-            complexity_rejection_count: snapshot.stats.rejection_counts.complexity,
             smarts_length_rejection_count: snapshot.stats.rejection_counts.smarts_length,
-            lead_complexity: snapshot.stats.lead_complexity,
-            average_complexity: snapshot.stats.average_complexity,
+            match_timeout_count: snapshot.stats.match_timeout_count,
+            lead_smarts_len: snapshot.stats.lead_smarts_len,
+            average_smarts_len: snapshot.stats.average_smarts_len,
             stagnation: snapshot.stagnation,
         }
     }
@@ -650,24 +654,24 @@ impl EvolutionProgress {
         self.cache_hits
     }
 
-    pub fn complexity_rejection_count(&self) -> usize {
-        self.complexity_rejection_count
-    }
-
     pub fn smarts_length_rejection_count(&self) -> usize {
         self.smarts_length_rejection_count
     }
 
     pub fn evaluation_rejection_count(&self) -> usize {
-        self.complexity_rejection_count + self.smarts_length_rejection_count
+        self.smarts_length_rejection_count
     }
 
-    pub fn lead_complexity(&self) -> usize {
-        self.lead_complexity
+    pub fn match_timeout_count(&self) -> usize {
+        self.match_timeout_count
     }
 
-    pub fn average_complexity(&self) -> f64 {
-        self.average_complexity
+    pub fn lead_smarts_len(&self) -> usize {
+        self.lead_smarts_len
+    }
+
+    pub fn average_smarts_len(&self) -> f64 {
+        self.average_smarts_len
     }
 
     pub fn stagnation(&self) -> u64 {
@@ -688,7 +692,7 @@ pub struct EvolutionSession {
     rng: SmallRng,
     best_fitness: ObjectiveFitness,
     best_smarts: String,
-    best_complexity: usize,
+    best_smarts_len: usize,
     stagnation: u64,
     fitness_cache: FitnessCache,
     last_leaders: Vec<RankedSmarts>,
@@ -774,7 +778,7 @@ impl EvolutionSession {
             rng,
             best_fitness: ObjectiveFitness::invalid(),
             best_smarts: String::from("[#6]"),
-            best_complexity: 0,
+            best_smarts_len: 0,
             stagnation: 0,
             fitness_cache: FitnessCache::new(config.fitness_cache_capacity()),
             last_leaders: Vec::new(),
@@ -858,7 +862,11 @@ impl EvolutionSession {
 
     /// Advance the search by one scored generation.
     pub fn step(&mut self) -> Option<EvolutionProgress> {
-        self.step_internal(None)
+        self.step_internal(
+            None,
+            #[cfg(target_arch = "wasm32")]
+            None,
+        )
     }
 
     /// Advance the search by one generation and report scoring progress.
@@ -866,12 +874,26 @@ impl EvolutionSession {
         &mut self,
         mut on_evaluation_progress: impl FnMut(EvolutionEvaluationProgress) + Send,
     ) -> Option<EvolutionProgress> {
-        self.step_internal(Some(&mut on_evaluation_progress))
+        self.step_internal(
+            Some(&mut on_evaluation_progress),
+            #[cfg(target_arch = "wasm32")]
+            None,
+        )
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn step_with_evaluation_progress_and_clock(
+        &mut self,
+        now_ms: &dyn Fn() -> f64,
+        mut on_evaluation_progress: impl FnMut(EvolutionEvaluationProgress) + Send,
+    ) -> Option<EvolutionProgress> {
+        self.step_internal(Some(&mut on_evaluation_progress), Some(now_ms))
     }
 
     fn step_internal(
         &mut self,
         mut on_evaluation_progress: Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
+        #[cfg(target_arch = "wasm32")] now_ms: Option<&dyn Fn() -> f64>,
     ) -> Option<EvolutionProgress> {
         if self.finished_result.is_some() || self.generation >= self.config.generation_limit() {
             return None;
@@ -882,7 +904,7 @@ impl EvolutionSession {
         let generation_limit = self.config.generation_limit();
         let total_count = self.population.len();
         let evaluation_total = total_count.max(1);
-        let average_complexity = average_complexity(&self.population);
+        let average_smarts_len = average_smarts_len(&self.population);
         let mut evaluation_progress = EvaluationProgressTracker::new(
             self.task_id.clone(),
             generation_number,
@@ -902,20 +924,23 @@ impl EvolutionSession {
             &mut evaluation_progress,
             &mut on_evaluation_progress,
         );
-        let mut unique_scored = prepared_scores.scored;
-        unique_scored.extend(self.score_uncached_population(
+        let fresh_scores = self.score_uncached_population(
             prepared_scores.uncached,
             generation_number,
             &mut evaluation_progress,
             &mut on_evaluation_progress,
-        ));
+            #[cfg(target_arch = "wasm32")]
+            now_ms,
+        );
+        let mut unique_scored = prepared_scores.scored;
+        unique_scored.extend(fresh_scores.scored);
 
         unique_scored = phenotypically_deduplicate(unique_scored);
         unique_scored.sort_by(compare_scored_genomes);
         let leaders = leaderboard_from_scored(&unique_scored, self.leaderboard_size);
 
         let lead = &unique_scored[0];
-        let lead_complexity = lead.genome.complexity();
+        let lead_smarts_len = lead.genome.smarts_len();
         self.update_incumbent_from_lead(generation, lead);
 
         let stats = GenerationStats {
@@ -924,8 +949,9 @@ impl EvolutionSession {
             duplicate_count,
             cache_hits: prepared_scores.cache_hits,
             rejection_counts: prepared_scores.rejection_counts,
-            lead_complexity,
-            average_complexity,
+            match_timeout_count: fresh_scores.match_timeout_count,
+            lead_smarts_len,
+            average_smarts_len,
         };
 
         debug!(
@@ -954,7 +980,7 @@ impl EvolutionSession {
             best_so_far: RankedSmarts {
                 smarts: self.best_smarts.clone(),
                 mcc: self.best_fitness.mcc(),
-                complexity: self.best_complexity,
+                smarts_len: self.best_smarts_len,
             },
             leaders,
             stats: &stats,
@@ -974,7 +1000,7 @@ impl EvolutionSession {
                 &self.task_id,
                 self.best_smarts.clone(),
                 self.best_fitness,
-                self.best_complexity,
+                self.best_smarts_len,
                 generations,
                 self.last_leaders.clone(),
             ));
@@ -992,7 +1018,7 @@ impl EvolutionSession {
                 &self.task_id,
                 self.best_smarts.clone(),
                 self.best_fitness,
-                self.best_complexity,
+                self.best_smarts_len,
                 generations,
                 self.last_leaders.clone(),
             ));
@@ -1074,35 +1100,97 @@ impl EvolutionSession {
         generation: u64,
         evaluation_progress: &mut EvaluationProgressTracker,
         on_evaluation_progress: &mut Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
-    ) -> Vec<ScoredGenome> {
+        #[cfg(target_arch = "wasm32")] now_ms: Option<&dyn Fn() -> f64>,
+    ) -> FreshPopulationScores {
         let log_settings = EvaluationLogSettings::new(
             self.task_id.clone(),
             generation,
             self.evaluator.fold_count(),
             self.evaluator.target_count(),
+            self.config.match_time_limit(),
             self.config.slow_evaluation_log_threshold(),
         );
 
         let freshly_scored = if on_evaluation_progress.is_some() {
-            self.evaluator.evaluate_many_with_progress_and_logging(
-                uncached_genomes,
-                &log_settings,
-                |progress| {
-                    let last = progress.last().map(RankedSmarts::from_evaluated);
-                    evaluation_progress.record_completed(last, on_evaluation_progress);
-                },
-            )
+            #[cfg(target_arch = "wasm32")]
+            let freshly_scored = if let Some(now_ms) = now_ms {
+                self.evaluator
+                    .evaluate_many_with_progress_logging_and_clock(
+                        uncached_genomes,
+                        &log_settings,
+                        now_ms,
+                        |progress| {
+                            let last = progress.last().map(RankedSmarts::from_evaluated);
+                            evaluation_progress.record_completed(last, on_evaluation_progress);
+                        },
+                    )
+            } else {
+                self.evaluator.evaluate_many_with_progress_and_logging(
+                    uncached_genomes,
+                    &log_settings,
+                    |progress| {
+                        let last = progress.last().map(RankedSmarts::from_evaluated);
+                        evaluation_progress.record_completed(last, on_evaluation_progress);
+                    },
+                )
+            };
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                freshly_scored
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.evaluator.evaluate_many_with_progress_and_logging(
+                    uncached_genomes,
+                    &log_settings,
+                    |progress| {
+                        let last = progress.last().map(RankedSmarts::from_evaluated);
+                        evaluation_progress.record_completed(last, on_evaluation_progress);
+                    },
+                )
+            }
         } else {
-            self.evaluator
-                .evaluate_many_with_logging(uncached_genomes, &log_settings)
+            #[cfg(target_arch = "wasm32")]
+            let freshly_scored = if let Some(now_ms) = now_ms {
+                self.evaluator.evaluate_many_with_logging_and_clock(
+                    uncached_genomes,
+                    &log_settings,
+                    now_ms,
+                )
+            } else {
+                self.evaluator
+                    .evaluate_many_with_logging(uncached_genomes, &log_settings)
+            };
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                freshly_scored
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.evaluator
+                    .evaluate_many_with_logging(uncached_genomes, &log_settings)
+            }
         };
 
-        freshly_scored
+        let match_timeout_count = freshly_scored
+            .iter()
+            .filter(|(_, evaluation)| evaluation.limit_exceeded())
+            .count();
+        let scored = freshly_scored
             .into_iter()
             .map(|(genome, evaluation)| {
                 build_scored_genome(&mut self.fitness_cache, genome, evaluation)
             })
-            .collect()
+            .collect();
+
+        FreshPopulationScores {
+            scored,
+            match_timeout_count,
+        }
     }
 
     fn update_incumbent_from_lead(&mut self, generation: u64, lead: &ScoredGenome) {
@@ -1111,13 +1199,13 @@ impl EvolutionSession {
                 lead.fitness,
                 &lead.genome,
                 self.best_fitness,
-                self.best_complexity,
+                self.best_smarts_len,
                 &self.best_smarts,
             )
         {
             self.best_fitness = lead.fitness;
             self.best_smarts = lead.genome.smarts().to_string();
-            self.best_complexity = lead.genome.complexity();
+            self.best_smarts_len = lead.genome.smarts_len();
             self.stagnation = 0;
         } else {
             self.stagnation += 1;
@@ -1192,7 +1280,7 @@ impl EvolutionSession {
         RankedSmarts::from_parts(
             self.best_smarts.clone(),
             self.best_fitness.mcc(),
-            self.best_complexity,
+            self.best_smarts_len,
         )
     }
 }
@@ -1272,14 +1360,13 @@ fn update_ranked_best(best: &mut Option<RankedSmarts>, candidate: &RankedSmarts)
 fn ranked_is_better(candidate: &RankedSmarts, current: &RankedSmarts) -> bool {
     candidate.mcc() > current.mcc()
         || (candidate.mcc() == current.mcc()
-            && (candidate.complexity() < current.complexity()
-                || (candidate.complexity() == current.complexity()
+            && (candidate.smarts_len() < current.smarts_len()
+                || (candidate.smarts_len() == current.smarts_len()
                     && candidate.smarts() < current.smarts())))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenomeEvaluationRejection {
-    Complexity { actual: usize, max: usize },
     SmartsLength { actual: usize, max: usize },
 }
 
@@ -1287,16 +1374,7 @@ fn genome_evaluation_rejection(
     config: &EvolutionConfig,
     genome: &SmartsGenome,
 ) -> Option<GenomeEvaluationRejection> {
-    let complexity = genome.complexity();
-    let max_complexity = config.max_evaluation_smarts_complexity();
-    if complexity > max_complexity {
-        return Some(GenomeEvaluationRejection::Complexity {
-            actual: complexity,
-            max: max_complexity,
-        });
-    }
-
-    let smarts_len = genome.smarts().len();
+    let smarts_len = genome.smarts_len();
     config
         .max_evaluation_smarts_len()
         .filter(|&max_len| smarts_len > max_len)
@@ -1313,27 +1391,14 @@ fn log_rejected_genome(
     rejection: GenomeEvaluationRejection,
 ) {
     match rejection {
-        GenomeEvaluationRejection::Complexity { actual, max } => {
-            warn!(
-                target: "smarts_evolution::evolution::runner",
-                "rejecting SMARTS before evaluation task_id={} generation={} reason=complexity actual={} max={} smarts_len={} smarts={}",
-                task_id,
-                generation,
-                actual,
-                max,
-                genome.smarts().len(),
-                genome.smarts(),
-            );
-        }
         GenomeEvaluationRejection::SmartsLength { actual, max } => {
             warn!(
                 target: "smarts_evolution::evolution::runner",
-                "rejecting SMARTS before evaluation task_id={} generation={} reason=smarts_len actual={} max={} complexity={} smarts={}",
+                "rejecting SMARTS before evaluation task_id={} generation={} reason=smarts_len actual={} max={} smarts={}",
                 task_id,
                 generation,
                 actual,
                 max,
-                genome.complexity(),
                 genome.smarts(),
             );
         }
@@ -1344,7 +1409,7 @@ fn build_task_result(
     task_id: &str,
     best_smarts: String,
     best_fitness: ObjectiveFitness,
-    best_complexity: usize,
+    best_smarts_len: usize,
     generations: u64,
     leaders: Vec<RankedSmarts>,
 ) -> TaskResult {
@@ -1352,7 +1417,7 @@ fn build_task_result(
         task_id: task_id.to_string(),
         best_smarts,
         best_mcc: best_fitness.mcc(),
-        best_complexity,
+        best_smarts_len,
         generations,
         leaders,
     }
@@ -1475,13 +1540,13 @@ fn build_reset_pool(
     reset_pool
 }
 
-fn average_complexity(population: &[SmartsGenome]) -> f64 {
+fn average_smarts_len(population: &[SmartsGenome]) -> f64 {
     if population.is_empty() {
         return 0.0;
     }
 
-    let total_complexity: usize = population.iter().map(SmartsGenome::complexity).sum();
-    total_complexity as f64 / population.len() as f64
+    let total_smarts_len: usize = population.iter().map(SmartsGenome::smarts_len).sum();
+    total_smarts_len as f64 / population.len() as f64
 }
 
 fn build_rng(config: &EvolutionConfig) -> SmallRng {
@@ -1504,7 +1569,7 @@ fn generation_progress_message(
     best: ObjectiveFitness,
 ) -> String {
     format!(
-        "lead={:.3} best={:.3} uniq={}/{} dup={} cache={}/{} rejected={} complexity_rejected={} smarts_len_rejected={} complexity={} avg_complexity={:.1}",
+        "lead={:.3} best={:.3} uniq={}/{} dup={} cache={}/{} rejected={} smarts_len_rejected={} match_timeouts={} smarts_len={} avg_smarts_len={:.1}",
         lead.mcc(),
         best.mcc(),
         stats.unique_count,
@@ -1513,10 +1578,10 @@ fn generation_progress_message(
         stats.cache_hits,
         stats.unique_count,
         stats.rejection_counts.total(),
-        stats.rejection_counts.complexity,
         stats.rejection_counts.smarts_length,
-        stats.lead_complexity,
-        stats.average_complexity,
+        stats.match_timeout_count,
+        stats.lead_smarts_len,
+        stats.average_smarts_len,
     )
 }
 
@@ -1524,7 +1589,7 @@ fn compare_scored_genomes(left: &ScoredGenome, right: &ScoredGenome) -> Ordering
     right
         .fitness
         .cmp(&left.fitness)
-        .then_with(|| left.genome.complexity().cmp(&right.genome.complexity()))
+        .then_with(|| left.genome.smarts_len().cmp(&right.genome.smarts_len()))
         .then_with(|| left.genome.smarts().cmp(right.genome.smarts()))
 }
 
@@ -1532,13 +1597,13 @@ fn is_better_candidate(
     candidate_fitness: ObjectiveFitness,
     candidate: &SmartsGenome,
     best_fitness: ObjectiveFitness,
-    best_complexity: usize,
+    best_smarts_len: usize,
     best_smarts: &str,
 ) -> bool {
     candidate_fitness > best_fitness
         || (candidate_fitness == best_fitness
-            && (candidate.complexity() < best_complexity
-                || (candidate.complexity() == best_complexity && candidate.smarts() < best_smarts)))
+            && (candidate.smarts_len() < best_smarts_len
+                || (candidate.smarts_len() == best_smarts_len && candidate.smarts() < best_smarts)))
 }
 
 fn tournament_select(
@@ -2143,14 +2208,14 @@ mod regression_tests {
     }
 
     #[test]
-    fn lower_complexity_smarts_win_when_scores_tie() {
+    fn lower_smarts_len_smarts_win_when_scores_tie() {
         let simple = scored("[#6]", 0.75, &[0b0001]);
-        let complex = scored("[#6]~[#7]", 0.75, &[0b0010]);
+        let longer = scored("[#6]~[#7]", 0.75, &[0b0010]);
 
-        assert!(simple.genome.complexity() < complex.genome.complexity());
+        assert!(simple.genome.smarts_len() < longer.genome.smarts_len());
 
-        assert!(compare_scored_genomes(&simple, &complex).is_lt());
-        assert!(compare_scored_genomes(&complex, &simple).is_gt());
+        assert!(compare_scored_genomes(&simple, &longer).is_lt());
+        assert!(compare_scored_genomes(&longer, &simple).is_gt());
     }
 
     #[test]
@@ -2198,12 +2263,10 @@ mod regression_tests {
                 total_count: 1024,
                 duplicate_count: 642,
                 cache_hits: 208,
-                rejection_counts: EvaluationRejectionCounts {
-                    complexity: 12,
-                    smarts_length: 5,
-                },
-                lead_complexity: 16,
-                average_complexity: 12.4,
+                rejection_counts: EvaluationRejectionCounts { smarts_length: 5 },
+                match_timeout_count: 12,
+                lead_smarts_len: 16,
+                average_smarts_len: 12.4,
             },
             fitness(0.6621),
             fitness(0.7314),
@@ -2211,13 +2274,13 @@ mod regression_tests {
 
         assert_eq!(
             message,
-            "lead=0.662 best=0.731 uniq=382/1024 dup=642 cache=208/382 rejected=17 complexity_rejected=12 smarts_len_rejected=5 complexity=16 avg_complexity=12.4"
+            "lead=0.662 best=0.731 uniq=382/1024 dup=642 cache=208/382 rejected=5 smarts_len_rejected=5 match_timeouts=12 smarts_len=16 avg_smarts_len=12.4"
         );
     }
 
     #[test]
-    fn average_complexity_handles_empty_population() {
-        assert_eq!(average_complexity(&[]), 0.0);
+    fn average_smarts_len_handles_empty_population() {
+        assert_eq!(average_smarts_len(&[]), 0.0);
     }
 
     #[test]
@@ -2261,19 +2324,17 @@ mod regression_tests {
         let ranked = RankedSmarts::new(&genome, fitness(0.5));
         assert_eq!(ranked.smarts(), "[#6]");
         assert_eq!(ranked.mcc(), 0.5);
-        assert_eq!(ranked.complexity(), genome.complexity());
+        assert_eq!(ranked.smarts_len(), genome.smarts_len());
 
         let stats = GenerationStats {
             unique_count: 2,
             total_count: 3,
             duplicate_count: 1,
             cache_hits: 1,
-            rejection_counts: EvaluationRejectionCounts {
-                complexity: 1,
-                smarts_length: 2,
-            },
-            lead_complexity: 4,
-            average_complexity: 2.5,
+            rejection_counts: EvaluationRejectionCounts { smarts_length: 2 },
+            match_timeout_count: 3,
+            lead_smarts_len: 4,
+            average_smarts_len: 2.5,
         };
         let progress = EvolutionProgress::from_snapshot(ProgressSnapshot {
             task_id: "task-1",
@@ -2298,11 +2359,11 @@ mod regression_tests {
         assert_eq!(progress.total_count(), 3);
         assert_eq!(progress.duplicate_count(), 1);
         assert_eq!(progress.cache_hits(), 1);
-        assert_eq!(progress.complexity_rejection_count(), 1);
         assert_eq!(progress.smarts_length_rejection_count(), 2);
-        assert_eq!(progress.evaluation_rejection_count(), 3);
-        assert_eq!(progress.lead_complexity(), 4);
-        assert_eq!(progress.average_complexity(), 2.5);
+        assert_eq!(progress.evaluation_rejection_count(), 2);
+        assert_eq!(progress.match_timeout_count(), 3);
+        assert_eq!(progress.lead_smarts_len(), 4);
+        assert_eq!(progress.average_smarts_len(), 2.5);
         assert_eq!(progress.stagnation(), 2);
 
         let evaluation_progress =
@@ -2345,7 +2406,7 @@ mod regression_tests {
         assert_eq!(result.task_id(), "task-1");
         assert_eq!(result.best_smarts(), "[#7]");
         assert_eq!(result.best_mcc(), 0.75);
-        assert_eq!(result.best_complexity(), 11);
+        assert_eq!(result.best_smarts_len(), 11);
         assert_eq!(result.generations(), 4);
         assert_eq!(result.leaders().len(), 1);
 
@@ -2363,31 +2424,31 @@ mod regression_tests {
         assert_eq!(rng_a.random::<u64>(), rng_b.random::<u64>());
 
         let simple = SmartsGenome::from_smarts("[#6]").unwrap();
-        let complex = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
-        assert!(simple.complexity() < complex.complexity());
+        let longer = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+        assert!(simple.smarts_len() < longer.smarts_len());
         assert!(is_better_candidate(
             fitness(0.5),
             &simple,
             fitness(0.5),
-            complex.complexity(),
-            complex.smarts(),
+            longer.smarts_len(),
+            longer.smarts(),
         ));
         assert!(!is_better_candidate(
             fitness(0.5),
-            &complex,
+            &longer,
             fitness(0.5),
-            simple.complexity(),
+            simple.smarts_len(),
             simple.smarts(),
         ));
 
         let alpha = SmartsGenome::from_smarts("[#6]").unwrap();
         let beta = SmartsGenome::from_smarts("[#7]").unwrap();
-        assert_eq!(alpha.complexity(), beta.complexity());
+        assert_eq!(alpha.smarts_len(), beta.smarts_len());
         assert!(is_better_candidate(
             fitness(0.5),
             &alpha,
             fitness(0.5),
-            beta.complexity(),
+            beta.smarts_len(),
             beta.smarts(),
         ));
 
@@ -2408,11 +2469,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn evaluation_limits_reject_over_budget_genomes_before_matching() {
-        let by_complexity = EvolutionConfig::builder()
-            .max_evaluation_smarts_complexity(1)
-            .build()
-            .unwrap();
+    fn optional_length_limit_rejects_over_budget_genomes_before_matching() {
         let by_length = EvolutionConfig::builder()
             .max_evaluation_smarts_len(4)
             .build()
@@ -2420,16 +2477,9 @@ mod regression_tests {
         let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
 
         assert_eq!(
-            genome_evaluation_rejection(&by_complexity, &genome),
-            Some(GenomeEvaluationRejection::Complexity {
-                actual: genome.complexity(),
-                max: 1
-            })
-        );
-        assert_eq!(
             genome_evaluation_rejection(&by_length, &genome),
             Some(GenomeEvaluationRejection::SmartsLength {
-                actual: genome.smarts().len(),
+                actual: genome.smarts_len(),
                 max: 4
             })
         );

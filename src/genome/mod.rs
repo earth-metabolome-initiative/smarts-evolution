@@ -13,7 +13,7 @@ pub(crate) fn over_limit_smarts_fixture() -> alloc::string::String {
         atoms.push("[#6]");
         let smarts = atoms.join(".");
         let genome = SmartsGenome::from_smarts(&smarts).unwrap();
-        if genome.complexity() > limits::MAX_SMARTS_COMPLEXITY {
+        if genome.smarts_len() > limits::MAX_SMARTS_LEN {
             return smarts;
         }
     }

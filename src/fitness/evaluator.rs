@@ -8,8 +8,8 @@ use core::time::Duration;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use rayon::prelude::*;
 use smarts_rs::{
-    CompiledQuery, MatchScratch, PreparedTarget, QueryMol, QueryScreen, TargetCorpusIndex,
-    TargetCorpusScratch,
+    CompiledQuery, MatchLimitResult, MatchScratch, PreparedTarget, QueryMol, QueryScreen,
+    TargetCorpusIndex, TargetCorpusScratch,
 };
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::sync::Mutex;
@@ -19,9 +19,7 @@ use std::time::Instant;
 use super::mcc::{ConfusionCounts, compute_fold_averaged_mcc};
 use super::objective::ObjectiveFitness;
 use crate::genome::SmartsGenome;
-use log::debug;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-use log::warn;
+use log::{debug, warn};
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 const MIN_PARALLEL_GENOMES: usize = 8;
@@ -134,6 +132,7 @@ pub(crate) struct EvaluationLogSettings {
     generation: u64,
     fold_count: usize,
     target_count: usize,
+    match_time_limit: Option<Duration>,
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     slow_log_threshold: Option<Duration>,
 }
@@ -144,6 +143,7 @@ impl EvaluationLogSettings {
         generation: u64,
         fold_count: usize,
         target_count: usize,
+        match_time_limit: Option<Duration>,
         slow_log_threshold: Option<Duration>,
     ) -> Self {
         #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
@@ -154,17 +154,54 @@ impl EvaluationLogSettings {
             generation,
             fold_count,
             target_count,
+            match_time_limit,
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             slow_log_threshold,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum EvaluationMatchLimit<'a> {
+    None,
+    Configured {
+        max_elapsed: Duration,
+        #[cfg(target_arch = "wasm32")]
+        now_ms: Option<&'a dyn Fn() -> f64>,
+        #[cfg(not(target_arch = "wasm32"))]
+        _marker: core::marker::PhantomData<&'a ()>,
+    },
+}
+
+impl<'a> EvaluationMatchLimit<'a> {
+    fn from_settings(
+        settings: Option<&EvaluationLogSettings>,
+        #[cfg(target_arch = "wasm32")] now_ms: Option<&'a dyn Fn() -> f64>,
+    ) -> Self {
+        match settings.and_then(|settings| settings.match_time_limit) {
+            Some(max_elapsed) => Self::Configured {
+                max_elapsed,
+                #[cfg(target_arch = "wasm32")]
+                now_ms,
+                #[cfg(not(target_arch = "wasm32"))]
+                _marker: core::marker::PhantomData,
+            },
+            None => Self::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvaluationFailure {
+    InvalidQuery,
+    LimitExceeded,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EvaluatedSmarts {
     smarts: String,
     mcc: f64,
-    complexity: usize,
+    smarts_len: usize,
 }
 
 impl EvaluatedSmarts {
@@ -172,7 +209,7 @@ impl EvaluatedSmarts {
         Self {
             smarts: genome.smarts().to_string(),
             mcc: fitness.mcc(),
-            complexity: genome.complexity(),
+            smarts_len: genome.smarts_len(),
         }
     }
 
@@ -184,8 +221,8 @@ impl EvaluatedSmarts {
         self.mcc
     }
 
-    pub fn complexity(&self) -> usize {
-        self.complexity
+    pub fn smarts_len(&self) -> usize {
+        self.smarts_len
     }
 }
 
@@ -251,6 +288,7 @@ impl EvaluationProgress {
 pub struct GenomeEvaluation {
     fitness: ObjectiveFitness,
     phenotype: Arc<[u64]>,
+    limit_exceeded: bool,
 }
 
 impl GenomeEvaluation {
@@ -260,6 +298,10 @@ impl GenomeEvaluation {
 
     pub fn phenotype(&self) -> &Arc<[u64]> {
         &self.phenotype
+    }
+
+    pub fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
     }
 }
 
@@ -288,10 +330,12 @@ impl SmartsEvaluator {
     fn fold_counts_and_behavior_for_query(
         &self,
         query: &QueryMol,
-    ) -> Option<(Vec<ConfusionCounts>, Arc<[u64]>)> {
-        let compiled = CompiledQuery::new(query.clone()).ok()?;
+        limit: EvaluationMatchLimit<'_>,
+    ) -> Result<(Vec<ConfusionCounts>, Arc<[u64]>), EvaluationFailure> {
+        let compiled =
+            CompiledQuery::new(query.clone()).map_err(|_| EvaluationFailure::InvalidQuery)?;
         let screen = QueryScreen::new(compiled.query());
-        Some(self.fold_counts_and_behavior_for_compiled(&compiled, &screen))
+        self.fold_counts_and_behavior_for_compiled(&compiled, &screen, limit)
     }
 
     // Keep fold aggregation localized so future evaluator changes stay local.
@@ -299,18 +343,24 @@ impl SmartsEvaluator {
         &self,
         compiled: &CompiledQuery,
         screen: &QueryScreen,
-    ) -> (Vec<ConfusionCounts>, Arc<[u64]>) {
+        limit: EvaluationMatchLimit<'_>,
+    ) -> Result<(Vec<ConfusionCounts>, Arc<[u64]>), EvaluationFailure> {
         let total_samples: usize = self.folds.iter().map(FoldData::len).sum();
         let mut behavior_words = vec![0u64; total_samples.div_ceil(64)];
         let mut bit_index = 0usize;
-        let fold_counts = self
-            .folds
-            .iter()
-            .map(|fold| {
-                count_matches_in_fold(compiled, screen, fold, &mut behavior_words, &mut bit_index)
-            })
-            .collect();
-        (fold_counts, Arc::from(behavior_words))
+        let mut fold_counts = Vec::with_capacity(self.folds.len());
+        for fold in &self.folds {
+            let counts = count_matches_in_fold(
+                compiled,
+                screen,
+                fold,
+                &mut behavior_words,
+                &mut bit_index,
+                limit,
+            )?;
+            fold_counts.push(counts);
+        }
+        Ok((fold_counts, Arc::from(behavior_words)))
     }
 
     /// Evaluate the MCC objective for a genome.
@@ -323,19 +373,31 @@ impl SmartsEvaluator {
     }
 
     pub fn evaluate(&self, genome: &SmartsGenome) -> GenomeEvaluation {
-        let Some((fold_counts, phenotype)) =
-            self.fold_counts_and_behavior_for_query(genome.query())
-        else {
-            return GenomeEvaluation {
-                fitness: ObjectiveFitness::invalid(),
-                phenotype: Arc::from([]),
+        self.evaluate_with_limit(genome, EvaluationMatchLimit::None)
+    }
+
+    fn evaluate_with_limit(
+        &self,
+        genome: &SmartsGenome,
+        limit: EvaluationMatchLimit<'_>,
+    ) -> GenomeEvaluation {
+        let (fold_counts, phenotype) =
+            match self.fold_counts_and_behavior_for_query(genome.query(), limit) {
+                Ok(result) => result,
+                Err(failure) => {
+                    return GenomeEvaluation {
+                        fitness: ObjectiveFitness::invalid(),
+                        phenotype: Arc::from([]),
+                        limit_exceeded: failure == EvaluationFailure::LimitExceeded,
+                    };
+                }
             };
-        };
 
         let mcc = compute_fold_averaged_mcc(&fold_counts);
         GenomeEvaluation {
             fitness: ObjectiveFitness::from_mcc(mcc),
             phenotype,
+            limit_exceeded: false,
         }
     }
 
@@ -343,6 +405,7 @@ impl SmartsEvaluator {
         &self,
         genome: &SmartsGenome,
         settings: Option<&EvaluationLogSettings>,
+        #[cfg(target_arch = "wasm32")] now_ms: Option<&dyn Fn() -> f64>,
     ) -> GenomeEvaluation {
         if let Some(settings) = settings {
             log_evaluation_start(genome, settings);
@@ -351,13 +414,27 @@ impl SmartsEvaluator {
         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         let started = Instant::now();
 
-        let evaluation = self.evaluate(genome);
+        let evaluation = self.evaluate_with_limit(
+            genome,
+            EvaluationMatchLimit::from_settings(
+                settings,
+                #[cfg(target_arch = "wasm32")]
+                now_ms,
+            ),
+        );
+
+        if evaluation.limit_exceeded()
+            && let Some(settings) = settings
+        {
+            log_limit_exceeded(genome, settings);
+        }
 
         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         if let Some(settings) = settings {
             log_slow_evaluation_if_needed(
                 genome,
                 evaluation.fitness(),
+                evaluation.limit_exceeded(),
                 settings,
                 started.elapsed(),
             );
@@ -372,7 +449,12 @@ impl SmartsEvaluator {
         &self,
         genomes: Vec<SmartsGenome>,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
-        self.evaluate_many_with_optional_logging(genomes, None)
+        self.evaluate_many_with_optional_logging(
+            genomes,
+            None,
+            #[cfg(target_arch = "wasm32")]
+            None,
+        )
     }
 
     pub(crate) fn evaluate_many_with_logging(
@@ -380,13 +462,29 @@ impl SmartsEvaluator {
         genomes: Vec<SmartsGenome>,
         settings: &EvaluationLogSettings,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
-        self.evaluate_many_with_optional_logging(genomes, Some(settings))
+        self.evaluate_many_with_optional_logging(
+            genomes,
+            Some(settings),
+            #[cfg(target_arch = "wasm32")]
+            None,
+        )
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn evaluate_many_with_logging_and_clock(
+        &self,
+        genomes: Vec<SmartsGenome>,
+        settings: &EvaluationLogSettings,
+        now_ms: &dyn Fn() -> f64,
+    ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
+        self.evaluate_many_with_optional_logging(genomes, Some(settings), Some(now_ms))
     }
 
     fn evaluate_many_with_optional_logging(
         &self,
         genomes: Vec<SmartsGenome>,
         settings: Option<&EvaluationLogSettings>,
+        #[cfg(target_arch = "wasm32")] now_ms: Option<&dyn Fn() -> f64>,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         if genomes.len() >= MIN_PARALLEL_GENOMES {
@@ -402,7 +500,12 @@ impl SmartsEvaluator {
         genomes
             .into_iter()
             .map(|genome| {
-                let evaluation = self.evaluate_with_logging(&genome, settings);
+                let evaluation = self.evaluate_with_logging(
+                    &genome,
+                    settings,
+                    #[cfg(target_arch = "wasm32")]
+                    now_ms,
+                );
                 (genome, evaluation)
             })
             .collect()
@@ -418,7 +521,13 @@ impl SmartsEvaluator {
         genomes: Vec<SmartsGenome>,
         on_progress: impl FnMut(EvaluationProgress) + Send,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
-        self.evaluate_many_with_progress_and_optional_logging(genomes, None, on_progress)
+        self.evaluate_many_with_progress_and_optional_logging(
+            genomes,
+            None,
+            #[cfg(target_arch = "wasm32")]
+            None,
+            on_progress,
+        )
     }
 
     pub(crate) fn evaluate_many_with_progress_and_logging(
@@ -427,13 +536,36 @@ impl SmartsEvaluator {
         settings: &EvaluationLogSettings,
         on_progress: impl FnMut(EvaluationProgress) + Send,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
-        self.evaluate_many_with_progress_and_optional_logging(genomes, Some(settings), on_progress)
+        self.evaluate_many_with_progress_and_optional_logging(
+            genomes,
+            Some(settings),
+            #[cfg(target_arch = "wasm32")]
+            None,
+            on_progress,
+        )
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn evaluate_many_with_progress_logging_and_clock(
+        &self,
+        genomes: Vec<SmartsGenome>,
+        settings: &EvaluationLogSettings,
+        now_ms: &dyn Fn() -> f64,
+        on_progress: impl FnMut(EvaluationProgress) + Send,
+    ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
+        self.evaluate_many_with_progress_and_optional_logging(
+            genomes,
+            Some(settings),
+            Some(now_ms),
+            on_progress,
+        )
     }
 
     fn evaluate_many_with_progress_and_optional_logging(
         &self,
         genomes: Vec<SmartsGenome>,
         settings: Option<&EvaluationLogSettings>,
+        #[cfg(target_arch = "wasm32")] now_ms: Option<&dyn Fn() -> f64>,
         on_progress: impl FnMut(EvaluationProgress) + Send,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
         let total = genomes.len().max(1);
@@ -464,7 +596,12 @@ impl SmartsEvaluator {
         genomes
             .into_iter()
             .map(|genome| {
-                let evaluation = self.evaluate_with_logging(&genome, settings);
+                let evaluation = self.evaluate_with_logging(
+                    &genome,
+                    settings,
+                    #[cfg(target_arch = "wasm32")]
+                    now_ms,
+                );
                 progress.record(&genome, evaluation.fitness());
                 (genome, evaluation)
             })
@@ -522,13 +659,31 @@ where
 fn log_evaluation_start(genome: &SmartsGenome, settings: &EvaluationLogSettings) {
     debug!(
         target: "smarts_evolution::fitness::evaluator",
-        "starting SMARTS evaluation task_id={} generation={} folds={} targets={} complexity={} smarts_len={} smarts={}",
+        "starting SMARTS evaluation task_id={} generation={} folds={} targets={} smarts_len={} match_time_limit_ms={} smarts={}",
         settings.task_id,
         settings.generation,
         settings.fold_count,
         settings.target_count,
-        genome.complexity(),
         genome.smarts().len(),
+        settings
+            .match_time_limit
+            .map_or(0, |limit| limit.as_millis()),
+        genome.smarts(),
+    );
+}
+
+fn log_limit_exceeded(genome: &SmartsGenome, settings: &EvaluationLogSettings) {
+    warn!(
+        target: "smarts_evolution::fitness::evaluator",
+        "SMARTS evaluation exceeded match limit task_id={} generation={} folds={} targets={} smarts_len={} match_time_limit_ms={} smarts={}",
+        settings.task_id,
+        settings.generation,
+        settings.fold_count,
+        settings.target_count,
+        genome.smarts().len(),
+        settings
+            .match_time_limit
+            .map_or(0, |limit| limit.as_millis()),
         genome.smarts(),
     );
 }
@@ -537,6 +692,7 @@ fn log_evaluation_start(genome: &SmartsGenome, settings: &EvaluationLogSettings)
 fn log_slow_evaluation_if_needed(
     genome: &SmartsGenome,
     fitness: ObjectiveFitness,
+    limit_exceeded: bool,
     settings: &EvaluationLogSettings,
     elapsed: Duration,
 ) {
@@ -549,15 +705,15 @@ fn log_slow_evaluation_if_needed(
 
     warn!(
         target: "smarts_evolution::fitness::evaluator",
-        "slow SMARTS evaluation task_id={} generation={} elapsed_ms={} threshold_ms={} folds={} targets={} complexity={} smarts_len={} mcc={:.3} smarts={}",
+        "slow SMARTS evaluation task_id={} generation={} elapsed_ms={} threshold_ms={} folds={} targets={} smarts_len={} limit_exceeded={} mcc={:.3} smarts={}",
         settings.task_id,
         settings.generation,
         elapsed.as_millis(),
         threshold.as_millis(),
         settings.fold_count,
         settings.target_count,
-        genome.complexity(),
         genome.smarts().len(),
+        limit_exceeded,
         fitness.mcc(),
         genome.smarts(),
     );
@@ -575,8 +731,8 @@ fn update_best_evaluated(best: &mut Option<EvaluatedSmarts>, candidate: &Evaluat
 fn evaluated_is_better(candidate: &EvaluatedSmarts, current: &EvaluatedSmarts) -> bool {
     candidate.mcc() > current.mcc()
         || (candidate.mcc() == current.mcc()
-            && (candidate.complexity() < current.complexity()
-                || (candidate.complexity() == current.complexity()
+            && (candidate.smarts_len() < current.smarts_len()
+                || (candidate.smarts_len() == current.smarts_len()
                     && candidate.smarts() < current.smarts())))
 }
 
@@ -586,7 +742,8 @@ fn count_matches_in_fold(
     fold: &FoldData,
     behavior_words: &mut [u64],
     bit_index: &mut usize,
-) -> ConfusionCounts {
+    limit: EvaluationMatchLimit<'_>,
+) -> Result<ConfusionCounts, EvaluationFailure> {
     let fold_start_bit_index = *bit_index;
     *bit_index += fold.len();
 
@@ -601,7 +758,10 @@ fn count_matches_in_fold(
 
     for target_id in candidates {
         let sample = &fold.samples()[target_id];
-        let matched = query.matches_with_scratch(sample.target(), &mut match_scratch);
+        let matched = match match_with_limit(query, sample.target(), &mut match_scratch, limit) {
+            MatchLimitResult::Complete(matched) => matched,
+            MatchLimitResult::Exceeded => return Err(EvaluationFailure::LimitExceeded),
+        };
         if !matched {
             continue;
         }
@@ -614,12 +774,67 @@ fn count_matches_in_fold(
         }
     }
 
-    ConfusionCounts::new(
+    Ok(ConfusionCounts::new(
         true_positives,
         false_positives,
         fold.negative_count() as u64 - false_positives,
         fold.positive_count() as u64 - true_positives,
-    )
+    ))
+}
+
+fn match_with_limit(
+    query: &CompiledQuery,
+    target: &PreparedTarget,
+    scratch: &mut MatchScratch,
+    limit: EvaluationMatchLimit<'_>,
+) -> MatchLimitResult {
+    match limit {
+        EvaluationMatchLimit::None => {
+            MatchLimitResult::Complete(query.matches_with_scratch(target, scratch))
+        }
+        EvaluationMatchLimit::Configured {
+            max_elapsed,
+            #[cfg(target_arch = "wasm32")]
+            now_ms,
+            #[cfg(not(target_arch = "wasm32"))]
+                _marker: _,
+        } => match_with_configured_limit(
+            query,
+            target,
+            scratch,
+            max_elapsed,
+            #[cfg(target_arch = "wasm32")]
+            now_ms,
+        ),
+    }
+}
+
+fn match_with_configured_limit(
+    query: &CompiledQuery,
+    target: &PreparedTarget,
+    scratch: &mut MatchScratch,
+    max_elapsed: Duration,
+    #[cfg(target_arch = "wasm32")] now_ms: Option<&dyn Fn() -> f64>,
+) -> MatchLimitResult {
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    {
+        return query.matches_with_scratch_and_time_limit(target, scratch, max_elapsed);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(now_ms) = now_ms {
+            let deadline_ms = now_ms() + max_elapsed.as_secs_f64() * 1_000.0;
+            return query
+                .matches_with_scratch_and_interrupt(target, scratch, || now_ms() >= deadline_ms);
+        }
+    }
+
+    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    {
+        let _ = max_elapsed;
+        MatchLimitResult::Complete(query.matches_with_scratch(target, scratch))
+    }
 }
 
 fn record_behavior_match(behavior_words: &mut [u64], bit_index: usize, matched: bool) {
@@ -674,10 +889,16 @@ mod tests {
         let mut behavior = vec![0u64; 1];
         let mut bit_index = 0usize;
 
-        let counts =
-            count_matches_in_fold(&compiled, &screen, &fold, &mut behavior, &mut bit_index);
+        let counts = count_matches_in_fold(
+            &compiled,
+            &screen,
+            &fold,
+            &mut behavior,
+            &mut bit_index,
+            EvaluationMatchLimit::None,
+        );
 
-        assert_eq!(counts, ConfusionCounts::new(1, 1, 1, 1));
+        assert_eq!(counts, Ok(ConfusionCounts::new(1, 1, 1, 1)));
         assert_eq!(behavior[0], 0b0011);
     }
 

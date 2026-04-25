@@ -118,8 +118,8 @@ fn candidate_tooltip(tooltip: &ScatterTooltip) -> Element {
                 span { class: "plot-tooltip-value", {format!("{:.3}", tooltip.candidate.mcc())} }
             }
             div { class: "plot-tooltip-row",
-                span { class: "plot-tooltip-label", "Complexity" }
-                span { class: "plot-tooltip-value", {tooltip.candidate.complexity().to_string()} }
+                span { class: "plot-tooltip-label", "SMARTS length" }
+                span { class: "plot-tooltip-value", {tooltip.candidate.smarts_len().to_string()} }
             }
             p { class: "plot-tooltip-smarts", {tooltip.candidate.smarts()} }
         }
@@ -177,7 +177,7 @@ fn compare_ranked_candidates(left: &RankedCandidate, right: &RankedCandidate) ->
         .mcc()
         .partial_cmp(&left.mcc())
         .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| left.complexity().cmp(&right.complexity()))
+        .then_with(|| left.smarts_len().cmp(&right.smarts_len()))
         .then_with(|| left.smarts().cmp(right.smarts()))
 }
 
@@ -457,10 +457,10 @@ mod tests {
     use super::{RankedCandidate, compare_ranked_candidates};
 
     #[test]
-    fn ranked_candidate_order_prefers_lower_complexity_ties() {
+    fn ranked_candidate_order_prefers_lower_smarts_len_ties() {
         let simpler = RankedCandidate::new("[#6]", 0.8124, 1);
-        let complex = RankedCandidate::new("[N]", 0.8124, 2);
-        assert!(compare_ranked_candidates(&simpler, &complex).is_lt());
+        let longer = RankedCandidate::new("[N]", 0.8124, 2);
+        assert!(compare_ranked_candidates(&simpler, &longer).is_lt());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use rand::prelude::IndexedRandom;
 use smarts_rs::QueryMol;
 
 use crate::genome::SmartsGenome;
-use crate::genome::limits::MAX_CROSSOVER_CHILD_COMPLEXITY;
+use crate::genome::limits::MAX_CROSSOVER_CHILD_SMARTS_LEN;
 
 /// SMARTS-aware crossover operator.
 ///
@@ -106,7 +106,7 @@ fn build_spliced_child(
 
 fn genome_from_query(query: &QueryMol) -> Option<SmartsGenome> {
     let genome = SmartsGenome::from_query_mol(query);
-    (genome.complexity() <= MAX_CROSSOVER_CHILD_COMPLEXITY && genome.is_valid()).then_some(genome)
+    (genome.smarts_len() <= MAX_CROSSOVER_CHILD_SMARTS_LEN && genome.is_valid()).then_some(genome)
 }
 
 #[cfg(test)]

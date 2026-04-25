@@ -4,8 +4,8 @@ const MCC_SCORE_SCALE: i64 = 10_000;
 
 /// Fitness used by the GA.
 ///
-/// The objective is just fold-averaged MCC. SMARTS complexity is handled
-/// outside this type as a secondary ranking rule.
+/// The objective is just fold-averaged MCC. SMARTS length is handled outside
+/// this type as a secondary ranking rule.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectiveFitness {
     mcc_score: i64,

@@ -19,7 +19,7 @@ const EVALUATION_STYLE_TEMPLATE: &str = "{prefix} [{wide_bar}] {pos}/{len} SMART
 /// Indicatif-backed progress bars for one evolution run.
 ///
 /// The top bar tracks completed generations and shows ETA, the best MCC,
-/// complexity, SMARTS so far, and the number of generations since the
+/// SMARTS length, SMARTS so far, and the number of generations since the
 /// incumbent last improved. The second bar tracks SMARTS evaluation inside the
 /// current generation.
 pub struct IndicatifEvolutionProgress {
@@ -146,10 +146,10 @@ impl IndicatifEvolutionProgress {
 
     fn finish(&mut self, result: &TaskResult) {
         let message = format!(
-            "done generations={} best_mcc={:.3} complexity={} best_smarts={}",
+            "done generations={} best_mcc={:.3} smarts_len={} best_smarts={}",
             result.generations(),
             result.best_mcc(),
-            result.best_complexity(),
+            result.best_smarts_len(),
             truncate_smarts(result.best_smarts(), self.best_smarts_width)
         );
         if self.clear_on_finish {
@@ -176,7 +176,7 @@ impl IndicatifEvolutionProgress {
         generation_detail_message(
             progress.task_id(),
             progress.best_so_far().mcc(),
-            progress.best_so_far().complexity(),
+            progress.best_so_far().smarts_len(),
             progress.stagnation(),
             progress.best_so_far().smarts(),
             self.best_smarts_width,
@@ -323,13 +323,13 @@ fn evaluation_detail_message(
 fn generation_detail_message(
     task_id: &str,
     best_mcc: f64,
-    best_complexity: usize,
+    best_smarts_len: usize,
     stagnation: u64,
     best_smarts: &str,
     best_smarts_width: usize,
 ) -> String {
     format!(
-        "task={task_id} best_mcc={best_mcc:.3} complexity={best_complexity} no_improve={stagnation} best_smarts={}",
+        "task={task_id} best_mcc={best_mcc:.3} smarts_len={best_smarts_len} no_improve={stagnation} best_smarts={}",
         truncate_smarts(best_smarts, best_smarts_width)
     )
 }
@@ -385,10 +385,10 @@ mod tests {
     }
 
     #[test]
-    fn generation_bar_message_includes_best_complexity() {
+    fn generation_bar_message_includes_best_smarts_len() {
         assert_eq!(
             generation_detail_message("alkaloids", 0.637, 42, 14, "[#6]~[#7]", 32),
-            "task=alkaloids best_mcc=0.637 complexity=42 no_improve=14 best_smarts=[#6]~[#7]"
+            "task=alkaloids best_mcc=0.637 smarts_len=42 no_improve=14 best_smarts=[#6]~[#7]"
         );
     }
 
