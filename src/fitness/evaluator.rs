@@ -818,7 +818,7 @@ fn match_with_configured_limit(
 ) -> MatchLimitResult {
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     {
-        return query.matches_with_scratch_and_time_limit(target, scratch, max_elapsed);
+        query.matches_with_scratch_and_time_limit(target, scratch, max_elapsed)
     }
 
     #[cfg(target_arch = "wasm32")]
