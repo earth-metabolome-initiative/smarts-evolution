@@ -1742,7 +1742,16 @@ fn target_dataset_seed_features(target: &smarts_rs::PreparedTarget) -> Vec<Datas
                 ordered_pair(atomic_number, other_atomic_number);
             features.insert(DatasetSeedFeature::Bond {
                 left_atomic_number,
-                bond: DatasetSeedBond::from_label(label),
+                bond: DatasetSeedBond::Any,
+                right_atomic_number,
+            });
+            let exact_bond = DatasetSeedBond::from_label(label);
+            if exact_bond == DatasetSeedBond::Any {
+                continue;
+            }
+            features.insert(DatasetSeedFeature::Bond {
+                left_atomic_number,
+                bond: exact_bond,
                 right_atomic_number,
             });
         }
@@ -2552,6 +2561,7 @@ mod regression_tests {
             .collect::<Vec<_>>();
 
         assert!(smarts.contains(&"[#7]"));
+        assert!(smarts.contains(&"[#6]~[#7]"));
         assert!(!smarts.contains(&"[#8]"));
     }
 
