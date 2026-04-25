@@ -847,11 +847,6 @@ impl EvolutionSession {
         let total_count = self.population.len();
         let evaluation_total = total_count.max(1);
         let average_complexity = average_complexity(&self.population);
-        let mut seen_population = HashSet::with_capacity(total_count);
-        let mut duplicate_count = 0usize;
-        let mut cache_hits = 0usize;
-        let mut complexity_rejection_count = 0usize;
-        let mut unique_population = Vec::with_capacity(total_count);
         let mut evaluation_progress = EvaluationProgressTracker::new(
             self.task_id.clone(),
             generation_number,
@@ -862,77 +857,22 @@ impl EvolutionSession {
 
         evaluation_progress.emit(None, &mut on_evaluation_progress);
 
-        for genome in self.population.drain(..) {
-            let smarts = genome.smarts_shared().clone();
-            if !seen_population.insert(smarts.clone()) {
-                duplicate_count += 1;
-                evaluation_progress.record_completed(None, &mut on_evaluation_progress);
-                continue;
-            }
-
-            unique_population.push(genome);
-        }
-        let unique_count = seen_population.len();
-        let mut unique_scored = Vec::with_capacity(unique_count);
-        let mut uncached_genomes = Vec::new();
-
-        for genome in unique_population {
-            let smarts = genome.smarts_shared().clone();
-            if let Some(rejection) = genome_evaluation_rejection(&self.config, &genome) {
-                complexity_rejection_count += 1;
-                log_rejected_genome(&self.task_id, generation_number, &genome, rejection);
-                let ranked = RankedSmarts::new(&genome, ObjectiveFitness::invalid());
-                unique_scored.push(build_rejected_scored_genome(genome));
-                evaluation_progress.record_completed(Some(ranked), &mut on_evaluation_progress);
-            } else if let Some((fitness, phenotype)) = self.fitness_cache.get(&smarts) {
-                cache_hits += 1;
-                let ranked = RankedSmarts::new(&genome, fitness);
-                unique_scored.push(ScoredGenome {
-                    genome,
-                    fitness,
-                    phenotype,
-                });
-                evaluation_progress.record_completed(Some(ranked), &mut on_evaluation_progress);
-            } else {
-                uncached_genomes.push(genome);
-            }
-        }
-        let log_settings = EvaluationLogSettings::new(
-            self.task_id.clone(),
-            generation_number,
-            self.evaluator.fold_count(),
-            self.evaluator.target_count(),
-            self.config.slow_evaluation_log_threshold(),
-        );
-
-        if on_evaluation_progress.is_some() {
-            let freshly_scored = self.evaluator.evaluate_many_with_progress_and_logging(
-                uncached_genomes,
-                &log_settings,
-                |progress| {
-                    let last = progress.last().map(RankedSmarts::from_evaluated);
-                    evaluation_progress.record_completed(last, &mut on_evaluation_progress);
-                },
+        let (unique_population, duplicate_count) =
+            self.drain_unique_population(&mut evaluation_progress, &mut on_evaluation_progress);
+        let unique_count = unique_population.len();
+        let (mut unique_scored, uncached_genomes, cache_hits, complexity_rejection_count) = self
+            .score_cached_or_rejected_population(
+                unique_population,
+                generation_number,
+                &mut evaluation_progress,
+                &mut on_evaluation_progress,
             );
-            for (genome, evaluation) in freshly_scored {
-                unique_scored.push(build_scored_genome(
-                    &mut self.fitness_cache,
-                    genome,
-                    evaluation,
-                ));
-            }
-        } else {
-            let freshly_scored = self
-                .evaluator
-                .evaluate_many_with_logging(uncached_genomes, &log_settings);
-            for (genome, evaluation) in freshly_scored {
-                unique_scored.push(build_scored_genome(
-                    &mut self.fitness_cache,
-                    genome,
-                    evaluation,
-                ));
-            }
-        }
+        unique_scored.extend(self.score_uncached_population(
+            uncached_genomes,
+            generation_number,
+            &mut evaluation_progress,
+            &mut on_evaluation_progress,
+        ));
 
         unique_scored = phenotypically_deduplicate(unique_scored);
         unique_scored.sort_by(compare_scored_genomes);
@@ -940,22 +880,7 @@ impl EvolutionSession {
 
         let lead = &unique_scored[0];
         let lead_complexity = lead.genome.complexity();
-        if generation == 0
-            || is_better_candidate(
-                lead.fitness,
-                &lead.genome,
-                self.best_fitness,
-                self.best_complexity,
-                &self.best_smarts,
-            )
-        {
-            self.best_fitness = lead.fitness;
-            self.best_smarts = lead.genome.smarts().to_string();
-            self.best_complexity = lead.genome.complexity();
-            self.stagnation = 0;
-        } else {
-            self.stagnation += 1;
-        }
+        self.update_incumbent_from_lead(generation, lead);
 
         let stats = GenerationStats {
             unique_count,
@@ -1038,12 +963,138 @@ impl EvolutionSession {
             return Some(progress);
         }
 
+        self.repopulate_from_scored(&unique_scored, generation);
+
+        Some(progress)
+    }
+
+    fn drain_unique_population(
+        &mut self,
+        evaluation_progress: &mut EvaluationProgressTracker,
+        on_evaluation_progress: &mut Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
+    ) -> (Vec<SmartsGenome>, usize) {
+        let mut seen_population = HashSet::with_capacity(self.population.len());
+        let mut unique_population = Vec::with_capacity(self.population.len());
+        let mut duplicate_count = 0usize;
+
+        for genome in self.population.drain(..) {
+            let smarts = genome.smarts_shared().clone();
+            if seen_population.insert(smarts) {
+                unique_population.push(genome);
+            } else {
+                duplicate_count += 1;
+                evaluation_progress.record_completed(None, on_evaluation_progress);
+            }
+        }
+
+        (unique_population, duplicate_count)
+    }
+
+    fn score_cached_or_rejected_population(
+        &mut self,
+        unique_population: Vec<SmartsGenome>,
+        generation: u64,
+        evaluation_progress: &mut EvaluationProgressTracker,
+        on_evaluation_progress: &mut Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
+    ) -> (Vec<ScoredGenome>, Vec<SmartsGenome>, usize, usize) {
+        let mut unique_scored = Vec::with_capacity(unique_population.len());
+        let mut uncached_genomes = Vec::new();
+        let mut cache_hits = 0usize;
+        let mut complexity_rejection_count = 0usize;
+
+        for genome in unique_population {
+            let smarts = genome.smarts_shared().clone();
+            if let Some(rejection) = genome_evaluation_rejection(&self.config, &genome) {
+                complexity_rejection_count += 1;
+                log_rejected_genome(&self.task_id, generation, &genome, rejection);
+                let ranked = RankedSmarts::new(&genome, ObjectiveFitness::invalid());
+                unique_scored.push(build_rejected_scored_genome(genome));
+                evaluation_progress.record_completed(Some(ranked), on_evaluation_progress);
+            } else if let Some((fitness, phenotype)) = self.fitness_cache.get(&smarts) {
+                cache_hits += 1;
+                let ranked = RankedSmarts::new(&genome, fitness);
+                unique_scored.push(ScoredGenome {
+                    genome,
+                    fitness,
+                    phenotype,
+                });
+                evaluation_progress.record_completed(Some(ranked), on_evaluation_progress);
+            } else {
+                uncached_genomes.push(genome);
+            }
+        }
+
+        (
+            unique_scored,
+            uncached_genomes,
+            cache_hits,
+            complexity_rejection_count,
+        )
+    }
+
+    fn score_uncached_population(
+        &mut self,
+        uncached_genomes: Vec<SmartsGenome>,
+        generation: u64,
+        evaluation_progress: &mut EvaluationProgressTracker,
+        on_evaluation_progress: &mut Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
+    ) -> Vec<ScoredGenome> {
+        let log_settings = EvaluationLogSettings::new(
+            self.task_id.clone(),
+            generation,
+            self.evaluator.fold_count(),
+            self.evaluator.target_count(),
+            self.config.slow_evaluation_log_threshold(),
+        );
+
+        let freshly_scored = if on_evaluation_progress.is_some() {
+            self.evaluator.evaluate_many_with_progress_and_logging(
+                uncached_genomes,
+                &log_settings,
+                |progress| {
+                    let last = progress.last().map(RankedSmarts::from_evaluated);
+                    evaluation_progress.record_completed(last, on_evaluation_progress);
+                },
+            )
+        } else {
+            self.evaluator
+                .evaluate_many_with_logging(uncached_genomes, &log_settings)
+        };
+
+        freshly_scored
+            .into_iter()
+            .map(|(genome, evaluation)| {
+                build_scored_genome(&mut self.fitness_cache, genome, evaluation)
+            })
+            .collect()
+    }
+
+    fn update_incumbent_from_lead(&mut self, generation: u64, lead: &ScoredGenome) {
+        if generation == 0
+            || is_better_candidate(
+                lead.fitness,
+                &lead.genome,
+                self.best_fitness,
+                self.best_complexity,
+                &self.best_smarts,
+            )
+        {
+            self.best_fitness = lead.fitness;
+            self.best_smarts = lead.genome.smarts().to_string();
+            self.best_complexity = lead.genome.complexity();
+            self.stagnation = 0;
+        } else {
+            self.stagnation += 1;
+        }
+    }
+
+    fn repopulate_from_scored(&mut self, unique_scored: &[ScoredGenome], generation: u64) {
         let num_parents = ((self.config.population_size() as f64 * self.config.selection_ratio())
             .round() as usize)
             .max(2)
             .min(self.config.population_size().max(2));
         let parents = tournament_select(
-            &unique_scored,
+            unique_scored,
             num_parents,
             self.config.tournament_size(),
             &mut self.rng,
@@ -1076,7 +1127,7 @@ impl EvolutionSession {
         let immigrant_base = generation as usize * self.config.population_size();
         let mut immigrant_idx = 0usize;
         self.population = reinsert_population(
-            &unique_scored,
+            unique_scored,
             offspring,
             self.config.population_size(),
             elite_count,
@@ -1089,8 +1140,6 @@ impl EvolutionSession {
                 genome
             },
         );
-
-        Some(progress)
     }
 
     /// Returns true once the session has reached a terminal state.

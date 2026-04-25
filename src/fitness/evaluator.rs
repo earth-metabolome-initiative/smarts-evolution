@@ -434,52 +434,36 @@ impl SmartsEvaluator {
         &self,
         genomes: Vec<SmartsGenome>,
         settings: Option<&EvaluationLogSettings>,
-        mut on_progress: impl FnMut(EvaluationProgress) + Send,
+        on_progress: impl FnMut(EvaluationProgress) + Send,
     ) -> Vec<(SmartsGenome, GenomeEvaluation)> {
         let total = genomes.len().max(1);
+        let mut progress = EvaluationProgressState::new(total, on_progress);
         if genomes.is_empty() {
-            on_progress(EvaluationProgress::new(0, total, None, None));
+            progress.emit_empty();
             return Vec::new();
         }
 
         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         if genomes.len() >= MIN_PARALLEL_GENOMES {
-            let progress_state = Mutex::new((0usize, None::<EvaluatedSmarts>, on_progress));
+            let progress_state = Mutex::new(progress);
             return genomes
                 .into_par_iter()
                 .map(|genome| {
                     let evaluation = self.evaluate_with_logging(&genome, settings);
-                    let last = EvaluatedSmarts::new(&genome, evaluation.fitness());
-                    let mut progress_state = progress_state.lock().unwrap();
-                    progress_state.0 += 1;
-                    update_best_evaluated(&mut progress_state.1, &last);
-                    let event = EvaluationProgress::new(
-                        progress_state.0,
-                        total,
-                        Some(last),
-                        progress_state.1.clone(),
-                    );
-                    (progress_state.2)(event);
+                    progress_state
+                        .lock()
+                        .unwrap()
+                        .record(&genome, evaluation.fitness());
                     (genome, evaluation)
                 })
                 .collect();
         }
 
-        let mut completed = 0usize;
-        let mut best = None::<EvaluatedSmarts>;
         genomes
             .into_iter()
             .map(|genome| {
                 let evaluation = self.evaluate_with_logging(&genome, settings);
-                let last = EvaluatedSmarts::new(&genome, evaluation.fitness());
-                update_best_evaluated(&mut best, &last);
-                completed += 1;
-                on_progress(EvaluationProgress::new(
-                    completed,
-                    total,
-                    Some(last),
-                    best.clone(),
-                ));
+                progress.record(&genome, evaluation.fitness());
                 (genome, evaluation)
             })
             .collect()
@@ -493,6 +477,43 @@ impl SmartsEvaluator {
             .into_iter()
             .map(|(genome, evaluation)| (genome, evaluation.fitness()))
             .collect()
+    }
+}
+
+struct EvaluationProgressState<C> {
+    completed: usize,
+    total: usize,
+    best: Option<EvaluatedSmarts>,
+    on_progress: C,
+}
+
+impl<C> EvaluationProgressState<C>
+where
+    C: FnMut(EvaluationProgress),
+{
+    fn new(total: usize, on_progress: C) -> Self {
+        Self {
+            completed: 0,
+            total: total.max(1),
+            best: None,
+            on_progress,
+        }
+    }
+
+    fn emit_empty(&mut self) {
+        (self.on_progress)(EvaluationProgress::new(0, self.total, None, None));
+    }
+
+    fn record(&mut self, genome: &SmartsGenome, fitness: ObjectiveFitness) {
+        let last = EvaluatedSmarts::new(genome, fitness);
+        update_best_evaluated(&mut self.best, &last);
+        self.completed += 1;
+        (self.on_progress)(EvaluationProgress::new(
+            self.completed,
+            self.total,
+            Some(last),
+            self.best.clone(),
+        ));
     }
 }
 

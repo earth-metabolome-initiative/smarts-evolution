@@ -184,6 +184,28 @@ mod tests {
     use log::Log;
     use std::fs;
 
+    struct TempLogFile {
+        path: PathBuf,
+    }
+
+    impl TempLogFile {
+        fn new(label: &str) -> Self {
+            Self {
+                path: temp_log_path(label),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempLogFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
     fn temp_log_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "smarts-evolution-{label}-{}.log",
@@ -218,8 +240,8 @@ mod tests {
 
     #[test]
     fn file_logger_writes_enabled_records() {
-        let path = temp_log_path("logger");
-        let file = File::create(&path).unwrap();
+        let log_file = TempLogFile::new("logger");
+        let file = File::create(log_file.path()).unwrap();
         let logger = FileLogger {
             file: Mutex::new(file),
             level: LevelFilter::Warn,
@@ -234,8 +256,7 @@ mod tests {
         logger.log(&record);
         logger.flush();
 
-        let logged = fs::read_to_string(&path).unwrap();
-        fs::remove_file(path).unwrap();
+        let logged = fs::read_to_string(log_file.path()).unwrap();
         assert!(
             logged.contains(" WARN smarts_evolution::fitness::evaluator - slow SMARTS evaluation")
         );
@@ -243,8 +264,8 @@ mod tests {
 
     #[test]
     fn file_logger_ignores_records_above_configured_level() {
-        let path = temp_log_path("filtered");
-        let file = File::create(&path).unwrap();
+        let log_file = TempLogFile::new("filtered");
+        let file = File::create(log_file.path()).unwrap();
         let logger = FileLogger {
             file: Mutex::new(file),
             level: LevelFilter::Warn,
@@ -259,8 +280,7 @@ mod tests {
         logger.log(&record);
         logger.flush();
 
-        let logged = fs::read_to_string(&path).unwrap();
-        fs::remove_file(path).unwrap();
+        let logged = fs::read_to_string(log_file.path()).unwrap();
         assert!(logged.is_empty());
     }
 
