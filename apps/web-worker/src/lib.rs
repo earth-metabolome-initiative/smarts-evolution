@@ -3,8 +3,11 @@
 
 use std::cell::RefCell;
 use std::str::FromStr;
+use std::time::Duration;
 
-use js_sys::{Date, global};
+#[cfg(target_arch = "wasm32")]
+use js_sys::Date;
+use js_sys::global;
 use smarts_evolution::{
     EvolutionConfig, EvolutionEvaluationProgress, EvolutionProgress, EvolutionSession,
     EvolutionStatus, EvolutionTask, FoldData, FoldSample, RankedSmarts, SeedCorpus, TaskResult,
@@ -19,6 +22,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 const STARTUP_PROGRESS_BATCH: usize = 16;
+const WORKER_MATCH_TIME_LIMIT: Duration = Duration::from_secs(1);
 
 thread_local! {
     static WORKER_STATE: RefCell<WorkerState> = RefCell::new(WorkerState::default());
@@ -116,6 +120,7 @@ fn build_config(input: &EvolutionConfigInput) -> Result<EvolutionConfig, String>
         .elite_count(input.elite_count())
         .random_immigrant_ratio(input.random_immigrant_ratio())
         .stagnation_limit(input.stagnation_limit())
+        .match_time_limit(WORKER_MATCH_TIME_LIMIT)
         .build()
 }
 
@@ -325,7 +330,7 @@ fn drive_active_run() {
     enum StepOutcome {
         Idle,
         Advanced {
-            progress: ProgressUpdate,
+            progress: Box<ProgressUpdate>,
             result: Option<CompletedRun>,
         },
         Fatal(FatalResponse),
@@ -344,17 +349,29 @@ fn drive_active_run() {
         }
 
         let run_id = active_run.run_id;
-        let Some(progress) =
-            active_run
-                .session
-                .step_with_evaluation_progress_and_clock(&worker_now_ms, |progress| {
-                    if should_report_evaluation_progress(progress.completed(), progress.total()) {
-                        let _ = post_response(&WorkerResponse::Evaluation(
-                            evaluation_update_from_snapshot(run_id, &progress),
-                        ));
-                    }
-                })
-        else {
+        let on_evaluation_progress = |progress: EvolutionEvaluationProgress| {
+            if should_report_evaluation_progress(progress.completed(), progress.total()) {
+                let _ = post_response(&WorkerResponse::Evaluation(
+                    evaluation_update_from_snapshot(run_id, &progress),
+                ));
+            }
+        };
+        let progress = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                active_run.session.step_with_evaluation_progress_and_clock(
+                    &worker_now_ms,
+                    on_evaluation_progress,
+                )
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                active_run
+                    .session
+                    .step_with_evaluation_progress(on_evaluation_progress)
+            }
+        };
+        let Some(progress) = progress else {
             return StepOutcome::Fatal(FatalResponse::new(
                 active_run.run_id,
                 "paused evolution session ended unexpectedly",
@@ -369,13 +386,16 @@ fn drive_active_run() {
         if result.is_none() {
             state.active_run = Some(active_run);
         }
-        StepOutcome::Advanced { progress, result }
+        StepOutcome::Advanced {
+            progress: Box::new(progress),
+            result,
+        }
     });
 
     match outcome {
         StepOutcome::Idle => {}
         StepOutcome::Advanced { progress, result } => {
-            let _ = post_response(&WorkerResponse::Progress(progress));
+            let _ = post_response(&WorkerResponse::Progress(*progress));
             if let Some(result) = result {
                 let _ = post_response(&WorkerResponse::Complete(result));
             } else {
@@ -410,6 +430,7 @@ fn worker_scope() -> DedicatedWorkerGlobalScope {
     global().unchecked_into::<DedicatedWorkerGlobalScope>()
 }
 
+#[cfg(target_arch = "wasm32")]
 fn worker_now_ms() -> f64 {
     worker_scope()
         .performance()
@@ -495,7 +516,11 @@ impl StartupReporter {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_seed_units, parse_worker_smiles, should_report_progress, startup_total};
+    use std::time::Duration;
+
+    use super::{
+        build_config, count_seed_units, parse_worker_smiles, should_report_progress, startup_total,
+    };
     use smarts_evolution_web_protocol::{EvolutionConfigInput, RunRequest};
 
     #[test]
@@ -526,6 +551,13 @@ mod tests {
         );
 
         assert_eq!(startup_total(&request), 8);
+    }
+
+    #[test]
+    fn worker_uses_short_match_time_limit() {
+        let config = build_config(&EvolutionConfigInput::default()).unwrap();
+
+        assert_eq!(config.match_time_limit(), Some(Duration::from_secs(1)));
     }
 
     #[test]
