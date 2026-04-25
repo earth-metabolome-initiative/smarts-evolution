@@ -242,7 +242,7 @@ fn builtin_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
     } else {
         CURATED_BUILTIN_SEED_SMARTS[idx - GENERIC_BUILTIN_SEED_SMARTS.len()]
     };
-    SmartsGenome::from_smarts(pat).unwrap()
+    genome_from_known_valid_smarts(pat)
 }
 
 /// Generate a random small SMARTS pattern.
@@ -255,7 +255,7 @@ fn random_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
         if i > 0 {
             smarts.push_str(random_seed_bond(rng));
         }
-        let elem = common_atoms.choose(rng).unwrap();
+        let elem = common_atoms[rng.random_range(0..common_atoms.len())];
         smarts.push_str(&format!("[#{elem}"));
         if rng.random_bool(0.4) {
             let constraint = match rng.random_range(0..3) {
@@ -269,11 +269,17 @@ fn random_seed<R: Rng>(rng: &mut R) -> SmartsGenome {
         smarts.push(']');
     }
 
-    SmartsGenome::from_smarts(&smarts).unwrap()
+    genome_from_known_valid_smarts(&smarts)
 }
 
 fn random_seed_bond<R: Rng>(rng: &mut R) -> &'static str {
-    ["-", "=", "~"].choose(rng).unwrap()
+    const BONDS: [&str; 3] = ["-", "=", "~"];
+    BONDS[rng.random_range(0..BONDS.len())]
+}
+
+#[allow(clippy::unwrap_used)]
+fn genome_from_known_valid_smarts(smarts: &str) -> SmartsGenome {
+    SmartsGenome::from_smarts(smarts).unwrap()
 }
 
 #[cfg(test)]

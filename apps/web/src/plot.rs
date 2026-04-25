@@ -1,6 +1,8 @@
 use dioxus::prelude::*;
 use smarts_evolution_web_protocol::RankedCandidate;
 
+use crate::ProgressPoint;
+
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
@@ -20,15 +22,6 @@ const PLOT_RIGHT_PAD: f64 = 14.0;
 const PLOT_TOP_PAD: f64 = 16.0;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const PLOT_BOTTOM_PAD: f64 = 30.0;
-
-#[derive(Clone, PartialEq)]
-pub(crate) struct ProgressPoint {
-    pub(crate) generation: u64,
-    pub(crate) best_mcc: f64,
-    pub(crate) best: RankedCandidate,
-    pub(crate) stagnation: u64,
-    pub(crate) leaders: Vec<RankedCandidate>,
-}
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, PartialEq)]
@@ -179,10 +172,7 @@ fn scatter_tooltip_style(tooltip: &ScatterTooltip) -> String {
     )
 }
 
-pub(crate) fn compare_ranked_candidates(
-    left: &RankedCandidate,
-    right: &RankedCandidate,
-) -> std::cmp::Ordering {
+fn compare_ranked_candidates(left: &RankedCandidate, right: &RankedCandidate) -> std::cmp::Ordering {
     right
         .mcc()
         .partial_cmp(&left.mcc())
@@ -459,5 +449,25 @@ fn draw_x_ticks(
         ctx.line_to(*x, bottom_y + 6.0);
         ctx.stroke();
         let _ = ctx.fill_text(label, *x - 12.0, height - 8.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RankedCandidate, compare_ranked_candidates};
+
+    #[test]
+    fn ranked_candidate_order_prefers_lower_complexity_ties() {
+        let simpler = RankedCandidate::new("[#6]", 0.8124, 1);
+        let complex = RankedCandidate::new("[N]", 0.8124, 2);
+        assert!(compare_ranked_candidates(&simpler, &complex).is_lt());
+    }
+
+    #[test]
+    fn ranked_candidate_order_prefers_higher_mcc() {
+        let lower_mcc = RankedCandidate::new("[#6]", 0.8000, 1);
+        let higher_mcc = RankedCandidate::new("[#6]", 0.9000, 1);
+
+        assert!(compare_ranked_candidates(&higher_mcc, &lower_mcc).is_lt());
     }
 }

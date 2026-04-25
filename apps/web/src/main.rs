@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 mod icons;
 mod plot;
 
@@ -7,7 +9,7 @@ use std::str::FromStr;
 
 use dioxus::prelude::*;
 use icons::{AppIcon, app_icon};
-use plot::{MccGenerationImprovementPlot, ProgressPoint};
+use plot::MccGenerationImprovementPlot;
 use smiles_parser::Smiles;
 use smarts_evolution_web_protocol::{
     CompletedRun, EvaluationUpdate, EvolutionConfigInput, ProgressUpdate, RankedCandidate,
@@ -208,6 +210,15 @@ enum RunPhase {
     Completed,
     Stopped,
     Failed,
+}
+
+#[derive(Clone, PartialEq)]
+struct ProgressPoint {
+    generation: u64,
+    best_mcc: f64,
+    best: RankedCandidate,
+    stagnation: u64,
+    leaders: Vec<RankedCandidate>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1418,9 +1429,8 @@ fn parse_f64(label: &str, value: &str) -> Result<f64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::plot::compare_ranked_candidates;
     use super::{
-        DraftValidation, EXAMPLE_PRESETS, RankedCandidate, build_run_request, compact_smiles_lines,
+        DraftValidation, EXAMPLE_PRESETS, build_run_request, compact_smiles_lines,
         smiles_count_label, smiles_entry_count, validate_smiles_lines,
     };
 
@@ -1436,21 +1446,6 @@ mod tests {
                 assert_eq!(smiles.lines().count(), expected_count);
             }
         }
-    }
-
-    #[test]
-    fn ranked_candidate_order_prefers_lower_complexity_ties() {
-        let simpler = RankedCandidate::new("[#6]", 0.8124, 1);
-        let complex = RankedCandidate::new("[N]", 0.8124, 2);
-        assert!(compare_ranked_candidates(&simpler, &complex).is_lt());
-    }
-
-    #[test]
-    fn ranked_candidate_order_prefers_higher_mcc() {
-        let lower_mcc = RankedCandidate::new("[#6]", 0.8000, 1);
-        let higher_mcc = RankedCandidate::new("[#6]", 0.9000, 1);
-
-        assert!(compare_ranked_candidates(&higher_mcc, &lower_mcc).is_lt());
     }
 
     #[test]

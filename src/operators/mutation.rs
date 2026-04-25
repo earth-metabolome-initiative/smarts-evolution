@@ -611,7 +611,9 @@ fn mutate_atom_constraints<R: Rng>(
                         .is_ok()
                 }
                 1 if !primitive_paths.is_empty() => {
-                    let path = primitive_paths.choose(rng).unwrap();
+                    let Some(path) = primitive_paths.choose(rng) else {
+                        return false;
+                    };
                     replace_atom_primitive(
                         &mut expr,
                         path,
@@ -620,7 +622,9 @@ fn mutate_atom_constraints<R: Rng>(
                     .is_ok()
                 }
                 2 if primitive_paths.len() > 1 => {
-                    let path = primitive_paths.choose(rng).unwrap();
+                    let Some(path) = primitive_paths.choose(rng) else {
+                        return false;
+                    };
                     remove_atom_primitive(&mut expr, path).is_ok()
                 }
                 3 => mutate_bracket_tree_shape(&mut expr, rng, recursive_depth),
@@ -735,8 +739,13 @@ fn mutate_recursive_query<R: Rng>(
             .is_ok();
     }
 
-    let (atom_id, path) = sites.choose(rng).unwrap().clone();
-    let mut atom_expr = editable.as_query_mol().atom(atom_id).unwrap().expr.clone();
+    let Some((atom_id, path)) = sites.choose(rng).cloned() else {
+        return false;
+    };
+    let Some(atom) = editable.as_query_mol().atom(atom_id) else {
+        return false;
+    };
+    let mut atom_expr = atom.expr.clone();
     let AtomExpr::Bracket(bracket) = &mut atom_expr else {
         return false;
     };
@@ -813,7 +822,10 @@ fn mutate_bond_constraints<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R)
         return false;
     };
 
-    let current = editable.as_query_mol().bond(bond_id).unwrap().expr.clone();
+    let Some(bond) = editable.as_query_mol().bond(bond_id) else {
+        return false;
+    };
+    let current = bond.expr.clone();
     match current {
         BondExpr::Elided => editable
             .replace_bond_expr(bond_id, random_bond_expr(rng))
@@ -825,11 +837,15 @@ fn mutate_bond_constraints<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R)
                     add_bond_primitive(&mut tree, random_bond_primitive(rng)).is_ok()
                 }
                 1 if !primitive_paths.is_empty() => {
-                    let path = primitive_paths.choose(rng).unwrap();
+                    let Some(path) = primitive_paths.choose(rng) else {
+                        return false;
+                    };
                     replace_bond_primitive(&mut tree, path, random_bond_primitive(rng)).is_ok()
                 }
                 2 if primitive_paths.len() > 1 => {
-                    let path = primitive_paths.choose(rng).unwrap();
+                    let Some(path) = primitive_paths.choose(rng) else {
+                        return false;
+                    };
                     remove_bond_primitive(&mut tree, path).is_ok()
                 }
                 3 => mutate_bond_tree_shape(&mut tree, rng),
@@ -867,7 +883,10 @@ fn ring_edit<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
     let snapshot = editable.as_query_mol().clone();
     let ring_bonds = snapshot.ring_bonds();
     if !ring_bonds.is_empty() && rng.random_bool(0.5) {
-        return editable.open_ring(*ring_bonds.choose(rng).unwrap()).is_ok();
+        let Some(&bond_id) = ring_bonds.choose(rng) else {
+            return false;
+        };
+        return editable.open_ring(bond_id).is_ok();
     }
 
     for _ in 0..RING_CLOSE_ATTEMPTS {
@@ -927,11 +946,9 @@ fn component_edit<R: Rng>(
     let removable = snapshot
         .leaf_atoms()
         .into_iter()
-        .filter(|&atom_id| {
-            snapshot
-                .component_atoms(snapshot.atom(atom_id).unwrap().component)
-                .len()
-                == 1
+        .filter_map(|atom_id| {
+            let atom = snapshot.atom(atom_id)?;
+            (snapshot.component_atoms(atom.component).len() == 1).then_some(atom_id)
         })
         .collect::<Vec<_>>();
     let Some(&atom_id) = removable.choose(rng) else {
@@ -1443,7 +1460,7 @@ fn random_bond_primitive<R: Rng>(rng: &mut R) -> BondPrimitive {
 
 fn random_atomic_number<R: Rng>(rng: &mut R) -> u16 {
     if rng.random_bool(0.90) {
-        *COMMON_ATOMIC_NUMBERS.choose(rng).unwrap()
+        COMMON_ATOMIC_NUMBERS[rng.random_range(0..COMMON_ATOMIC_NUMBERS.len())]
     } else {
         rng.random_range(1..=MAX_ATOMIC_NUMBER)
     }
@@ -1457,11 +1474,12 @@ fn random_symbol_primitive<R: Rng>(rng: &mut R) -> AtomPrimitive {
 
 fn random_supported_element<R: Rng>(rng: &mut R, aromatic: bool) -> Element {
     let symbol = if aromatic {
-        *AROMATIC_ELEMENT_SYMBOLS.choose(rng).unwrap()
+        AROMATIC_ELEMENT_SYMBOLS[rng.random_range(0..AROMATIC_ELEMENT_SYMBOLS.len())]
     } else if rng.random_bool(0.90) {
-        *COMMON_ALIPHATIC_ELEMENT_SYMBOLS.choose(rng).unwrap()
+        COMMON_ALIPHATIC_ELEMENT_SYMBOLS
+            [rng.random_range(0..COMMON_ALIPHATIC_ELEMENT_SYMBOLS.len())]
     } else {
-        *ALL_ELEMENT_SYMBOLS.choose(rng).unwrap()
+        ALL_ELEMENT_SYMBOLS[rng.random_range(0..ALL_ELEMENT_SYMBOLS.len())]
     };
     match Element::from_str(symbol) {
         Ok(element) => element,
@@ -1503,11 +1521,11 @@ fn random_chirality<R: Rng>(rng: &mut R) -> Chirality {
     match rng.random_range(0..7) {
         0 => Chirality::At,
         1 => Chirality::AtAt,
-        2 => Chirality::try_th(rng.random_range(1..=2)).unwrap(),
-        3 => Chirality::try_al(rng.random_range(1..=2)).unwrap(),
-        4 => Chirality::try_sp(rng.random_range(1..=3)).unwrap(),
-        5 => Chirality::try_tb(rng.random_range(1..=20)).unwrap(),
-        _ => Chirality::try_oh(rng.random_range(1..=30)).unwrap(),
+        2 => Chirality::try_th(rng.random_range(1..=2)).unwrap_or(Chirality::At),
+        3 => Chirality::try_al(rng.random_range(1..=2)).unwrap_or(Chirality::At),
+        4 => Chirality::try_sp(rng.random_range(1..=3)).unwrap_or(Chirality::At),
+        5 => Chirality::try_tb(rng.random_range(1..=20)).unwrap_or(Chirality::At),
+        _ => Chirality::try_oh(rng.random_range(1..=30)).unwrap_or(Chirality::At),
     }
 }
 
@@ -1541,9 +1559,14 @@ fn random_numeric_query<R: Rng>(rng: &mut R, min: u16, max: u16) -> NumericQuery
     }
 }
 
+#[allow(clippy::unwrap_used)]
+fn query_from_known_valid_smarts(smarts: &str) -> QueryMol {
+    QueryMol::from_str(smarts).unwrap()
+}
+
 fn random_recursive_query<R: Rng>(rng: &mut R, recursive_depth: usize) -> QueryMol {
-    let smarts = RECURSIVE_FRAGMENT_SMARTS.choose(rng).unwrap();
-    let mut query = QueryMol::from_str(smarts).unwrap();
+    let smarts = RECURSIVE_FRAGMENT_SMARTS[rng.random_range(0..RECURSIVE_FRAGMENT_SMARTS.len())];
+    let mut query = query_from_known_valid_smarts(smarts);
     if recursive_depth < MAX_RECURSIVE_QUERY_DEPTH && rng.random_bool(0.35) {
         let mut editable = query.edit();
         let edit = apply_random_mutation(&mut editable, &[], rng, recursive_depth);

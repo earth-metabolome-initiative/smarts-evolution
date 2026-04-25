@@ -1,5 +1,6 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 extern crate alloc;
 #[cfg(any(test, feature = "std"))]

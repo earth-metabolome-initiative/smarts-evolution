@@ -51,9 +51,28 @@ struct GenerationStats {
     total_count: usize,
     duplicate_count: usize,
     cache_hits: usize,
-    complexity_rejection_count: usize,
+    rejection_counts: EvaluationRejectionCounts,
     lead_complexity: usize,
     average_complexity: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EvaluationRejectionCounts {
+    complexity: usize,
+    smarts_length: usize,
+}
+
+impl EvaluationRejectionCounts {
+    fn record(&mut self, rejection: GenomeEvaluationRejection) {
+        match rejection {
+            GenomeEvaluationRejection::Complexity { .. } => self.complexity += 1,
+            GenomeEvaluationRejection::SmartsLength { .. } => self.smarts_length += 1,
+        }
+    }
+
+    fn total(self) -> usize {
+        self.complexity + self.smarts_length
+    }
 }
 
 #[derive(Clone)]
@@ -167,6 +186,13 @@ struct ScoredGenome {
     genome: SmartsGenome,
     fitness: ObjectiveFitness,
     phenotype: Arc<[u64]>,
+}
+
+struct PreparedPopulationScores {
+    scored: Vec<ScoredGenome>,
+    uncached: Vec<SmartsGenome>,
+    cache_hits: usize,
+    rejection_counts: EvaluationRejectionCounts,
 }
 
 /// One generic evolution task.
@@ -428,6 +454,7 @@ pub struct EvolutionProgress {
     duplicate_count: usize,
     cache_hits: usize,
     complexity_rejection_count: usize,
+    smarts_length_rejection_count: usize,
     lead_complexity: usize,
     average_complexity: f64,
     stagnation: u64,
@@ -571,7 +598,8 @@ impl EvolutionProgress {
             total_count: snapshot.stats.total_count,
             duplicate_count: snapshot.stats.duplicate_count,
             cache_hits: snapshot.stats.cache_hits,
-            complexity_rejection_count: snapshot.stats.complexity_rejection_count,
+            complexity_rejection_count: snapshot.stats.rejection_counts.complexity,
+            smarts_length_rejection_count: snapshot.stats.rejection_counts.smarts_length,
             lead_complexity: snapshot.stats.lead_complexity,
             average_complexity: snapshot.stats.average_complexity,
             stagnation: snapshot.stagnation,
@@ -624,6 +652,14 @@ impl EvolutionProgress {
 
     pub fn complexity_rejection_count(&self) -> usize {
         self.complexity_rejection_count
+    }
+
+    pub fn smarts_length_rejection_count(&self) -> usize {
+        self.smarts_length_rejection_count
+    }
+
+    pub fn evaluation_rejection_count(&self) -> usize {
+        self.complexity_rejection_count + self.smarts_length_rejection_count
     }
 
     pub fn lead_complexity(&self) -> usize {
@@ -860,15 +896,15 @@ impl EvolutionSession {
         let (unique_population, duplicate_count) =
             self.drain_unique_population(&mut evaluation_progress, &mut on_evaluation_progress);
         let unique_count = unique_population.len();
-        let (mut unique_scored, uncached_genomes, cache_hits, complexity_rejection_count) = self
-            .score_cached_or_rejected_population(
-                unique_population,
-                generation_number,
-                &mut evaluation_progress,
-                &mut on_evaluation_progress,
-            );
+        let prepared_scores = self.score_cached_or_rejected_population(
+            unique_population,
+            generation_number,
+            &mut evaluation_progress,
+            &mut on_evaluation_progress,
+        );
+        let mut unique_scored = prepared_scores.scored;
         unique_scored.extend(self.score_uncached_population(
-            uncached_genomes,
+            prepared_scores.uncached,
             generation_number,
             &mut evaluation_progress,
             &mut on_evaluation_progress,
@@ -886,8 +922,8 @@ impl EvolutionSession {
             unique_count,
             total_count,
             duplicate_count,
-            cache_hits,
-            complexity_rejection_count,
+            cache_hits: prepared_scores.cache_hits,
+            rejection_counts: prepared_scores.rejection_counts,
             lead_complexity,
             average_complexity,
         };
@@ -996,16 +1032,16 @@ impl EvolutionSession {
         generation: u64,
         evaluation_progress: &mut EvaluationProgressTracker,
         on_evaluation_progress: &mut Option<&mut (dyn FnMut(EvolutionEvaluationProgress) + Send)>,
-    ) -> (Vec<ScoredGenome>, Vec<SmartsGenome>, usize, usize) {
+    ) -> PreparedPopulationScores {
         let mut unique_scored = Vec::with_capacity(unique_population.len());
         let mut uncached_genomes = Vec::new();
         let mut cache_hits = 0usize;
-        let mut complexity_rejection_count = 0usize;
+        let mut rejection_counts = EvaluationRejectionCounts::default();
 
         for genome in unique_population {
             let smarts = genome.smarts_shared().clone();
             if let Some(rejection) = genome_evaluation_rejection(&self.config, &genome) {
-                complexity_rejection_count += 1;
+                rejection_counts.record(rejection);
                 log_rejected_genome(&self.task_id, generation, &genome, rejection);
                 let ranked = RankedSmarts::new(&genome, ObjectiveFitness::invalid());
                 unique_scored.push(build_rejected_scored_genome(genome));
@@ -1024,12 +1060,12 @@ impl EvolutionSession {
             }
         }
 
-        (
-            unique_scored,
-            uncached_genomes,
+        PreparedPopulationScores {
+            scored: unique_scored,
+            uncached: uncached_genomes,
             cache_hits,
-            complexity_rejection_count,
-        )
+            rejection_counts,
+        }
     }
 
     fn score_uncached_population(
@@ -1468,7 +1504,7 @@ fn generation_progress_message(
     best: ObjectiveFitness,
 ) -> String {
     format!(
-        "lead={:.3} best={:.3} uniq={}/{} dup={} cache={}/{} rejected={} complexity={} avg_complexity={:.1}",
+        "lead={:.3} best={:.3} uniq={}/{} dup={} cache={}/{} rejected={} complexity_rejected={} smarts_len_rejected={} complexity={} avg_complexity={:.1}",
         lead.mcc(),
         best.mcc(),
         stats.unique_count,
@@ -1476,7 +1512,9 @@ fn generation_progress_message(
         stats.duplicate_count,
         stats.cache_hits,
         stats.unique_count,
-        stats.complexity_rejection_count,
+        stats.rejection_counts.total(),
+        stats.rejection_counts.complexity,
+        stats.rejection_counts.smarts_length,
         stats.lead_complexity,
         stats.average_complexity,
     )
@@ -2160,7 +2198,10 @@ mod regression_tests {
                 total_count: 1024,
                 duplicate_count: 642,
                 cache_hits: 208,
-                complexity_rejection_count: 17,
+                rejection_counts: EvaluationRejectionCounts {
+                    complexity: 12,
+                    smarts_length: 5,
+                },
                 lead_complexity: 16,
                 average_complexity: 12.4,
             },
@@ -2170,7 +2211,7 @@ mod regression_tests {
 
         assert_eq!(
             message,
-            "lead=0.662 best=0.731 uniq=382/1024 dup=642 cache=208/382 rejected=17 complexity=16 avg_complexity=12.4"
+            "lead=0.662 best=0.731 uniq=382/1024 dup=642 cache=208/382 rejected=17 complexity_rejected=12 smarts_len_rejected=5 complexity=16 avg_complexity=12.4"
         );
     }
 
@@ -2227,7 +2268,10 @@ mod regression_tests {
             total_count: 3,
             duplicate_count: 1,
             cache_hits: 1,
-            complexity_rejection_count: 1,
+            rejection_counts: EvaluationRejectionCounts {
+                complexity: 1,
+                smarts_length: 2,
+            },
             lead_complexity: 4,
             average_complexity: 2.5,
         };
@@ -2255,6 +2299,8 @@ mod regression_tests {
         assert_eq!(progress.duplicate_count(), 1);
         assert_eq!(progress.cache_hits(), 1);
         assert_eq!(progress.complexity_rejection_count(), 1);
+        assert_eq!(progress.smarts_length_rejection_count(), 2);
+        assert_eq!(progress.evaluation_rejection_count(), 3);
         assert_eq!(progress.lead_complexity(), 4);
         assert_eq!(progress.average_complexity(), 2.5);
         assert_eq!(progress.stagnation(), 2);

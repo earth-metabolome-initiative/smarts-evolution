@@ -450,10 +450,12 @@ impl SmartsEvaluator {
                 .into_par_iter()
                 .map(|genome| {
                     let evaluation = self.evaluate_with_logging(&genome, settings);
-                    progress_state
-                        .lock()
-                        .unwrap()
-                        .record(&genome, evaluation.fitness());
+                    match progress_state.lock() {
+                        Ok(mut progress) => progress.record(&genome, evaluation.fitness()),
+                        Err(poisoned) => {
+                            poisoned.into_inner().record(&genome, evaluation.fitness())
+                        }
+                    }
                     (genome, evaluation)
                 })
                 .collect();

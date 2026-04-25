@@ -1,4 +1,5 @@
 //! Dedicated worker for browser-side SMARTS evolution runs.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::cell::RefCell;
 use std::str::FromStr;

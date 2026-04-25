@@ -22,3 +22,12 @@ wasm-bindgen-cli-support = "0.2.118"
 [profile.wasm-dev]
 inherits = "dev"
 debug = 0
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+expect_used = "warn"
+panic = "warn"
+unwrap_used = "warn"
