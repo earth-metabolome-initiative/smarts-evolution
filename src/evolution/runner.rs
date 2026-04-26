@@ -12,6 +12,8 @@ use log::{debug, info, warn};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+use rayon::prelude::*;
 use smarts_rs::{BondLabel, PreparedTarget};
 
 use super::config::EvolutionConfig;
@@ -217,6 +219,15 @@ struct PreparedPopulationScores {
 struct FreshPopulationScores {
     scored: Vec<ScoredGenome>,
     match_timeout_count: usize,
+}
+
+struct OffspringPairJob {
+    parent_a: SmartsGenome,
+    parent_b: SmartsGenome,
+    direction_a: MutationDirection,
+    direction_b: MutationDirection,
+    seed: u64,
+    include_second: bool,
 }
 
 /// One generic evolution task.
@@ -1272,26 +1283,7 @@ impl EvolutionSession {
             &mut self.rng,
         );
 
-        let mut offspring = Vec::with_capacity(self.config.population_size());
-        let mut pi = 0;
-        while offspring.len() < self.config.population_size() {
-            let p1 = &parents[pi % parents.len()];
-            let p2 = &parents[(pi + 1) % parents.len()];
-            pi += 2;
-
-            let p1_direction = self.mutation_direction_for_parent(p1);
-            let p2_direction = self.mutation_direction_for_parent(p2);
-            let (child_a, child_b) =
-                self.crossover
-                    .crossover_pair(&p1.genome, &p2.genome, &mut self.rng);
-            let child_a = self.mutate_offspring(child_a, p1_direction);
-            offspring.push(child_a);
-            if offspring.len() >= self.config.population_size() {
-                break;
-            }
-            let child_b = self.mutate_offspring(child_b, p2_direction);
-            offspring.push(child_b);
-        }
+        let offspring = self.build_offspring(&parents);
 
         let elite_count = self
             .config
@@ -1320,22 +1312,62 @@ impl EvolutionSession {
         );
     }
 
-    fn mutate_offspring(
-        &mut self,
-        genome: SmartsGenome,
-        direction: MutationDirection,
-    ) -> SmartsGenome {
-        let evaluator = &self.evaluator;
-        self.mutator.mutate_guided(
-            genome,
-            GUIDED_MUTATION_PROPOSAL_COUNT,
-            direction,
-            &mut self.rng,
-            |_, candidates| select_screened_mutation_candidate(evaluator, candidates),
-        )
+    fn build_offspring(&mut self, parents: &[ScoredGenome]) -> Vec<SmartsGenome> {
+        let jobs = self.offspring_pair_jobs(parents);
+        let population_size = self.config.population_size();
+
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        {
+            let child_pairs = jobs
+                .par_iter()
+                .map(|job| {
+                    build_offspring_pair(job, &self.crossover, &self.mutator, &self.evaluator)
+                })
+                .collect::<Vec<_>>();
+            child_pairs
+                .into_iter()
+                .flatten()
+                .take(population_size)
+                .collect()
+        }
+
+        #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+        {
+            jobs.iter()
+                .flat_map(|job| {
+                    build_offspring_pair(job, &self.crossover, &self.mutator, &self.evaluator)
+                })
+                .take(population_size)
+                .collect()
+        }
+    }
+
+    fn offspring_pair_jobs(&mut self, parents: &[ScoredGenome]) -> Vec<OffspringPairJob> {
+        let population_size = self.config.population_size();
+        let pair_count = population_size.div_ceil(2);
+        let mut jobs = Vec::with_capacity(pair_count);
+
+        for pair_index in 0..pair_count {
+            let parent_a = &parents[(pair_index * 2) % parents.len()];
+            let parent_b = &parents[(pair_index * 2 + 1) % parents.len()];
+            jobs.push(OffspringPairJob {
+                parent_a: parent_a.genome.clone(),
+                parent_b: parent_b.genome.clone(),
+                direction_a: self.mutation_direction_for_parent(parent_a),
+                direction_b: self.mutation_direction_for_parent(parent_b),
+                seed: self.rng.random::<u64>(),
+                include_second: pair_index * 2 + 1 < population_size,
+            });
+        }
+
+        jobs
     }
 
     fn mutation_direction_for_parent(&self, parent: &ScoredGenome) -> MutationDirection {
+        if parent.phenotype.is_empty() {
+            return MutationDirection::Balanced;
+        }
+
         mutation_direction_from_counts(
             self.evaluator
                 .confusion_for_phenotype(parent.phenotype.as_ref()),
@@ -1536,6 +1568,50 @@ fn build_rejected_scored_genome(genome: SmartsGenome) -> ScoredGenome {
         phenotype: Arc::from([]),
         coverage_score: 0.0,
     }
+}
+
+fn build_offspring_pair(
+    job: &OffspringPairJob,
+    crossover: &SmartsCrossover,
+    mutator: &SmartsMutation,
+    evaluator: &SmartsEvaluator,
+) -> Vec<SmartsGenome> {
+    let mut rng = SmallRng::seed_from_u64(job.seed);
+    let (child_a, child_b) = crossover.crossover_pair(&job.parent_a, &job.parent_b, &mut rng);
+    let mut children = Vec::with_capacity(if job.include_second { 2 } else { 1 });
+    children.push(mutate_offspring_with(
+        mutator,
+        evaluator,
+        child_a,
+        job.direction_a,
+        &mut rng,
+    ));
+    if job.include_second {
+        children.push(mutate_offspring_with(
+            mutator,
+            evaluator,
+            child_b,
+            job.direction_b,
+            &mut rng,
+        ));
+    }
+    children
+}
+
+fn mutate_offspring_with(
+    mutator: &SmartsMutation,
+    evaluator: &SmartsEvaluator,
+    genome: SmartsGenome,
+    direction: MutationDirection,
+    rng: &mut SmallRng,
+) -> SmartsGenome {
+    mutator.mutate_guided(
+        genome,
+        GUIDED_MUTATION_PROPOSAL_COUNT,
+        direction,
+        rng,
+        |_, candidates| select_screened_mutation_candidate(evaluator, candidates),
+    )
 }
 
 #[cfg(test)]
@@ -2118,11 +2194,17 @@ fn tournament_select(
     tournament_size: usize,
     rng: &mut impl rand::Rng,
 ) -> Vec<ScoredGenome> {
+    let selectable_indices = scored
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, candidate)| (!candidate.phenotype.is_empty()).then_some(idx))
+        .collect::<Vec<_>>();
+
     let mut parents = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut best_idx = rng.random_range(0..scored.len());
+        let mut best_idx = tournament_candidate_index(scored, &selectable_indices, rng);
         for _ in 1..tournament_size {
-            let idx = rng.random_range(0..scored.len());
+            let idx = tournament_candidate_index(scored, &selectable_indices, rng);
             if compare_scored_genomes(&scored[idx], &scored[best_idx]).is_lt() {
                 best_idx = idx;
             }
@@ -2130,6 +2212,18 @@ fn tournament_select(
         parents.push(scored[best_idx].clone());
     }
     parents
+}
+
+fn tournament_candidate_index(
+    scored: &[ScoredGenome],
+    selectable_indices: &[usize],
+    rng: &mut impl rand::Rng,
+) -> usize {
+    if selectable_indices.is_empty() {
+        rng.random_range(0..scored.len())
+    } else {
+        selectable_indices[rng.random_range(0..selectable_indices.len())]
+    }
 }
 
 fn leaderboard_from_scored(scored: &[ScoredGenome], limit: usize) -> Vec<RankedSmarts> {
@@ -2243,6 +2337,15 @@ mod regression_tests {
 
     fn scored(smarts: &str, mcc: f64, phenotype: &[u64]) -> ScoredGenome {
         scored_with_coverage(smarts, mcc, 0.0, phenotype)
+    }
+
+    fn invalid_scored(smarts: &str) -> ScoredGenome {
+        ScoredGenome {
+            genome: SmartsGenome::from_smarts(smarts).unwrap(),
+            fitness: ObjectiveFitness::invalid(),
+            phenotype: Arc::from([]),
+            coverage_score: 0.0,
+        }
     }
 
     fn scored_with_coverage(
@@ -2697,6 +2800,44 @@ mod regression_tests {
     }
 
     #[test]
+    fn offspring_builder_parallel_path_is_sized_valid_and_reproducible() {
+        let task = EvolutionTask::new(
+            "offspring",
+            vec![FoldData::new(vec![sample("CN", true), sample("CC", false)])],
+        );
+        let config = EvolutionConfig::builder()
+            .population_size(5)
+            .generation_limit(2)
+            .stagnation_limit(2)
+            .rng_seed(99)
+            .build()
+            .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6]~[#7]", "[#6]", "[#7]"]).unwrap();
+        let parents = vec![
+            scored("[#6]~[#7]", 0.90, &[0b01]),
+            scored("[#6]", 0.10, &[0b11]),
+            scored("[#7]", 0.50, &[0b01]),
+        ];
+        let mut left = EvolutionSession::new(&task, &config, &seed_corpus, 2).unwrap();
+        let mut right = EvolutionSession::new(&task, &config, &seed_corpus, 2).unwrap();
+
+        let left_offspring = left.build_offspring(&parents);
+        let right_offspring = right.build_offspring(&parents);
+        let left_smarts = left_offspring
+            .iter()
+            .map(|genome| genome.smarts())
+            .collect::<Vec<_>>();
+        let right_smarts = right_offspring
+            .iter()
+            .map(|genome| genome.smarts())
+            .collect::<Vec<_>>();
+
+        assert_eq!(left_offspring.len(), config.population_size());
+        assert!(left_offspring.iter().all(SmartsGenome::is_valid));
+        assert_eq!(left_smarts, right_smarts);
+    }
+
+    #[test]
     fn build_reset_pool_prefers_corpus_and_respects_limit() {
         let seed_corpus = SeedCorpus::try_from(["[#6]", "[#7]", "[#8]"]).unwrap();
         let population = vec![
@@ -2853,6 +2994,40 @@ mod regression_tests {
         assert_eq!(
             mutation_direction_from_counts(ConfusionCounts::new(9, 1, 9, 1)),
             MutationDirection::Balanced
+        );
+
+        let task = EvolutionTask::new(
+            "direction",
+            vec![FoldData::new(vec![sample("CN", true), sample("CC", false)])],
+        );
+        let config = EvolutionConfig::builder()
+            .population_size(4)
+            .generation_limit(1)
+            .stagnation_limit(1)
+            .build()
+            .unwrap();
+        let session = EvolutionSession::new(&task, &config, &SeedCorpus::builtin(), 1).unwrap();
+        assert_eq!(
+            session.mutation_direction_for_parent(&invalid_scored("[#6]")),
+            MutationDirection::Balanced
+        );
+    }
+
+    #[test]
+    fn tournament_selection_avoids_unknown_parents_when_valid_parents_exist() {
+        let scored = vec![
+            invalid_scored("[#6]"),
+            invalid_scored("[#7]"),
+            scored("[#6]~[#7]", 0.25, &[0b01]),
+        ];
+        let mut rng = SmallRng::seed_from_u64(11);
+
+        let parents = tournament_select(&scored, 16, 1, &mut rng);
+
+        assert!(
+            parents
+                .iter()
+                .all(|parent| !parent.phenotype.as_ref().is_empty())
         );
     }
 
