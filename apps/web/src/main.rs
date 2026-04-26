@@ -10,19 +10,19 @@ use std::str::FromStr;
 use dioxus::prelude::*;
 use icons::{AppIcon, app_icon};
 use plot::MccGenerationImprovementPlot;
-use smiles_parser::Smiles;
 use smarts_evolution::SmartsGenome;
 use smarts_evolution_web_protocol::{
-    CompletedRun, EvaluationUpdate, EvolutionConfigInput, ProgressUpdate, RankedCandidate,
-    RunRequest, StartupUpdate, WorkerRequest,
+    CompletedRun, EvaluationUpdate, EvolutionConfigInput, OffspringUpdate, ProgressUpdate,
+    RankedCandidate, RunRequest, StartupUpdate, WorkerRequest,
 };
+use smiles_parser::Smiles;
 
+#[cfg(target_arch = "wasm32")]
+use smarts_evolution_web_protocol::WorkerResponse;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{ErrorEvent, MessageEvent, Worker, WorkerOptions, WorkerType};
-#[cfg(target_arch = "wasm32")]
-use smarts_evolution_web_protocol::WorkerResponse;
 
 #[cfg(target_arch = "wasm32")]
 const WORKER_SCRIPT: &str = "/generated/evolution-worker.js";
@@ -59,42 +59,26 @@ const EXAMPLE_PRESETS: [ExamplePreset; 5] = [
     ExamplePreset {
         label: "Amphetamines",
         icon: AppIcon::Bolt,
-        positive_smiles: include_str!(
-            "../examples/amphetamines_and_derivatives_positive.smiles"
-        ),
-        negative_smiles: include_str!(
-            "../examples/amphetamines_and_derivatives_negative.smiles"
-        ),
+        positive_smiles: include_str!("../examples/amphetamines_and_derivatives_positive.smiles"),
+        negative_smiles: include_str!("../examples/amphetamines_and_derivatives_negative.smiles"),
     },
     ExamplePreset {
         label: "Flavonoids",
         icon: AppIcon::Leaf,
-        positive_smiles: include_str!(
-            "../examples/flavonoids_positive.smiles"
-        ),
-        negative_smiles: include_str!(
-            "../examples/flavonoids_negative.smiles"
-        ),
+        positive_smiles: include_str!("../examples/flavonoids_positive.smiles"),
+        negative_smiles: include_str!("../examples/flavonoids_negative.smiles"),
     },
     ExamplePreset {
         label: "Fatty acids",
         icon: AppIcon::Droplet,
-        positive_smiles: include_str!(
-            "../examples/fatty_acids_and_conjugates_positive.smiles"
-        ),
-        negative_smiles: include_str!(
-            "../examples/fatty_acids_and_conjugates_negative.smiles"
-        ),
+        positive_smiles: include_str!("../examples/fatty_acids_and_conjugates_positive.smiles"),
+        negative_smiles: include_str!("../examples/fatty_acids_and_conjugates_negative.smiles"),
     },
     ExamplePreset {
         label: "Penicillins",
         icon: AppIcon::Capsules,
-        positive_smiles: include_str!(
-            "../examples/penicillins_positive.smiles"
-        ),
-        negative_smiles: include_str!(
-            "../examples/penicillins_negative.smiles"
-        ),
+        positive_smiles: include_str!("../examples/penicillins_positive.smiles"),
+        negative_smiles: include_str!("../examples/penicillins_negative.smiles"),
     },
     ExamplePreset {
         label: "Steroids",
@@ -230,6 +214,7 @@ struct RunView {
     phase: RunPhase,
     startup: Option<StartupUpdate>,
     evaluation: Option<EvaluationUpdate>,
+    offspring: Option<OffspringUpdate>,
     progress: Option<ProgressUpdate>,
     result: Option<CompletedRun>,
     history: Vec<ProgressPoint>,
@@ -242,6 +227,7 @@ impl Default for RunView {
             phase: RunPhase::Idle,
             startup: None,
             evaluation: None,
+            offspring: None,
             progress: None,
             result: None,
             history: Vec::new(),
@@ -257,6 +243,7 @@ impl RunView {
             phase: RunPhase::Running,
             startup: Some(StartupUpdate::new(run_id, "Launching worker", 0, 1)),
             evaluation: None,
+            offspring: None,
             progress: None,
             result: None,
             history: Vec::new(),
@@ -271,6 +258,7 @@ impl RunView {
         }
         self.startup = Some(startup);
         self.evaluation = None;
+        self.offspring = None;
         self.progress = None;
         self.result = None;
     }
@@ -282,6 +270,18 @@ impl RunView {
         }
         self.startup = None;
         self.evaluation = Some(evaluation);
+        self.offspring = None;
+        self.result = None;
+    }
+
+    fn apply_offspring(&mut self, offspring: OffspringUpdate) {
+        if self.phase != RunPhase::Stopped {
+            self.phase = RunPhase::Running;
+            self.message = None;
+        }
+        self.startup = None;
+        self.evaluation = None;
+        self.offspring = Some(offspring);
         self.result = None;
     }
 
@@ -292,11 +292,15 @@ impl RunView {
         }
         self.startup = None;
         self.evaluation = None;
+        self.offspring = None;
         self.push_progress_point(&progress);
         self.progress = Some(progress);
         self.result = None;
         self.message = if was_stopped {
-            Some("Evolution paused. Resume continues from the last completed generation.".to_string())
+            Some(
+                "Evolution paused. Resume continues from the last completed generation."
+                    .to_string(),
+            )
         } else {
             None
         };
@@ -306,6 +310,7 @@ impl RunView {
         self.phase = RunPhase::Completed;
         self.startup = None;
         self.evaluation = None;
+        self.offspring = None;
         self.result = Some(result);
         self.message = Some("Evolution run completed.".to_string());
     }
@@ -314,6 +319,7 @@ impl RunView {
         self.phase = RunPhase::Failed;
         self.startup = None;
         self.evaluation = None;
+        self.offspring = None;
         self.message = Some(message);
     }
 
@@ -412,6 +418,7 @@ impl EvolutionWorker {
                 WorkerResponse::Evaluation(evaluation) => {
                     run_view.write().apply_evaluation(evaluation)
                 }
+                WorkerResponse::Offspring(offspring) => run_view.write().apply_offspring(offspring),
                 WorkerResponse::Progress(progress) => run_view.write().apply_progress(progress),
                 WorkerResponse::Complete(result) => run_view.write().finish(result),
                 WorkerResponse::Fatal(error) => run_view.write().fail(error.message().to_string()),
@@ -586,9 +593,12 @@ fn App() -> Element {
 
     let run_view_value = run_view();
     let setup_is_visible = setup_visible();
-    let draft_value = if setup_is_visible { Some(draft()) } else { None };
-    let validation_cache =
-        use_hook(|| RefCell::new(None::<(RunDraft, DraftValidation)>));
+    let draft_value = if setup_is_visible {
+        Some(draft())
+    } else {
+        None
+    };
+    let validation_cache = use_hook(|| RefCell::new(None::<(RunDraft, DraftValidation)>));
     let validation = if let Some(draft_value) = draft_value.as_ref() {
         let mut cache = validation_cache.borrow_mut();
         let recompute = match cache.as_ref() {
@@ -912,9 +922,21 @@ fn App() -> Element {
                                 div { class: "progress-stack",
                                     {progress_meter(
                                         "Generation progress",
-                                        progress.generation() as f64,
+                                        displayed_completed_generation(
+                                            progress,
+                                            run_view_value.evaluation.as_ref(),
+                                            run_view_value.offspring.as_ref(),
+                                        ) as f64,
                                         progress.generation_limit() as f64,
-                                        format!("{}/{}", progress.generation(), progress.generation_limit()),
+                                        format!(
+                                            "{}/{}",
+                                            displayed_completed_generation(
+                                                progress,
+                                                run_view_value.evaluation.as_ref(),
+                                                run_view_value.offspring.as_ref(),
+                                            ),
+                                            progress.generation_limit(),
+                                        ),
                                         "progress-fill",
                                     )}
                                     if let Some(evaluation) = run_view_value.evaluation.as_ref() {
@@ -924,6 +946,14 @@ fn App() -> Element {
                                             evaluation.total() as f64,
                                             format!("{}/{} SMARTS", evaluation.completed(), evaluation.total()),
                                             "progress-fill",
+                                        )}
+                                    } else if let Some(offspring) = run_view_value.offspring.as_ref() {
+                                        {progress_meter(
+                                            format!("Generating candidates for generation {}", offspring.generation()),
+                                            offspring.completed() as f64,
+                                            offspring.total() as f64,
+                                            format!("{}/{} candidates", offspring.completed(), offspring.total()),
+                                            "progress-fill-secondary",
                                         )}
                                     }
                                 }
@@ -959,6 +989,27 @@ fn App() -> Element {
                                         evaluation.total() as f64,
                                         format!("{}/{} SMARTS", evaluation.completed(), evaluation.total()),
                                         "progress-fill",
+                                    )}
+                                }
+                            } else if let Some(offspring) = run_view_value.offspring.as_ref() {
+                                div { class: "progress-stack",
+                                    {progress_meter(
+                                        "Generation progress",
+                                        offspring.generation().saturating_sub(1) as f64,
+                                        offspring.generation_limit() as f64,
+                                        format!(
+                                            "{}/{}",
+                                            offspring.generation().saturating_sub(1),
+                                            offspring.generation_limit(),
+                                        ),
+                                        "progress-fill",
+                                    )}
+                                    {progress_meter(
+                                        format!("Generating candidates for generation {}", offspring.generation()),
+                                        offspring.completed() as f64,
+                                        offspring.total() as f64,
+                                        format!("{}/{} candidates", offspring.completed(), offspring.total()),
+                                        "progress-fill-secondary",
                                     )}
                                 }
                             }
@@ -1166,6 +1217,19 @@ fn progress_meter(
     }
 }
 
+fn displayed_completed_generation(
+    progress: &ProgressUpdate,
+    evaluation: Option<&EvaluationUpdate>,
+    offspring: Option<&OffspringUpdate>,
+) -> u64 {
+    if evaluation.is_none()
+        && let Some(offspring) = offspring
+    {
+        return offspring.generation().saturating_sub(1);
+    }
+    progress.generation()
+}
+
 fn current_leaders(view: &RunView) -> &[RankedCandidate] {
     if let Some(result) = view.result.as_ref() {
         result.leaders()
@@ -1209,8 +1273,7 @@ fn validate_draft(draft: &RunDraft) -> DraftValidation {
     let mutation_rate = validate_probability_value("Mutation rate", &draft.mutation_rate, false);
     validation.mutation_rate = mutation_rate.error.clone();
 
-    let crossover_rate =
-        validate_probability_value("Crossover rate", &draft.crossover_rate, false);
+    let crossover_rate = validate_probability_value("Crossover rate", &draft.crossover_rate, false);
     validation.crossover_rate = crossover_rate.error.clone();
 
     let selection_ratio =
@@ -1223,11 +1286,8 @@ fn validate_draft(draft: &RunDraft) -> DraftValidation {
     let elite_count = validate_usize_value("Elite count", &draft.elite_count, false);
     validation.elite_count = elite_count.error.clone();
 
-    let random_immigrant_ratio = validate_probability_value(
-        "Immigrant ratio",
-        &draft.random_immigrant_ratio,
-        false,
-    );
+    let random_immigrant_ratio =
+        validate_probability_value("Immigrant ratio", &draft.random_immigrant_ratio, false);
     validation.random_immigrant_ratio = random_immigrant_ratio.error.clone();
 
     let stagnation_limit = validate_u64_value("Stagnation limit", &draft.stagnation_limit, true);
@@ -1251,8 +1311,10 @@ fn build_run_request(run_id: u64, draft: &RunDraft) -> Result<RunRequest, String
         return Err(error.to_string());
     }
 
-    let normalized_positive_smiles = compact_smiles_lines("positive SMILES", &draft.positive_smiles)?;
-    let normalized_negative_smiles = compact_smiles_lines("negative SMILES", &draft.negative_smiles)?;
+    let normalized_positive_smiles =
+        compact_smiles_lines("positive SMILES", &draft.positive_smiles)?;
+    let normalized_negative_smiles =
+        compact_smiles_lines("negative SMILES", &draft.negative_smiles)?;
 
     let config = EvolutionConfigInput::default()
         .with_population_size(parse_usize("population size", &draft.population_size)?)
@@ -1438,7 +1500,11 @@ fn validate_u64_value(label: &str, value: &str, require_positive: bool) -> Parse
     }
 }
 
-fn validate_probability_value(label: &str, value: &str, require_positive: bool) -> ParsedValue<f64> {
+fn validate_probability_value(
+    label: &str,
+    value: &str,
+    require_positive: bool,
+) -> ParsedValue<f64> {
     match value.trim().parse::<f64>() {
         Ok(parsed) if !(0.0..=1.0).contains(&parsed) => ParsedValue {
             value: Some(parsed),
@@ -1484,16 +1550,17 @@ fn parse_f64(label: &str, value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         DraftValidation, EXAMPLE_PRESETS, build_run_request, compact_smiles_lines,
-        seed_smarts_entry_count, smiles_count_label, smiles_entry_count, smarts_count_label,
+        seed_smarts_entry_count, smarts_count_label, smiles_count_label, smiles_entry_count,
         validate_seed_smarts_lines, validate_smiles_lines,
     };
 
     #[test]
     fn baked_in_examples_are_smiles_only() {
         for preset in EXAMPLE_PRESETS {
-            for (smiles, expected_count) in
-                [(preset.positive_smiles(), 2000usize), (preset.negative_smiles(), 2000usize)]
-            {
+            for (smiles, expected_count) in [
+                (preset.positive_smiles(), 2000usize),
+                (preset.negative_smiles(), 2000usize),
+            ] {
                 let first = smiles.lines().next().unwrap();
                 assert!(!first.contains('\t'));
                 assert!(!first.chars().all(|ch| ch.is_ascii_digit()));

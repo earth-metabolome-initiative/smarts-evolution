@@ -7,24 +7,27 @@ use ::indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle}
 
 use super::config::EvolutionConfig;
 use super::runner::{
-    EvolutionError, EvolutionEvaluationProgress, EvolutionProgress, EvolutionProgressObserver,
-    EvolutionSession, EvolutionTask, TaskResult,
+    EvolutionError, EvolutionEvaluationProgress, EvolutionOffspringProgress, EvolutionProgress,
+    EvolutionProgressObserver, EvolutionSession, EvolutionTask, TaskResult,
 };
 use crate::genome::seed::SeedCorpus;
 
 const DEFAULT_BEST_SMARTS_WIDTH: usize = 96;
 const GENERATION_STYLE_TEMPLATE: &str = "{prefix} [{wide_bar}] {pos}/{len} ETA {eta_precise} {msg}";
 const EVALUATION_STYLE_TEMPLATE: &str = "{prefix} [{wide_bar}] {pos}/{len} SMARTS{msg}";
+const OFFSPRING_STYLE_TEMPLATE: &str = "{prefix} [{wide_bar}] {pos}/{len} candidates{msg}";
 
 /// Indicatif-backed progress bars for one evolution run.
 ///
 /// The top bar tracks completed generations and shows ETA, the best MCC,
 /// match coverage, SMARTS so far, and the number of generations since the
 /// incumbent last improved. The second bar tracks SMARTS evaluation inside the
-/// current generation.
+/// current generation. The third bar tracks mutation and candidate selection
+/// while the next generation is being prepared.
 pub struct IndicatifEvolutionProgress {
     generation_bar: ProgressBar,
     evaluation_bar: ProgressBar,
+    offspring_bar: ProgressBar,
     best_smarts_width: usize,
     clear_on_finish: bool,
 }
@@ -49,14 +52,26 @@ impl IndicatifEvolutionProgress {
 
     /// Create progress bars from caller-owned indicatif bars.
     pub fn from_bars(generation_bar: ProgressBar, evaluation_bar: ProgressBar) -> Self {
+        Self::from_bars_with_offspring(generation_bar, evaluation_bar, ProgressBar::hidden())
+    }
+
+    /// Create progress bars from caller-owned indicatif bars, including offspring progress.
+    pub fn from_bars_with_offspring(
+        generation_bar: ProgressBar,
+        evaluation_bar: ProgressBar,
+        offspring_bar: ProgressBar,
+    ) -> Self {
         generation_bar.set_style(generation_style());
         generation_bar.set_prefix("generations");
         evaluation_bar.set_style(evaluation_style());
         evaluation_bar.set_prefix("evaluating");
+        offspring_bar.set_style(offspring_style());
+        offspring_bar.set_prefix("mutating");
 
         Self {
             generation_bar,
             evaluation_bar,
+            offspring_bar,
             best_smarts_width: DEFAULT_BEST_SMARTS_WIDTH,
             clear_on_finish: false,
         }
@@ -64,7 +79,8 @@ impl IndicatifEvolutionProgress {
 
     /// Attach evolution progress bars to an existing indicatif multi-progress.
     pub fn attach_to(multi: &MultiProgress) -> Self {
-        Self::from_bars(
+        Self::from_bars_with_offspring(
+            multi.add(ProgressBar::new(1)),
             multi.add(ProgressBar::new(1)),
             multi.add(ProgressBar::new(1)),
         )
@@ -93,6 +109,12 @@ impl IndicatifEvolutionProgress {
         self
     }
 
+    /// Use a caller-provided style for the offspring candidate progress bar.
+    pub fn with_offspring_style(self, style: ProgressStyle) -> Self {
+        self.offspring_bar.set_style(style);
+        self
+    }
+
     /// Clear both evolution bars when the run finishes or fails.
     pub fn clear_on_finish(mut self, clear: bool) -> Self {
         self.clear_on_finish = clear;
@@ -110,6 +132,12 @@ impl IndicatifEvolutionProgress {
         self
     }
 
+    /// Set a custom prefix for the offspring candidate bar.
+    pub fn with_offspring_prefix(self, offspring: impl Into<String>) -> Self {
+        self.offspring_bar.set_prefix(offspring.into());
+        self
+    }
+
     fn start(&mut self, task_id: &str, generation_limit: u64) {
         self.generation_bar.set_length(generation_limit.max(1));
         self.generation_bar.set_position(0);
@@ -117,6 +145,9 @@ impl IndicatifEvolutionProgress {
         self.evaluation_bar.set_length(1);
         self.evaluation_bar.set_position(0);
         self.evaluation_bar.set_message("waiting for generation 1");
+        self.offspring_bar.set_length(1);
+        self.offspring_bar.set_position(0);
+        self.offspring_bar.set_message("waiting for scored parents");
     }
 
     fn record_evaluation(&mut self, progress: &EvolutionEvaluationProgress) {
@@ -144,6 +175,22 @@ impl IndicatifEvolutionProgress {
             .set_message(self.generation_message(progress));
     }
 
+    fn record_offspring(&mut self, progress: &EvolutionOffspringProgress) {
+        if progress.completed() == 0 {
+            self.offspring_bar.reset_elapsed();
+            self.offspring_bar.reset_eta();
+        }
+        self.generation_bar
+            .set_length(progress.generation_limit().max(1));
+        self.generation_bar
+            .set_position(progress.generation().saturating_sub(1));
+        self.offspring_bar
+            .set_length(progress.total().max(1) as u64);
+        self.offspring_bar.set_position(progress.completed() as u64);
+        self.offspring_bar
+            .set_message(format!(" generation={}", progress.generation()));
+    }
+
     fn finish(&mut self, result: &TaskResult) {
         let message = format!(
             "done generations={} best_mcc={:.3} coverage={:.3} best_smarts={}",
@@ -153,9 +200,11 @@ impl IndicatifEvolutionProgress {
             truncate_smarts(result.best_smarts(), self.best_smarts_width)
         );
         if self.clear_on_finish {
+            self.offspring_bar.finish_and_clear();
             self.evaluation_bar.finish_and_clear();
             self.generation_bar.finish_and_clear();
         } else {
+            self.offspring_bar.finish_with_message("done");
             self.evaluation_bar.finish_with_message("done");
             self.generation_bar.finish_with_message(message);
         }
@@ -163,9 +212,11 @@ impl IndicatifEvolutionProgress {
 
     fn abandon(&mut self, error: &EvolutionError) {
         if self.clear_on_finish {
+            self.offspring_bar.finish_and_clear();
             self.evaluation_bar.finish_and_clear();
             self.generation_bar.finish_and_clear();
         } else {
+            self.offspring_bar.abandon_with_message("failed");
             self.evaluation_bar.abandon_with_message("failed");
             self.generation_bar
                 .abandon_with_message(format!("failed: {error}"));
@@ -191,6 +242,10 @@ impl EvolutionProgressObserver for IndicatifEvolutionProgress {
 
     fn on_evaluation(&mut self, progress: &EvolutionEvaluationProgress) {
         self.record_evaluation(progress);
+    }
+
+    fn on_offspring(&mut self, progress: &EvolutionOffspringProgress) {
+        self.record_offspring(progress);
     }
 
     fn on_generation(&mut self, progress: &EvolutionProgress) {
@@ -286,6 +341,10 @@ fn evaluation_style() -> ProgressStyle {
     bar_style(EVALUATION_STYLE_TEMPLATE)
 }
 
+fn offspring_style() -> ProgressStyle {
+    bar_style(OFFSPRING_STYLE_TEMPLATE)
+}
+
 fn bar_style(template: &str) -> ProgressStyle {
     ProgressStyle::with_template(template)
         .unwrap_or_else(|_| ProgressStyle::default_bar())
@@ -373,6 +432,16 @@ mod tests {
             evaluation_detail_message(Some(0.478), Some("[#7;R&+0:27651]"), 12),
             " current_mcc=0.478 current=[#7;R&+0:..."
         );
+    }
+
+    #[test]
+    fn offspring_bar_uses_candidate_counter() {
+        assert_eq!(
+            OFFSPRING_STYLE_TEMPLATE,
+            "{prefix} [{wide_bar}] {pos}/{len} candidates{msg}"
+        );
+        assert!(!OFFSPRING_STYLE_TEMPLATE.contains("SMARTS"));
+        assert!(!OFFSPRING_STYLE_TEMPLATE.contains("generation="));
     }
 
     #[test]

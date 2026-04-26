@@ -12,6 +12,9 @@ use wasm_bindgen::{JsCast, closure::Closure};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent};
 
+#[cfg(target_arch = "wasm32")]
+type MouseClosureSlot = Rc<RefCell<Option<Closure<dyn FnMut(MouseEvent)>>>>;
+
 const PLOT_WIDTH: f64 = 560.0;
 const PLOT_HEIGHT: f64 = 180.0;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -67,7 +70,8 @@ pub(crate) fn MccGenerationImprovementPlot(history: Vec<ProgressPoint>) -> Eleme
         let move_slot = move_slot.clone();
         let leave_slot = leave_slot.clone();
         use_effect(move || {
-            let Some((_, width, height)) = canvas_context("mcc-generation-improvement-canvas") else {
+            let Some((_, width, height)) = canvas_context("mcc-generation-improvement-canvas")
+            else {
                 return;
             };
             let plot_data =
@@ -172,7 +176,10 @@ fn scatter_tooltip_style(tooltip: &ScatterTooltip) -> String {
     )
 }
 
-fn compare_ranked_candidates(left: &RankedCandidate, right: &RankedCandidate) -> std::cmp::Ordering {
+fn compare_ranked_candidates(
+    left: &RankedCandidate,
+    right: &RankedCandidate,
+) -> std::cmp::Ordering {
     right
         .mcc()
         .partial_cmp(&left.mcc())
@@ -190,8 +197,8 @@ fn bind_scatter_hover_handlers(
     canvas_id: &str,
     points: Vec<ScatterPlotPoint>,
     mut hover: Signal<Option<ScatterTooltip>>,
-    move_slot: Rc<RefCell<Option<Closure<dyn FnMut(MouseEvent)>>>>,
-    leave_slot: Rc<RefCell<Option<Closure<dyn FnMut(MouseEvent)>>>>,
+    move_slot: MouseClosureSlot,
+    leave_slot: MouseClosureSlot,
 ) {
     let Some((_, _, _)) = canvas_context(canvas_id) else {
         return;
@@ -321,7 +328,10 @@ fn build_mcc_generation_improvement_data_for_size(
     };
 
     let x_ticks: Vec<(f64, String)> = if history.len() == 1 {
-        vec![(PLOT_LEFT_PAD + usable_width / 2.0, history[0].generation.to_string())]
+        vec![(
+            PLOT_LEFT_PAD + usable_width / 2.0,
+            history[0].generation.to_string(),
+        )]
     } else {
         let tick_count = history.len().min(5);
         (0..tick_count)

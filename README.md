@@ -51,7 +51,7 @@ assert!(result.best_mcc().is_finite());
 
 ## Terminal Progress Bars
 
-Enable the `indicatif` feature and call `task.evolve_with_indicatif(&config, &seed_corpus)` to get a generation progress bar plus a per-generation SMARTS evaluation bar. The evaluation bar reports completion, current SMARTS and MCC, generation-best SMARTS and MCC, and incumbent-best SMARTS and MCC. For large prepared datasets, use `task.evolve_owned_with_indicatif_progress(...)` to move the task folds into the session; use `IndicatifEvolutionProgress::attach_to(&multi)` or `from_bars(...)` to embed the bars in an existing `MultiProgress`. Non-terminal callers can implement `EvolutionProgressObserver` and pass it to `task.evolve_with_observer(...)`.
+Enable the `indicatif` feature and call `task.evolve_with_indicatif(&config, &seed_corpus)` to get generation, per-generation SMARTS evaluation, and offspring candidate-generation progress bars. The evaluation bar reports completion, current SMARTS and MCC, generation-best SMARTS and MCC, and incumbent-best SMARTS and MCC; the offspring bar reports mutation and candidate selection progress while the next generation is prepared. For large prepared datasets, use `task.evolve_owned_with_indicatif_progress(...)` to move the task folds into the session; use `IndicatifEvolutionProgress::attach_to(&multi)` or `from_bars_with_offspring(...)` to embed all bars in an existing `MultiProgress`. Non-terminal callers can implement `EvolutionProgressObserver` and pass it to `task.evolve_with_observer(...)`.
 
 ## Pathological SMARTS Evaluation
 

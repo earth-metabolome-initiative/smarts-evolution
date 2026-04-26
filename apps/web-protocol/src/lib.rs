@@ -161,10 +161,7 @@ impl EvolutionConfigInput {
     /// emitted SMARTS will produce PubChem hits or avoid PubChem search-time
     /// failures for very complex queries.
     #[must_use]
-    pub const fn with_pubchem_compatible_smarts(
-        mut self,
-        pubchem_compatible_smarts: bool,
-    ) -> Self {
+    pub const fn with_pubchem_compatible_smarts(mut self, pubchem_compatible_smarts: bool) -> Self {
         self.pubchem_compatible_smarts = pubchem_compatible_smarts;
         self
     }
@@ -309,6 +306,53 @@ pub struct EvaluationUpdate {
 }
 
 impl EvaluationUpdate {
+    pub fn new(
+        run_id: u64,
+        generation: u64,
+        generation_limit: u64,
+        completed: usize,
+        total: usize,
+    ) -> Self {
+        Self {
+            run_id,
+            generation,
+            generation_limit,
+            completed,
+            total: total.max(1),
+        }
+    }
+
+    pub fn run_id(&self) -> u64 {
+        self.run_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn generation_limit(&self) -> u64 {
+        self.generation_limit
+    }
+
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OffspringUpdate {
+    run_id: u64,
+    generation: u64,
+    generation_limit: u64,
+    completed: usize,
+    total: usize,
+}
+
+impl OffspringUpdate {
     pub fn new(
         run_id: u64,
         generation: u64,
@@ -548,6 +592,7 @@ pub enum WorkerResponse {
     Ready,
     Startup(StartupUpdate),
     Evaluation(EvaluationUpdate),
+    Offspring(OffspringUpdate),
     Progress(ProgressUpdate),
     Complete(CompletedRun),
     Fatal(FatalResponse),
@@ -559,6 +604,7 @@ impl WorkerResponse {
             Self::Ready => 0,
             Self::Startup(startup) => startup.run_id(),
             Self::Evaluation(evaluation) => evaluation.run_id(),
+            Self::Offspring(offspring) => offspring.run_id(),
             Self::Progress(progress) => progress.run_id(),
             Self::Complete(result) => result.run_id(),
             Self::Fatal(error) => error.run_id(),

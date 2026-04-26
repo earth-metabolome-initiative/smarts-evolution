@@ -9,12 +9,14 @@ use std::time::Duration;
 use js_sys::Date;
 use js_sys::global;
 use smarts_evolution::{
-    EvolutionConfig, EvolutionEvaluationProgress, EvolutionProgress, EvolutionSession,
-    EvolutionStatus, EvolutionTask, FoldData, FoldSample, RankedSmarts, SeedCorpus, TaskResult,
+    EvolutionConfig, EvolutionEvaluationProgress, EvolutionOffspringProgress, EvolutionProgress,
+    EvolutionSession, EvolutionStatus, EvolutionTask, FoldData, FoldSample, RankedSmarts,
+    SeedCorpus, TaskResult,
 };
 use smarts_evolution_web_protocol::{
-    CompletedRun, EvaluationUpdate, EvolutionConfigInput, FatalResponse, ProgressUpdate,
-    RankedCandidate, RunRequest, RunStatus, StartupUpdate, WorkerRequest, WorkerResponse,
+    CompletedRun, EvaluationUpdate, EvolutionConfigInput, FatalResponse, OffspringUpdate,
+    ProgressUpdate, RankedCandidate, RunRequest, RunStatus, StartupUpdate, WorkerRequest,
+    WorkerResponse,
 };
 use smarts_rs::PreparedTarget;
 use smiles_parser::Smiles;
@@ -69,9 +71,8 @@ pub fn start() -> Result<(), JsValue> {
             WorkerRequest::Stop { run_id } => pause_active_run(run_id),
             WorkerRequest::Resume { run_id } => {
                 if let Err(message) = resume_active_run(run_id) {
-                    let _ = post_response(&WorkerResponse::Fatal(FatalResponse::new(
-                        run_id, message,
-                    )));
+                    let _ =
+                        post_response(&WorkerResponse::Fatal(FatalResponse::new(run_id, message)));
                 }
             }
         }
@@ -94,9 +95,8 @@ fn start_run(request: RunRequest) -> Result<(), String> {
     startup.advance(1, "Preparing evaluation fold")?;
     startup.advance(1, "Starting genetic search")?;
     let leaderboard_size = request.top_k().max(1);
-    let session =
-        EvolutionSession::new(&task, &config, &seed_corpus, leaderboard_size)
-            .map_err(|error| error.to_string())?;
+    let session = EvolutionSession::new(&task, &config, &seed_corpus, leaderboard_size)
+        .map_err(|error| error.to_string())?;
 
     WORKER_STATE.with(|state| {
         state.borrow_mut().active_run = Some(ActiveRun {
@@ -254,6 +254,19 @@ fn evaluation_update_from_snapshot(
     )
 }
 
+fn offspring_update_from_snapshot(
+    run_id: u64,
+    snapshot: &EvolutionOffspringProgress,
+) -> OffspringUpdate {
+    OffspringUpdate::new(
+        run_id,
+        snapshot.generation(),
+        snapshot.generation_limit(),
+        snapshot.completed(),
+        snapshot.total(),
+    )
+}
+
 fn completed_run_from_result(run_id: u64, result: &TaskResult) -> CompletedRun {
     CompletedRun::new(
         run_id,
@@ -358,19 +371,32 @@ fn drive_active_run() {
                 ));
             }
         };
+        let on_offspring_progress = |progress: EvolutionOffspringProgress| {
+            if should_report_progress(progress.completed(), progress.total()) {
+                let _ = post_response(&WorkerResponse::Offspring(offspring_update_from_snapshot(
+                    run_id, &progress,
+                )));
+            }
+        };
         let progress = {
             #[cfg(target_arch = "wasm32")]
             {
-                active_run.session.step_with_evaluation_progress_and_clock(
-                    &worker_now_ms,
-                    on_evaluation_progress,
-                )
+                active_run
+                    .session
+                    .step_with_evaluation_and_offspring_progress_and_clock(
+                        &worker_now_ms,
+                        on_evaluation_progress,
+                        on_offspring_progress,
+                    )
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
                 active_run
                     .session
-                    .step_with_evaluation_progress(on_evaluation_progress)
+                    .step_with_evaluation_and_offspring_progress(
+                        on_evaluation_progress,
+                        on_offspring_progress,
+                    )
             }
         };
         let Some(progress) = progress else {
