@@ -24,8 +24,11 @@ hashbrown = { version = "0.17.0", default-features = false, features = ["default
 indicatif = { version = "0.18.4", default-features = false, optional = true }
 rayon = { version = "1.12.0", optional = true }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = "0.8.2"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [[bench]]
 name = "evolution"

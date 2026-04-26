@@ -1344,6 +1344,10 @@ impl EvolutionSession {
 
     fn offspring_pair_jobs(&mut self, parents: &[ScoredGenome]) -> Vec<OffspringPairJob> {
         let population_size = self.config.population_size();
+        if parents.is_empty() || population_size == 0 {
+            return Vec::new();
+        }
+
         let pair_count = population_size.div_ceil(2);
         let mut jobs = Vec::with_capacity(pair_count);
 
@@ -2122,6 +2126,10 @@ fn select_screened_mutation_candidate(
     evaluator: &SmartsEvaluator,
     candidates: &[SmartsGenome],
 ) -> usize {
+    if candidates.is_empty() {
+        return 0;
+    }
+
     let mut best_idx = 0usize;
     let mut best_score = evaluator.screening_proxy_of(&candidates[0]);
     for (idx, candidate) in candidates.iter().enumerate().skip(1) {
@@ -2194,6 +2202,10 @@ fn tournament_select(
     tournament_size: usize,
     rng: &mut impl rand::Rng,
 ) -> Vec<ScoredGenome> {
+    if scored.is_empty() || count == 0 {
+        return Vec::new();
+    }
+
     let selectable_indices = scored
         .iter()
         .enumerate()
@@ -2328,6 +2340,8 @@ mod regression_tests {
     use crate::fitness::evaluator::FoldSample;
     use smarts_rs::PreparedTarget;
     use smiles_parser::Smiles;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::*;
 
@@ -2555,6 +2569,60 @@ mod regression_tests {
         assert!(result.generations() >= 2);
         assert!(result.generations() <= config.generation_limit());
         assert!(SmartsGenome::from_smarts(result.best_smarts()).is_ok());
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn fatty_acid_example_with_custom_seeds_runs_generations() {
+        let positive_smiles =
+            include_str!("../../apps/web/examples/fatty_acids_and_conjugates_positive.smiles");
+        let negative_smiles =
+            include_str!("../../apps/web/examples/fatty_acids_and_conjugates_negative.smiles");
+        let canonical_sample = |smiles: &str, is_positive| {
+            let target = PreparedTarget::new(Smiles::from_str(smiles).unwrap().canonicalize());
+            FoldSample::new(target, is_positive)
+        };
+        let samples = positive_smiles
+            .lines()
+            .take(128)
+            .map(|smiles| canonical_sample(smiles, true))
+            .chain(
+                negative_smiles
+                    .lines()
+                    .take(128)
+                    .map(|smiles| canonical_sample(smiles, false)),
+            )
+            .collect::<Vec<_>>();
+        let task = EvolutionTask::new("fatty-acids-regression", vec![FoldData::new(samples)]);
+        let config = EvolutionConfig::builder()
+            .population_size(24)
+            .generation_limit(3)
+            .stagnation_limit(3)
+            .rng_seed(1337)
+            .build()
+            .unwrap();
+        let seed_corpus = SeedCorpus::try_from([
+            "[CX3](=O)[OX2H1]",
+            "[CX3](=O)[OX2H1]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CX4]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CX4]-[CX4]-[CX4]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CX4]-[CX4]-[CX4]-[CX4]-[CX4]-[CX4]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CH2]-[CH2]-[CH2]-[CH2]",
+            "[CX3](=O)[OX2H1]-[CH2]-[CH2]-[CH2]-[CH2]-[CH2]",
+            "[CX3](=O)[OX2H1]-[CX4,CX3]~[CX3]=[CX3]",
+            "[CX3](=O)[OX2H1].*[CX3]=[CX3]",
+            "[CX3](=O)[OX2H1].*[CX3]=[CX3].*[CX3]=[CX3]",
+            "[CX3](=O)[O-]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CX4;!$(C[a])]",
+            "[CX3](=O)[OX2H1]-[CX4;!$(C[!#6])]",
+        ])
+        .unwrap();
+        let mut session = EvolutionSession::new(&task, &config, &seed_corpus, 8).unwrap();
+
+        for _ in 0..3 {
+            let progress = session.step().unwrap();
+            assert!(!progress.leaders().is_empty());
+        }
     }
 
     #[test]
@@ -2838,6 +2906,25 @@ mod regression_tests {
     }
 
     #[test]
+    fn offspring_builder_handles_empty_parent_pool() {
+        let task = EvolutionTask::new(
+            "empty-offspring",
+            vec![FoldData::new(vec![sample("CN", true), sample("CC", false)])],
+        );
+        let config = EvolutionConfig::builder()
+            .population_size(5)
+            .generation_limit(1)
+            .stagnation_limit(1)
+            .rng_seed(99)
+            .build()
+            .unwrap();
+        let seed_corpus = SeedCorpus::try_from(["[#6]~[#7]", "[#6]", "[#7]"]).unwrap();
+        let mut session = EvolutionSession::new(&task, &config, &seed_corpus, 2).unwrap();
+
+        assert!(session.build_offspring(&[]).is_empty());
+    }
+
+    #[test]
     fn build_reset_pool_prefers_corpus_and_respects_limit() {
         let seed_corpus = SeedCorpus::try_from(["[#6]", "[#7]", "[#8]"]).unwrap();
         let population = vec![
@@ -3029,6 +3116,15 @@ mod regression_tests {
                 .iter()
                 .all(|parent| !parent.phenotype.as_ref().is_empty())
         );
+    }
+
+    #[test]
+    fn tournament_selection_handles_empty_input() {
+        let mut rng = SmallRng::seed_from_u64(11);
+
+        let parents = tournament_select(&[], 16, 3, &mut rng);
+
+        assert!(parents.is_empty());
     }
 
     #[test]
@@ -3257,6 +3353,8 @@ mod regression_tests {
             sample("CC", false),
             sample("CO", false),
         ])]);
+        assert_eq!(select_screened_mutation_candidate(&evaluator, &[]), 0);
+
         let candidates = vec![
             SmartsGenome::from_smarts("[#16]").unwrap(),
             SmartsGenome::from_smarts("[#6]").unwrap(),

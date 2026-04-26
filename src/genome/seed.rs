@@ -413,6 +413,30 @@ mod tests {
     }
 
     #[test]
+    fn fatty_acid_seed_corpus_inserts_without_panicking() {
+        let seeds = [
+            "[CX3](=O)[OX2H1]",
+            "[CX3](=O)[OX2H1]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CX4]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CX4]-[CX4]-[CX4]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CX4]-[CX4]-[CX4]-[CX4]-[CX4]-[CX4]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CH2]-[CH2]-[CH2]-[CH2]",
+            "[CX3](=O)[OX2H1]-[CH2]-[CH2]-[CH2]-[CH2]-[CH2]",
+            "[CX3](=O)[OX2H1]-[CX4,CX3]~[CX3]=[CX3]",
+            "[CX3](=O)[OX2H1].*[CX3]=[CX3]",
+            "[CX3](=O)[OX2H1].*[CX3]=[CX3].*[CX3]=[CX3]",
+            "[CX3](=O)[O-]-[CX4]",
+            "[CX3](=O)[OX2H1]-[CX4;!$(C[a])]",
+            "[CX3](=O)[OX2H1]-[CX4;!$(C[!#6])]",
+        ];
+
+        let corpus = SeedCorpus::try_from(seeds).unwrap();
+
+        assert_eq!(corpus.len(), seeds.len());
+        assert!(corpus.entries().iter().all(SmartsGenome::is_valid));
+    }
+
+    #[test]
     fn builder_can_draw_from_explicit_seed_corpus() {
         let corpus = SeedCorpus::try_from(["[#6]~[#17]", "[#6]~[#35]"]).unwrap();
         let builder = SmartsGenomeBuilder::new(corpus);

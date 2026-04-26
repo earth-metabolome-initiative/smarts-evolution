@@ -11,6 +11,7 @@ use dioxus::prelude::*;
 use icons::{AppIcon, app_icon};
 use plot::MccGenerationImprovementPlot;
 use smiles_parser::Smiles;
+use smarts_evolution::SmartsGenome;
 use smarts_evolution_web_protocol::{
     CompletedRun, EvaluationUpdate, EvolutionConfigInput, ProgressUpdate, RankedCandidate,
     RunRequest, StartupUpdate, WorkerRequest,
@@ -147,6 +148,7 @@ impl Default for RunDraft {
 struct DraftValidation {
     positive_smiles: Option<String>,
     negative_smiles: Option<String>,
+    seed_smarts: Option<String>,
     population_size: Option<String>,
     generation_limit: Option<String>,
     mutation_rate: Option<String>,
@@ -162,6 +164,7 @@ impl DraftValidation {
     fn has_errors(&self) -> bool {
         self.positive_smiles.is_some()
             || self.negative_smiles.is_some()
+            || self.seed_smarts.is_some()
             || self.population_size.is_some()
             || self.generation_limit.is_some()
             || self.mutation_rate.is_some()
@@ -177,6 +180,7 @@ impl DraftValidation {
         self.positive_smiles
             .as_deref()
             .or(self.negative_smiles.as_deref())
+            .or(self.seed_smarts.as_deref())
             .or(self.population_size.as_deref())
             .or(self.generation_limit.as_deref())
             .or(self.mutation_rate.as_deref())
@@ -624,6 +628,10 @@ fn App() -> Element {
         .as_ref()
         .map(|draft_value| smiles_entry_count(&draft_value.negative_smiles))
         .unwrap_or(0);
+    let seed_smarts_count = draft_value
+        .as_ref()
+        .map(|draft_value| seed_smarts_entry_count(&draft_value.seed_smarts))
+        .unwrap_or(0);
     let draft_value = draft_value.unwrap_or_default();
     let has_run_started = run_view_value.startup.is_some()
         || run_view_value.evaluation.is_some()
@@ -776,15 +784,17 @@ fn App() -> Element {
                                     }
                                 }
 
-                                div { class: "field",
+                                div { class: if validation.seed_smarts.is_some() { "field field-invalid" } else { "field" },
                                     label { r#for: "seed-smarts",
                                         span { class: "field-label-row",
                                             {app_icon(AppIcon::Seedling)}
                                             span { "Seed SMARTS" }
+                                            span { class: "field-count", "{smarts_count_label(seed_smarts_count)}" }
                                         }
                                     }
                                     textarea {
                                         id: "seed-smarts",
+                                        class: if validation.seed_smarts.is_some() { "input-invalid" } else { "" },
                                         disabled: is_running,
                                         value: draft_value.seed_smarts.clone(),
                                         oninput: move |event| {
@@ -793,6 +803,9 @@ fn App() -> Element {
                                     }
                                     p { class: "field-note",
                                         "Starting motifs. If empty, a default corpus will be used."
+                                    }
+                                    if let Some(error) = validation.seed_smarts.as_ref() {
+                                        p { class: "field-error", "{error}" }
                                     }
                                 }
                             }
@@ -1183,6 +1196,7 @@ fn validate_draft(draft: &RunDraft) -> DraftValidation {
     let mut validation = DraftValidation {
         positive_smiles: validate_smiles_lines("positive SMILES", &draft.positive_smiles),
         negative_smiles: validate_smiles_lines("negative SMILES", &draft.negative_smiles),
+        seed_smarts: validate_seed_smarts_lines(&draft.seed_smarts),
         ..DraftValidation::default()
     };
 
@@ -1335,13 +1349,54 @@ fn compact_smiles_lines(label: &str, value: &str) -> Result<String, String> {
     }
 }
 
+fn validate_seed_smarts_lines(value: &str) -> Option<String> {
+    for (line_idx, line) in value.lines().enumerate() {
+        let smarts = line.trim();
+        if smarts.is_empty() || smarts.starts_with('#') {
+            continue;
+        }
+
+        match SmartsGenome::from_smarts(smarts) {
+            Ok(genome) if genome.is_valid() => {}
+            Ok(_) => {
+                return Some(format!(
+                    "Seed SMARTS has invalid SMARTS at line {}: SMARTS exceeds structural limits.",
+                    line_idx + 1
+                ));
+            }
+            Err(error) => {
+                return Some(format!(
+                    "Seed SMARTS has invalid SMARTS at line {}: {error}",
+                    line_idx + 1
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 fn smiles_entry_count(value: &str) -> usize {
     value.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+fn seed_smarts_entry_count(value: &str) -> usize {
+    value
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .count()
 }
 
 fn smiles_count_label(count: usize) -> String {
     let suffix = if count == 1 { "entry" } else { "entries" };
     format!("{count} {suffix}")
+}
+
+fn smarts_count_label(count: usize) -> String {
+    format!("{count} SMARTS")
 }
 
 struct ParsedValue<T> {
@@ -1429,7 +1484,8 @@ fn parse_f64(label: &str, value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         DraftValidation, EXAMPLE_PRESETS, build_run_request, compact_smiles_lines,
-        smiles_count_label, smiles_entry_count, validate_smiles_lines,
+        seed_smarts_entry_count, smiles_count_label, smiles_entry_count, smarts_count_label,
+        validate_seed_smarts_lines, validate_smiles_lines,
     };
 
     #[test]
@@ -1476,6 +1532,29 @@ mod tests {
     }
 
     #[test]
+    fn invalid_seed_smarts_line_is_reported_before_start() {
+        let error = validate_seed_smarts_lines("[#6]\nnot smarts\n[#7]");
+        assert!(error.is_some());
+        assert!(
+            error
+                .unwrap()
+                .starts_with("Seed SMARTS has invalid SMARTS at line 2:")
+        );
+
+        let draft = super::RunDraft {
+            positive_smiles: "CCO".to_string(),
+            negative_smiles: "CCN".to_string(),
+            seed_smarts: "[#6]\nnot smarts".to_string(),
+            ..super::RunDraft::default()
+        };
+        assert!(
+            build_run_request(7, &draft)
+                .unwrap_err()
+                .starts_with("Seed SMARTS has invalid SMARTS at line 2:")
+        );
+    }
+
+    #[test]
     fn compact_smiles_lines_trims_and_compacts_input() {
         let normalized = compact_smiles_lines("positive SMILES", " CCO \n\n N \n").unwrap();
         assert_eq!(normalized, "CCO\nN");
@@ -1499,6 +1578,14 @@ mod tests {
         assert_eq!(smiles_entry_count("CCO\n\nN\n"), 2);
         assert_eq!(smiles_count_label(1), "1 entry");
         assert_eq!(smiles_count_label(2), "2 entries");
+    }
+
+    #[test]
+    fn seed_smarts_counts_ignore_blank_lines_and_comments() {
+        assert_eq!(seed_smarts_entry_count("[#6]\n\n# comment\n[#7]\n"), 2);
+        assert_eq!(smarts_count_label(0), "0 SMARTS");
+        assert_eq!(smarts_count_label(1), "1 SMARTS");
+        assert_eq!(smarts_count_label(2), "2 SMARTS");
     }
 }
 
