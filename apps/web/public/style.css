@@ -415,9 +415,14 @@ textarea {
   background: rgba(19, 38, 48, 0.08);
 }
 
-.progress-fill {
+.progress-fill,
+.progress-fill-secondary,
+.progress-fill-muted {
   height: 100%;
   border-radius: inherit;
+}
+
+.progress-fill {
   background: var(--accent);
 }
 
