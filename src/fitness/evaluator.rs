@@ -262,6 +262,13 @@ impl<'a> EvaluationMatchLimit<'a> {
             }
         }
     }
+
+    fn ensure_not_exceeded(self) -> Result<(), EvaluationFailure> {
+        match self {
+            Self::None => Ok(()),
+            Self::Configured { .. } => self.remaining().map(|_| ()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,6 +476,7 @@ impl SmartsEvaluator {
         let compiled =
             CompiledQuery::new(query.clone()).map_err(|_| EvaluationFailure::InvalidQuery)?;
         let screen = QueryScreen::new(compiled.query());
+        limit.ensure_not_exceeded()?;
         self.fold_counts_and_behavior_for_compiled(&compiled, &screen, limit)
     }
 
@@ -486,6 +494,7 @@ impl SmartsEvaluator {
         let mut fold_counts = Vec::with_capacity(self.folds.len());
         let mut positive_coverage_sum = 0.0;
         for fold in &self.folds {
+            limit.ensure_not_exceeded()?;
             let summary = count_matches_in_fold(
                 compiled,
                 screen,
@@ -950,8 +959,10 @@ fn count_matches_in_fold(
 
     let mut candidates = Vec::new();
     let mut corpus_scratch = TargetCorpusScratch::new();
+    limit.ensure_not_exceeded()?;
     fold.index()
         .candidate_ids_with_scratch_into(screen, &mut corpus_scratch, &mut candidates);
+    limit.ensure_not_exceeded()?;
 
     let mut match_scratch = MatchScratch::new();
     let mut true_positives = 0u64;
@@ -1169,6 +1180,15 @@ mod tests {
 
         assert_eq!(
             match_outcome_with_limit(&query, &target, &mut scratch, limit),
+            Err(EvaluationFailure::LimitExceeded)
+        );
+
+        let fold = FoldData::new(vec![sample("OO", true)]);
+        let screen = QueryScreen::new(query.query());
+        let mut behavior = vec![0u64; 1];
+        let mut bit_index = 0usize;
+        assert_eq!(
+            count_matches_in_fold(&query, &screen, &fold, &mut behavior, &mut bit_index, limit),
             Err(EvaluationFailure::LimitExceeded)
         );
     }

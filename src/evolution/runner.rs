@@ -2,6 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt;
@@ -11,7 +12,7 @@ use log::{debug, info, warn};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
-use smarts_rs::{BondLabel, CompiledQuery, PreparedTarget, QueryMol};
+use smarts_rs::{BondLabel, PreparedTarget};
 
 use super::config::EvolutionConfig;
 use crate::fitness::evaluator::{
@@ -1865,13 +1866,90 @@ fn dataset_seed_feature_score(
 }
 
 fn dataset_seed_feature_coverage(feature: DatasetSeedFeature, target: &PreparedTarget) -> f64 {
-    let Ok(query) = feature.smarts().parse::<QueryMol>() else {
+    let denominator = target.atom_count() + target.bond_count();
+    if denominator == 0 {
         return 0.0;
+    }
+
+    let numerator = match feature {
+        DatasetSeedFeature::Atom(atomic_number) => (0..target.atom_count())
+            .filter(|&atom_id| target_atomic_number(target, atom_id) == Some(atomic_number))
+            .count(),
+        DatasetSeedFeature::RingAtom(atomic_number) => (0..target.atom_count())
+            .filter(|&atom_id| {
+                target_atomic_number(target, atom_id) == Some(atomic_number)
+                    && target.is_ring_atom(atom_id)
+            })
+            .count(),
+        DatasetSeedFeature::TotalHydrogen {
+            atomic_number,
+            hydrogens,
+        } => (0..target.atom_count())
+            .filter(|&atom_id| {
+                target_atomic_number(target, atom_id) == Some(atomic_number)
+                    && target.total_hydrogen_count(atom_id) == Some(hydrogens)
+            })
+            .count(),
+        DatasetSeedFeature::Bond {
+            left_atomic_number,
+            bond,
+            right_atomic_number,
+        } => dataset_seed_bond_feature_coverage_numerator(
+            target,
+            left_atomic_number,
+            bond,
+            right_atomic_number,
+        ),
     };
-    let Ok(compiled) = CompiledQuery::new(query) else {
-        return 0.0;
-    };
-    compiled.match_outcome(target).coverage
+
+    numerator as f64 / denominator as f64
+}
+
+fn dataset_seed_bond_feature_coverage_numerator(
+    target: &PreparedTarget,
+    feature_left_atomic_number: u16,
+    feature_bond: DatasetSeedBond,
+    feature_right_atomic_number: u16,
+) -> usize {
+    let mut covered_atoms = vec![false; target.atom_count()];
+    let mut covered_bonds = 0usize;
+
+    for atom_id in 0..target.atom_count() {
+        for (left, right, _, _) in target.target().edges_for_node(atom_id) {
+            let other_atom_id = if left == atom_id { right } else { left };
+            if other_atom_id < atom_id {
+                continue;
+            }
+            let Some(left_atomic_number) = target_atomic_number(target, atom_id) else {
+                continue;
+            };
+            let Some(right_atomic_number) = target_atomic_number(target, other_atom_id) else {
+                continue;
+            };
+            let (left_atomic_number, right_atomic_number) =
+                ordered_pair(left_atomic_number, right_atomic_number);
+            if (left_atomic_number, right_atomic_number)
+                != (feature_left_atomic_number, feature_right_atomic_number)
+            {
+                continue;
+            }
+
+            let Some(label) = target.bond(atom_id, other_atom_id) else {
+                continue;
+            };
+            if feature_bond != DatasetSeedBond::Any
+                && DatasetSeedBond::from_label(label) != feature_bond
+            {
+                continue;
+            }
+
+            covered_atoms[atom_id] = true;
+            covered_atoms[other_atom_id] = true;
+            covered_bonds += 1;
+        }
+    }
+
+    covered_atoms.into_iter().filter(|covered| *covered).count() + covered_bonds
 }
 
 fn compare_dataset_seed_features(
@@ -2667,6 +2745,32 @@ mod regression_tests {
 
         let top = dataset_seed_corpus(&folds, 1);
         assert_eq!(top.entries()[0].smarts(), "[#6]-[#7]");
+    }
+
+    #[test]
+    fn dataset_seed_feature_coverage_matches_matcher_for_supported_features() {
+        let targets = [
+            target("CN"),
+            target("CCN"),
+            target("CC(=O)N"),
+            target("c1ccccc1"),
+        ];
+
+        for target in &targets {
+            for feature in target_dataset_seed_features(target) {
+                let query = feature.smarts().parse::<smarts_rs::QueryMol>().unwrap();
+                let compiled = smarts_rs::CompiledQuery::new(query).unwrap();
+                let expected = compiled.match_outcome(target).coverage;
+                let actual = dataset_seed_feature_coverage(feature, target);
+
+                assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "feature {:?} on target {} produced {actual}, expected {expected}",
+                    feature,
+                    target.target()
+                );
+            }
+        }
     }
 
     #[test]
