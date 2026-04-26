@@ -244,6 +244,10 @@ mod tests {
             "C[C@H](F)O",
             "F/C=C/F",
             "([#8].[#8])",
+            // smarts-rs normalizes double negation before the GA stores genomes.
+            "[!!#6]",
+            "[#6&!!X3]",
+            "[#6]!!#[#7]",
         ] {
             let query = QueryMol::from_str(smarts).unwrap();
 
@@ -270,9 +274,6 @@ mod tests {
             "[$([#6]-[#8].[#7])]",
             "[$(([#6].[#8]))]",
             "[!*]",
-            "[!!#6]",
-            "[#6&!!X3]",
-            "[#6]!!#[#7]",
             "[v]",
             "[!v]",
             "[v,D]",

@@ -148,6 +148,24 @@ mod tests {
     }
 
     #[test]
+    fn genome_handles_ga_reported_recursive_canonicalization_regression() {
+        let source = concat!(
+            "*~[!R&v11:62086](/[!!h4&#51&-3&@SP3&X,X10,a&^3&v5]",
+            "~[!$([Fe]~[#8])&R:1432](*=[@SP1:39279]:[!#6&$(*)&H0])",
+            "/[#6:42118]~[#6&@TH2&z{-16}:55558])=[#6:55558]",
+            "~[#6&$(*):55558].*([!$([#8])&R:1432]~[@]",
+            "[R{-16}&h&z{-12}:24468])=[@SP1:39279]~[!R&z]=[@]",
+        );
+        let genome = SmartsGenome::from_smarts(source).unwrap();
+        let reparsed = SmartsGenome::from_smarts(genome.smarts()).unwrap();
+
+        assert!(genome.is_valid());
+        assert!(genome.query().is_canonical());
+        assert!(!genome.smarts().contains("!!"));
+        assert_eq!(genome, reparsed);
+    }
+
+    #[test]
     fn genome_uses_upstream_canonicalization_for_boolean_simplifications() {
         for (source, expected) in [
             ("[#6&#6]", "[#6]"),
