@@ -22,6 +22,13 @@ use smiles_parser::atom::bracketed::chirality::Chirality;
 use smiles_parser::bond::Bond;
 
 use crate::genome::SmartsGenome;
+#[cfg(test)]
+use crate::genome::compatibility::pubchem_bond_expr_is_compatible;
+use crate::genome::compatibility::{
+    PUBCHEM_MAX_ATOM_MAP, PUBCHEM_MAX_ISOTOPE_MASS_NUMBER, SmartsCompatibilityMode,
+    bracket_tree_contains_wildcard_primitive, pubchem_element_symbol_is_compatible,
+    pubchem_recursive_query_is_compatible,
+};
 use crate::genome::limits::{MAX_PRIMITIVES_PER_BRACKET, MAX_SMARTS_LEN};
 
 const ALL_ELEMENT_SYMBOLS: &[&str] = &[
@@ -78,6 +85,17 @@ const RECURSIVE_FRAGMENT_SMARTS: &[&str] = &[
     "[!#1]",
     "[#6]1~[#6]~[#6]1",
     "[#6]-[#8].[#7]",
+];
+const PUBCHEM_RECURSIVE_FRAGMENT_SMARTS: &[&str] = &[
+    "[#6]",
+    "[#7]",
+    "[#8]",
+    "[#6]=[#8]",
+    "[#6]~[#7]",
+    "[#6]~[#8]",
+    "[#6,#7]",
+    "[!#1]",
+    "[#6]1~[#6]~[#6]1",
 ];
 
 const MUTATION_LOG_TARGET: &str = "smarts_evolution::operators::mutation";
@@ -215,24 +233,34 @@ impl MutationOperator {
         rng: &mut R,
         recursive_depth: usize,
         direction: MutationDirection,
+        compatibility: SmartsCompatibilityMode,
     ) -> bool {
         match self {
-            Self::AtomConstraints => mutate_atom_constraints(editable, rng, recursive_depth),
+            Self::AtomConstraints => {
+                mutate_atom_constraints(editable, rng, recursive_depth, compatibility)
+            }
             Self::AtomRefinement => {
-                generalize_specialize_atom(editable, rng, recursive_depth, direction)
+                generalize_specialize_atom(editable, rng, recursive_depth, direction, compatibility)
             }
-            Self::AtomMap => mutate_atom_map(editable, rng),
-            Self::RecursiveQuery => {
-                mutate_recursive_query(editable, reset_pool, rng, recursive_depth, direction)
-            }
-            Self::AttachLeafAtom => attach_leaf_atom(editable, rng),
-            Self::InsertAtomOnBond => insert_atom_on_bond(editable, rng),
+            Self::AtomMap => mutate_atom_map(editable, rng, compatibility),
+            Self::RecursiveQuery => mutate_recursive_query(
+                editable,
+                reset_pool,
+                rng,
+                recursive_depth,
+                direction,
+                compatibility,
+            ),
+            Self::AttachLeafAtom => attach_leaf_atom(editable, rng, compatibility),
+            Self::InsertAtomOnBond => insert_atom_on_bond(editable, rng, compatibility),
             Self::RemoveLeafAtom => remove_leaf_atom(editable, rng),
-            Self::BondConstraints => mutate_bond_constraints(editable, rng),
-            Self::RingEdit => ring_edit(editable, rng),
-            Self::ComponentEdit => component_edit(editable, rng, recursive_depth),
-            Self::ToggleAtomNot => toggle_atom_not(editable, rng),
-            Self::GraftSeedFragment => graft_seed_fragment(editable, reset_pool, rng),
+            Self::BondConstraints => mutate_bond_constraints(editable, rng, compatibility),
+            Self::RingEdit => ring_edit(editable, rng, compatibility),
+            Self::ComponentEdit => component_edit(editable, rng, recursive_depth, compatibility),
+            Self::ToggleAtomNot => toggle_atom_not(editable, rng, compatibility),
+            Self::GraftSeedFragment => {
+                graft_seed_fragment(editable, reset_pool, rng, compatibility)
+            }
         }
     }
 }
@@ -326,6 +354,7 @@ pub struct SmartsMutation {
     reset_probability: f64,
     max_mutation_steps: usize,
     attempt_budget: usize,
+    smarts_compatibility: SmartsCompatibilityMode,
 }
 
 impl SmartsMutation {
@@ -340,7 +369,23 @@ impl SmartsMutation {
             reset_probability: DEFAULT_RESET_PROBABILITY,
             max_mutation_steps: DEFAULT_MAX_MUTATION_STEPS,
             attempt_budget: DEFAULT_ATTEMPT_BUDGET,
+            smarts_compatibility: SmartsCompatibilityMode::Full,
         }
+    }
+
+    #[must_use]
+    pub fn with_smarts_compatibility(mut self, mode: SmartsCompatibilityMode) -> Self {
+        self.smarts_compatibility = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_pubchem_compatible_smarts(self, enabled: bool) -> Self {
+        self.with_smarts_compatibility(if enabled {
+            SmartsCompatibilityMode::PubChem
+        } else {
+            SmartsCompatibilityMode::Full
+        })
     }
 
     pub fn mutate<R>(&self, genome: SmartsGenome, rng: &mut R) -> SmartsGenome
@@ -502,8 +547,14 @@ impl SmartsMutation {
             let mut mutated = false;
 
             for _ in 0..mutation_steps {
-                let edit =
-                    apply_random_mutation(&mut editable, &self.reset_pool, rng, 0, direction);
+                let edit = apply_random_mutation(
+                    &mut editable,
+                    &self.reset_pool,
+                    rng,
+                    0,
+                    direction,
+                    self.smarts_compatibility,
+                );
                 stats.record_edit(edit);
                 mutated |= edit.changed;
             }
@@ -516,7 +567,7 @@ impl SmartsMutation {
                 stats.query_errors += 1;
                 continue;
             };
-            let Some(candidate) = genome_from_query(&query) else {
+            let Some(candidate) = genome_from_query(&query, self.smarts_compatibility) else {
                 stats.rejected_genomes += 1;
                 continue;
             };
@@ -556,9 +607,15 @@ fn sample_mutation_steps<R: Rng>(max_mutation_steps: usize, rng: &mut R) -> usiz
     }
 }
 
-fn genome_from_query(query: &QueryMol) -> Option<SmartsGenome> {
+fn genome_from_query(
+    query: &QueryMol,
+    compatibility: SmartsCompatibilityMode,
+) -> Option<SmartsGenome> {
     let genome = SmartsGenome::from_query_mol(query);
-    (genome.smarts_len() <= MAX_SMARTS_LEN && genome.is_valid()).then_some(genome)
+    (genome.smarts_len() <= MAX_SMARTS_LEN
+        && genome.is_valid()
+        && compatibility.allows_query(genome.query()))
+    .then_some(genome)
 }
 
 fn apply_random_mutation<R: Rng>(
@@ -567,6 +624,7 @@ fn apply_random_mutation<R: Rng>(
     rng: &mut R,
     recursive_depth: usize,
     direction: MutationDirection,
+    compatibility: SmartsCompatibilityMode,
 ) -> MutationEdit {
     let operator = sample_mutation_operator(
         editable.as_query_mol(),
@@ -575,7 +633,14 @@ fn apply_random_mutation<R: Rng>(
         recursive_depth,
         direction,
     );
-    let changed = operator.apply(editable, reset_pool, rng, recursive_depth, direction);
+    let changed = operator.apply(
+        editable,
+        reset_pool,
+        rng,
+        recursive_depth,
+        direction,
+        compatibility,
+    );
 
     MutationEdit { operator, changed }
 }
@@ -738,6 +803,7 @@ fn mutate_atom_constraints<R: Rng>(
     editable: &mut EditableQueryMol,
     rng: &mut R,
     recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
 ) -> bool {
     let (atom_id, atom_expr) = random_atom(editable, rng);
 
@@ -745,10 +811,11 @@ fn mutate_atom_constraints<R: Rng>(
         AtomExpr::Bracket(mut expr) => {
             let primitive_paths = bracket_primitive_paths(&expr);
             let mutated = match rng.random_range(0..5) {
-                0 if primitive_paths.len() < MAX_PRIMITIVES_PER_BRACKET => {
-                    add_atom_primitive(&mut expr, random_atom_primitive(rng, recursive_depth))
-                        .is_ok()
-                }
+                0 if primitive_paths.len() < MAX_PRIMITIVES_PER_BRACKET => add_atom_primitive(
+                    &mut expr,
+                    random_atom_primitive(rng, recursive_depth, compatibility),
+                )
+                .is_ok(),
                 1 if !primitive_paths.is_empty() => {
                     let Some(path) = primitive_paths.choose(rng) else {
                         return false;
@@ -756,7 +823,7 @@ fn mutate_atom_constraints<R: Rng>(
                     replace_atom_primitive(
                         &mut expr,
                         path,
-                        random_atom_primitive(rng, recursive_depth),
+                        random_atom_primitive(rng, recursive_depth, compatibility),
                     )
                     .is_ok()
                 }
@@ -766,9 +833,9 @@ fn mutate_atom_constraints<R: Rng>(
                     };
                     remove_atom_primitive(&mut expr, path).is_ok()
                 }
-                3 => mutate_bracket_tree_shape(&mut expr, rng, recursive_depth),
+                3 => mutate_bracket_tree_shape(&mut expr, rng, recursive_depth, compatibility),
                 _ => {
-                    expr = random_bracket_expr(rng, recursive_depth);
+                    expr = random_bracket_expr(rng, recursive_depth, compatibility);
                     true
                 }
             };
@@ -779,7 +846,7 @@ fn mutate_atom_constraints<R: Rng>(
                     .is_ok()
         }
         other => editable
-            .replace_atom_expr(atom_id, local_atom_expr_mutation(other, rng))
+            .replace_atom_expr(atom_id, local_atom_expr_mutation(other, rng, compatibility))
             .is_ok(),
     }
 }
@@ -789,12 +856,16 @@ fn generalize_specialize_atom<R: Rng>(
     rng: &mut R,
     recursive_depth: usize,
     direction: MutationDirection,
+    compatibility: SmartsCompatibilityMode,
 ) -> bool {
     let (atom_id, atom_expr) = random_atom(editable, rng);
 
     let AtomExpr::Bracket(mut expr) = atom_expr else {
         return editable
-            .replace_atom_expr(atom_id, local_atom_expr_mutation(atom_expr, rng))
+            .replace_atom_expr(
+                atom_id,
+                local_atom_expr_mutation(atom_expr, rng, compatibility),
+            )
             .is_ok();
     };
     let primitive_paths = bracket_primitive_paths(&expr);
@@ -810,9 +881,9 @@ fn generalize_specialize_atom<R: Rng>(
         MutationDirection::Specialize => rng.random_bool(0.20),
     };
     let replacement = if should_generalize {
-        generalize_atom_primitive(current, rng, recursive_depth)
+        generalize_atom_primitive(current, rng, recursive_depth, compatibility)
     } else {
-        specialize_atom_primitive(current, rng, recursive_depth)
+        specialize_atom_primitive(current, rng, recursive_depth, compatibility)
     };
 
     replace_atom_primitive(&mut expr, path, replacement).is_ok()
@@ -821,7 +892,11 @@ fn generalize_specialize_atom<R: Rng>(
             .is_ok()
 }
 
-fn mutate_atom_map<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+fn mutate_atom_map<R: Rng>(
+    editable: &mut EditableQueryMol,
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> bool {
     let Some((atom_id, mut expr)) = random_mapped_bracket_atom(editable, rng) else {
         return false;
     };
@@ -829,7 +904,7 @@ fn mutate_atom_map<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool
     expr.atom_map = if rng.random_bool(REMOVE_ATOM_MAP_PROBABILITY) {
         None
     } else {
-        Some(rng.random_range(1..=MAX_ATOM_MAP))
+        Some(random_atom_map(rng, compatibility))
     };
 
     editable
@@ -843,6 +918,7 @@ fn mutate_recursive_query<R: Rng>(
     rng: &mut R,
     recursive_depth: usize,
     direction: MutationDirection,
+    compatibility: SmartsCompatibilityMode,
 ) -> bool {
     if recursive_depth >= MAX_RECURSIVE_QUERY_DEPTH {
         return false;
@@ -851,7 +927,7 @@ fn mutate_recursive_query<R: Rng>(
     let sites = recursive_sites(editable.as_query_mol());
     if sites.is_empty() {
         let (atom_id, atom_expr) = random_atom(editable, rng);
-        let recursive = random_recursive_query(rng, recursive_depth + 1);
+        let recursive = random_recursive_query(rng, recursive_depth + 1, compatibility);
         let expr = match atom_expr {
             AtomExpr::Bracket(mut expr) => {
                 if add_atom_primitive(
@@ -902,8 +978,8 @@ fn mutate_recursive_query<R: Rng>(
     };
 
     let mutated_inner = if rng.random_bool(0.30) {
-        let candidate = random_recursive_query(rng, recursive_depth + 1);
-        if genome_from_query(&candidate).is_some() {
+        let candidate = random_recursive_query(rng, recursive_depth + 1, compatibility);
+        if recursive_query_is_valid_for_context(&candidate, compatibility) {
             **inner = candidate;
             true
         } else {
@@ -911,15 +987,22 @@ fn mutate_recursive_query<R: Rng>(
         }
     } else {
         let mut nested = inner.edit();
-        if !apply_random_mutation(&mut nested, reset_pool, rng, recursive_depth + 1, direction)
-            .changed
+        if !apply_random_mutation(
+            &mut nested,
+            reset_pool,
+            rng,
+            recursive_depth + 1,
+            direction,
+            compatibility,
+        )
+        .changed
         {
             false
         } else {
             let Ok(query) = nested.into_query_mol() else {
                 return false;
             };
-            if genome_from_query(&query).is_none() {
+            if !recursive_query_is_valid_for_context(&query, compatibility) {
                 return false;
             }
             **inner = query;
@@ -930,15 +1013,27 @@ fn mutate_recursive_query<R: Rng>(
     mutated_inner && editable.replace_atom_expr(atom_id, atom_expr).is_ok()
 }
 
-fn attach_leaf_atom<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+fn attach_leaf_atom<R: Rng>(
+    editable: &mut EditableQueryMol,
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> bool {
     let parent = random_atom_id(editable, rng);
 
     editable
-        .attach_leaf(parent, random_bond_expr(rng), random_atom_expr(rng, 0))
+        .attach_leaf(
+            parent,
+            random_bond_expr(rng, compatibility),
+            random_atom_expr(rng, 0, compatibility),
+        )
         .is_ok()
 }
 
-fn insert_atom_on_bond<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+fn insert_atom_on_bond<R: Rng>(
+    editable: &mut EditableQueryMol,
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> bool {
     let Some(bond_id) = random_bond_id(editable, rng) else {
         return false;
     };
@@ -946,9 +1041,9 @@ fn insert_atom_on_bond<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> 
     editable
         .insert_atom_on_bond(
             bond_id,
-            random_bond_expr(rng),
-            random_atom_expr(rng, 0),
-            random_bond_expr(rng),
+            random_bond_expr(rng, compatibility),
+            random_atom_expr(rng, 0, compatibility),
+            random_bond_expr(rng, compatibility),
         )
         .is_ok()
 }
@@ -965,7 +1060,11 @@ fn remove_leaf_atom<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> boo
     editable.remove_leaf_atom(leaf).is_ok()
 }
 
-fn mutate_bond_constraints<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+fn mutate_bond_constraints<R: Rng>(
+    editable: &mut EditableQueryMol,
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> bool {
     let Some(bond_id) = random_bond_id(editable, rng) else {
         return false;
     };
@@ -976,19 +1075,24 @@ fn mutate_bond_constraints<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R)
     let current = bond.expr.clone();
     match current {
         BondExpr::Elided => editable
-            .replace_bond_expr(bond_id, random_bond_expr(rng))
+            .replace_bond_expr(bond_id, random_bond_expr(rng, compatibility))
             .is_ok(),
         BondExpr::Query(mut tree) => {
             let primitive_paths = bond_primitive_paths(&tree);
             let mutated = match rng.random_range(0..5) {
                 0 if primitive_paths.len() < MAX_PRIMITIVES_PER_BRACKET => {
-                    add_bond_primitive(&mut tree, random_bond_primitive(rng)).is_ok()
+                    add_bond_primitive(&mut tree, random_bond_primitive(rng, compatibility)).is_ok()
                 }
                 1 if !primitive_paths.is_empty() => {
                     let Some(path) = primitive_paths.choose(rng) else {
                         return false;
                     };
-                    replace_bond_primitive(&mut tree, path, random_bond_primitive(rng)).is_ok()
+                    replace_bond_primitive(
+                        &mut tree,
+                        path,
+                        random_bond_primitive(rng, compatibility),
+                    )
+                    .is_ok()
                 }
                 2 if primitive_paths.len() > 1 => {
                     let Some(path) = primitive_paths.choose(rng) else {
@@ -996,9 +1100,9 @@ fn mutate_bond_constraints<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R)
                     };
                     remove_bond_primitive(&mut tree, path).is_ok()
                 }
-                3 => mutate_bond_tree_shape(&mut tree, rng),
+                3 => mutate_bond_tree_shape(&mut tree, rng, compatibility),
                 _ => {
-                    tree = random_bond_tree(rng, 0);
+                    tree = random_bond_tree(rng, 0, compatibility);
                     true
                 }
             };
@@ -1012,13 +1116,23 @@ fn mutate_bond_constraints<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R)
     }
 }
 
-fn toggle_atom_not<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+fn toggle_atom_not<R: Rng>(
+    editable: &mut EditableQueryMol,
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> bool {
     let Some((atom_id, mut expr)) = random_bracket_atom(editable, rng) else {
         return false;
     };
 
     expr.tree = match expr.tree {
         BracketExprTree::Not(inner) => *inner,
+        tree if compatibility.pubchem_compatible()
+            && (bracket_tree_contains_not(&tree)
+                || bracket_tree_contains_wildcard_primitive(&tree)) =>
+        {
+            return false;
+        }
         tree => BracketExprTree::Not(Box::new(tree)),
     };
     expr.normalize().is_ok()
@@ -1027,7 +1141,11 @@ fn toggle_atom_not<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool
             .is_ok()
 }
 
-fn ring_edit<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
+fn ring_edit<R: Rng>(
+    editable: &mut EditableQueryMol,
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> bool {
     let snapshot = editable.as_query_mol().clone();
     let ring_bonds = snapshot.ring_bonds();
     if !ring_bonds.is_empty() && rng.random_bool(0.5) {
@@ -1052,7 +1170,7 @@ fn ring_edit<R: Rng>(editable: &mut EditableQueryMol, rng: &mut R) -> bool {
         let right = atoms[right_idx];
         if snapshot.bond_between(left, right).is_none() {
             return editable
-                .close_ring(left, right, random_bond_expr(rng))
+                .close_ring(left, right, random_bond_expr(rng, compatibility))
                 .is_ok();
         }
     }
@@ -1064,20 +1182,23 @@ fn component_edit<R: Rng>(
     editable: &mut EditableQueryMol,
     rng: &mut R,
     recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
 ) -> bool {
     let snapshot = editable.as_query_mol().clone();
 
     if snapshot.component_count() < MAX_COMPONENTS && rng.random_bool(0.55) {
         let new_component = snapshot.component_count();
-        let Ok(root) = editable.add_atom(new_component, random_atom_expr(rng, recursive_depth))
-        else {
+        let Ok(root) = editable.add_atom(
+            new_component,
+            random_atom_expr(rng, recursive_depth, compatibility),
+        ) else {
             return false;
         };
         if rng.random_bool(0.5) {
             let _ = editable.attach_leaf(
                 root,
-                random_bond_expr(rng),
-                random_atom_expr(rng, recursive_depth),
+                random_bond_expr(rng, compatibility),
+                random_atom_expr(rng, recursive_depth, compatibility),
             );
         }
         return true;
@@ -1154,6 +1275,7 @@ fn graft_seed_fragment<R: Rng>(
     editable: &mut EditableQueryMol,
     reset_pool: &[SmartsGenome],
     rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
 ) -> bool {
     if reset_pool.is_empty() {
         return false;
@@ -1172,7 +1294,7 @@ fn graft_seed_fragment<R: Rng>(
     editable
         .graft_subgraph(
             parent,
-            random_bond_expr(rng),
+            random_bond_expr(rng, compatibility),
             fragment_genome.query(),
             fragment_root,
         )
@@ -1235,58 +1357,84 @@ fn mutate_bracket_tree_shape<R: Rng>(
     expr: &mut BracketExpr,
     rng: &mut R,
     recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
 ) -> bool {
-    expr.tree = match rng.random_range(0..4) {
+    let choice = if compatibility.pubchem_compatible()
+        && (bracket_tree_contains_not(&expr.tree)
+            || bracket_tree_contains_wildcard_primitive(&expr.tree))
+    {
+        rng.random_range(1..4)
+    } else {
+        rng.random_range(0..4)
+    };
+    expr.tree = match choice {
         0 => BracketExprTree::Not(Box::new(expr.tree.clone())),
         1 => BracketExprTree::HighAnd(vec![
             expr.tree.clone(),
-            BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth)),
+            BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth, compatibility)),
         ]),
         2 => BracketExprTree::Or(vec![
             expr.tree.clone(),
-            BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth)),
+            BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth, compatibility)),
         ]),
         _ => BracketExprTree::LowAnd(vec![
             expr.tree.clone(),
-            BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth)),
+            BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth, compatibility)),
         ]),
     };
     expr.normalize().is_ok()
 }
 
-fn mutate_bond_tree_shape<R: Rng>(tree: &mut BondExprTree, rng: &mut R) -> bool {
-    *tree = match rng.random_range(0..4) {
+fn mutate_bond_tree_shape<R: Rng>(
+    tree: &mut BondExprTree,
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> bool {
+    let choice = if compatibility.pubchem_compatible() && bond_tree_contains_not(tree) {
+        rng.random_range(1..4)
+    } else {
+        rng.random_range(0..4)
+    };
+    *tree = match choice {
         0 => BondExprTree::Not(Box::new(tree.clone())),
         1 => BondExprTree::HighAnd(vec![
             tree.clone(),
-            BondExprTree::Primitive(random_bond_primitive(rng)),
+            BondExprTree::Primitive(random_bond_primitive(rng, compatibility)),
         ]),
         2 => BondExprTree::Or(vec![
             tree.clone(),
-            BondExprTree::Primitive(random_bond_primitive(rng)),
+            BondExprTree::Primitive(random_bond_primitive(rng, compatibility)),
         ]),
         _ => BondExprTree::LowAnd(vec![
             tree.clone(),
-            BondExprTree::Primitive(random_bond_primitive(rng)),
+            BondExprTree::Primitive(random_bond_primitive(rng, compatibility)),
         ]),
     };
     normalize_bond_tree(tree).is_ok()
 }
 
-fn random_atom_expr<R: Rng>(rng: &mut R, recursive_depth: usize) -> AtomExpr {
+fn random_atom_expr<R: Rng>(
+    rng: &mut R,
+    recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
+) -> AtomExpr {
     match rng.random_range(0..4) {
         0 => AtomExpr::Wildcard,
-        1 => random_bare_atom_expr(rng),
-        _ => AtomExpr::Bracket(random_bracket_expr(rng, recursive_depth)),
+        1 => random_bare_atom_expr(rng, compatibility),
+        _ => AtomExpr::Bracket(random_bracket_expr(rng, recursive_depth, compatibility)),
     }
 }
 
-fn local_atom_expr_mutation<R: Rng>(atom_expr: AtomExpr, rng: &mut R) -> AtomExpr {
+fn local_atom_expr_mutation<R: Rng>(
+    atom_expr: AtomExpr,
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> AtomExpr {
     match atom_expr {
         AtomExpr::Bracket(expr) => AtomExpr::Bracket(expr),
         AtomExpr::Wildcard => {
             if rng.random_bool(0.5) {
-                random_bare_atom_expr(rng)
+                random_bare_atom_expr(rng, compatibility)
             } else {
                 bracket_atom_expr(AtomPrimitive::Wildcard)
             }
@@ -1303,14 +1451,14 @@ fn local_atom_expr_mutation<R: Rng>(atom_expr: AtomExpr, rng: &mut R) -> AtomExp
                 let mut expr = BracketExpr {
                     tree: BracketExprTree::HighAnd(vec![
                         BracketExprTree::Primitive(AtomPrimitive::Symbol { element, aromatic }),
-                        BracketExprTree::Primitive(random_local_atom_primitive(rng)),
+                        BracketExprTree::Primitive(random_local_atom_primitive(rng, compatibility)),
                     ]),
                     atom_map: None,
                 };
                 let _ = expr.normalize();
                 AtomExpr::Bracket(expr)
             }
-            _ => random_bare_atom_expr(rng),
+            _ => random_bare_atom_expr(rng, compatibility),
         },
     }
 }
@@ -1322,50 +1470,94 @@ fn bracket_atom_expr(primitive: AtomPrimitive) -> AtomExpr {
     })
 }
 
-fn random_bare_atom_expr<R: Rng>(rng: &mut R) -> AtomExpr {
+fn random_bare_atom_expr<R: Rng>(rng: &mut R, compatibility: SmartsCompatibilityMode) -> AtomExpr {
     if rng.random_bool(0.35) {
         AtomExpr::Bare {
-            element: random_supported_element(rng, true),
+            element: random_supported_element(rng, true, compatibility),
             aromatic: true,
         }
     } else {
         AtomExpr::Bare {
-            element: random_supported_element(rng, false),
+            element: random_supported_element(rng, false, compatibility),
             aromatic: false,
         }
     }
 }
 
-fn random_bracket_expr<R: Rng>(rng: &mut R, recursive_depth: usize) -> BracketExpr {
+fn random_bracket_expr<R: Rng>(
+    rng: &mut R,
+    recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
+) -> BracketExpr {
     let mut expr = BracketExpr {
-        tree: random_bracket_tree(rng, recursive_depth, 0),
+        tree: random_bracket_tree(rng, recursive_depth, 0, compatibility),
         atom_map: rng
             .random_bool(0.01)
-            .then_some(rng.random_range(1..=MAX_ATOM_MAP)),
+            .then_some(random_atom_map(rng, compatibility)),
     };
     let _ = expr.normalize();
     expr
+}
+
+fn random_atom_map<R: Rng>(rng: &mut R, compatibility: SmartsCompatibilityMode) -> u32 {
+    let max = if compatibility.pubchem_compatible() {
+        PUBCHEM_MAX_ATOM_MAP
+    } else {
+        MAX_ATOM_MAP
+    };
+    rng.random_range(1..=max)
 }
 
 fn random_bracket_tree<R: Rng>(
     rng: &mut R,
     recursive_depth: usize,
     tree_depth: usize,
+    compatibility: SmartsCompatibilityMode,
 ) -> BracketExprTree {
     if tree_depth >= MAX_EXPR_TREE_DEPTH {
-        return BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth));
+        return BracketExprTree::Primitive(random_atom_primitive(
+            rng,
+            recursive_depth,
+            compatibility,
+        ));
     }
 
     match rng.random_range(0..6) {
-        0 | 1 => BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth)),
-        2 => BracketExprTree::Not(Box::new(random_bracket_tree(
+        0 | 1 => {
+            BracketExprTree::Primitive(random_atom_primitive(rng, recursive_depth, compatibility))
+        }
+        2 => {
+            let mut child =
+                random_bracket_tree(rng, recursive_depth, tree_depth + 1, compatibility);
+            if compatibility.pubchem_compatible()
+                && (bracket_tree_contains_not(&child)
+                    || bracket_tree_contains_wildcard_primitive(&child))
+            {
+                child = BracketExprTree::Primitive(random_pubchem_negation_child_atom_primitive(
+                    rng,
+                    recursive_depth,
+                ));
+            }
+            BracketExprTree::Not(Box::new(child))
+        }
+        3 => BracketExprTree::HighAnd(random_bracket_children(
             rng,
             recursive_depth,
-            tree_depth + 1,
-        ))),
-        3 => BracketExprTree::HighAnd(random_bracket_children(rng, recursive_depth, tree_depth)),
-        4 => BracketExprTree::Or(random_bracket_children(rng, recursive_depth, tree_depth)),
-        _ => BracketExprTree::LowAnd(random_bracket_children(rng, recursive_depth, tree_depth)),
+            tree_depth,
+            compatibility,
+        )),
+        4 => BracketExprTree::Or(random_bracket_children(
+            rng,
+            recursive_depth,
+            tree_depth,
+            compatibility,
+        )),
+        _ => BracketExprTree::LowAnd(random_bracket_children(
+            rng,
+            recursive_depth,
+            tree_depth,
+            compatibility,
+        )),
     }
 }
 
@@ -1373,89 +1565,162 @@ fn random_bracket_children<R: Rng>(
     rng: &mut R,
     recursive_depth: usize,
     tree_depth: usize,
+    compatibility: SmartsCompatibilityMode,
 ) -> Vec<BracketExprTree> {
     (0..rng.random_range(2..=MAX_BOOLEAN_CHILDREN))
-        .map(|_| random_bracket_tree(rng, recursive_depth, tree_depth + 1))
+        .map(|_| random_bracket_tree(rng, recursive_depth, tree_depth + 1, compatibility))
         .collect()
 }
 
-fn random_atom_primitive<R: Rng>(rng: &mut R, recursive_depth: usize) -> AtomPrimitive {
+fn random_atom_primitive<R: Rng>(
+    rng: &mut R,
+    recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
+) -> AtomPrimitive {
     match rng.random_range(0..100) {
         0..=5 => AtomPrimitive::Wildcard,
         6..=10 => AtomPrimitive::AliphaticAny,
         11..=15 => AtomPrimitive::AromaticAny,
-        16..=38 => random_symbol_primitive(rng),
+        16..=38 => random_symbol_primitive(rng, compatibility),
         39..=47 => AtomPrimitive::AtomicNumber(random_atomic_number(rng)),
-        48..=52 => AtomPrimitive::Degree(random_optional_numeric_query(rng, 0, MAX_DEGREE)),
-        53..=57 => {
-            AtomPrimitive::Connectivity(random_optional_numeric_query(rng, 0, MAX_CONNECTIVITY))
-        }
-        58..=62 => AtomPrimitive::Valence(random_optional_numeric_query(rng, 0, MAX_VALENCE)),
-        63..=69 => random_hydrogen_primitive(rng, MAX_HYDROGEN_COUNT),
+        48..=52 => AtomPrimitive::Degree(random_optional_numeric_query(
+            rng,
+            0,
+            MAX_DEGREE,
+            compatibility,
+        )),
+        53..=57 => AtomPrimitive::Connectivity(random_optional_numeric_query(
+            rng,
+            0,
+            MAX_CONNECTIVITY,
+            compatibility,
+        )),
+        58..=62 => AtomPrimitive::Valence(random_pubchem_required_numeric_query(
+            rng,
+            0,
+            MAX_VALENCE,
+            compatibility,
+        )),
+        63..=69 => random_hydrogen_primitive(rng, MAX_HYDROGEN_COUNT, compatibility),
         70..=74 => AtomPrimitive::RingMembership(random_optional_numeric_query(
             rng,
             0,
             MAX_RING_MEMBERSHIP,
+            compatibility,
         )),
-        75..=79 => AtomPrimitive::RingSize(random_optional_numeric_query(rng, 3, MAX_RING_SIZE)),
+        75..=79 => AtomPrimitive::RingSize(random_optional_numeric_query(
+            rng,
+            3,
+            MAX_RING_SIZE,
+            compatibility,
+        )),
         80..=83 => AtomPrimitive::RingConnectivity(random_optional_numeric_query(
             rng,
             0,
             MAX_RING_CONNECTIVITY,
+            compatibility,
         )),
-        84..=86 if recursive_depth < MAX_RECURSIVE_QUERY_DEPTH => AtomPrimitive::RecursiveQuery(
-            Box::new(random_recursive_query(rng, recursive_depth + 1)),
-        ),
-        84..=86 => random_hydrogen_primitive(rng, MAX_HYDROGEN_COUNT),
+        84..=86 if recursive_depth < MAX_RECURSIVE_QUERY_DEPTH => {
+            AtomPrimitive::RecursiveQuery(Box::new(random_recursive_query(
+                rng,
+                recursive_depth + 1,
+                compatibility,
+            )))
+        }
+        84..=86 => random_hydrogen_primitive(rng, MAX_HYDROGEN_COUNT, compatibility),
         87 => AtomPrimitive::Isotope {
             isotope: random_isotope(rng),
             aromatic: rng.random_bool(0.2),
         },
-        88 => AtomPrimitive::IsotopeWildcard(random_isotope_wildcard(rng)),
-        89 => AtomPrimitive::Hybridization(random_numeric_query(rng, 1, MAX_HYBRIDIZATION)),
+        88 => AtomPrimitive::IsotopeWildcard(random_isotope_wildcard(rng, compatibility)),
+        89 if compatibility.pubchem_compatible() => {
+            random_hydrogen_primitive(rng, MAX_HYDROGEN_COUNT, compatibility)
+        }
+        89 => AtomPrimitive::Hybridization(random_numeric_query(
+            rng,
+            1,
+            MAX_HYBRIDIZATION,
+            compatibility,
+        )),
+        90 | 91 if compatibility.pubchem_compatible() => AtomPrimitive::Charge(random_charge(rng)),
         90 => AtomPrimitive::HeteroNeighbor(random_optional_numeric_query(
             rng,
             0,
             MAX_HETERO_NEIGHBOR,
+            compatibility,
         )),
         91 => AtomPrimitive::AliphaticHeteroNeighbor(random_optional_numeric_query(
             rng,
             0,
             MAX_ALIPHATIC_HETERO_NEIGHBOR,
+            compatibility,
         )),
-        92 => AtomPrimitive::Chirality(random_chirality(rng)),
+        92 => AtomPrimitive::Chirality(random_chirality(rng, compatibility)),
         _ => AtomPrimitive::Charge(random_charge(rng)),
     }
 }
 
-fn random_local_atom_primitive<R: Rng>(rng: &mut R) -> AtomPrimitive {
+fn random_local_atom_primitive<R: Rng>(
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> AtomPrimitive {
     match rng.random_range(0..100) {
-        0..=18 => random_hydrogen_primitive(rng, 4),
-        19..=34 => AtomPrimitive::Degree(random_optional_numeric_query(rng, 0, 6)),
-        35..=50 => AtomPrimitive::Connectivity(random_optional_numeric_query(rng, 0, 6)),
-        51..=63 => AtomPrimitive::Valence(random_optional_numeric_query(rng, 0, 6)),
-        64..=73 => AtomPrimitive::RingMembership(random_optional_numeric_query(rng, 0, 6)),
-        74..=82 => AtomPrimitive::RingSize(random_optional_numeric_query(rng, 3, 8)),
-        83..=90 => AtomPrimitive::RingConnectivity(random_optional_numeric_query(rng, 0, 6)),
+        0..=18 => random_hydrogen_primitive(rng, 4, compatibility),
+        19..=34 => AtomPrimitive::Degree(random_optional_numeric_query(rng, 0, 6, compatibility)),
+        35..=50 => {
+            AtomPrimitive::Connectivity(random_optional_numeric_query(rng, 0, 6, compatibility))
+        }
+        51..=63 => AtomPrimitive::Valence(random_pubchem_required_numeric_query(
+            rng,
+            0,
+            6,
+            compatibility,
+        )),
+        64..=73 => {
+            AtomPrimitive::RingMembership(random_optional_numeric_query(rng, 0, 6, compatibility))
+        }
+        74..=82 => AtomPrimitive::RingSize(random_optional_numeric_query(rng, 3, 8, compatibility)),
+        83..=90 => {
+            AtomPrimitive::RingConnectivity(random_optional_numeric_query(rng, 0, 6, compatibility))
+        }
         91..=96 => AtomPrimitive::Charge(rng.random_range(-1..=1)),
-        97..=98 => AtomPrimitive::HeteroNeighbor(random_optional_numeric_query(rng, 0, 4)),
-        _ => AtomPrimitive::AliphaticHeteroNeighbor(random_optional_numeric_query(rng, 0, 4)),
+        97..=98 if compatibility.pubchem_compatible() => {
+            AtomPrimitive::Charge(rng.random_range(-1..=1))
+        }
+        97..=98 => {
+            AtomPrimitive::HeteroNeighbor(random_optional_numeric_query(rng, 0, 4, compatibility))
+        }
+        _ if compatibility.pubchem_compatible() => AtomPrimitive::Charge(rng.random_range(-1..=1)),
+        _ => AtomPrimitive::AliphaticHeteroNeighbor(random_optional_numeric_query(
+            rng,
+            0,
+            4,
+            compatibility,
+        )),
     }
 }
 
-fn random_hydrogen_primitive<R: Rng>(rng: &mut R, max_count: u16) -> AtomPrimitive {
-    let kind = if rng.random_bool(0.5) {
+fn random_hydrogen_primitive<R: Rng>(
+    rng: &mut R,
+    max_count: u16,
+    compatibility: SmartsCompatibilityMode,
+) -> AtomPrimitive {
+    let kind = if compatibility.pubchem_compatible() || rng.random_bool(0.5) {
         HydrogenKind::Total
     } else {
         HydrogenKind::Implicit
     };
-    AtomPrimitive::Hydrogen(kind, random_optional_numeric_query(rng, 0, max_count))
+    AtomPrimitive::Hydrogen(
+        kind,
+        random_optional_numeric_query(rng, 0, max_count, compatibility),
+    )
 }
 
 fn generalize_atom_primitive<R: Rng>(
     primitive: &AtomPrimitive,
     rng: &mut R,
     recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
 ) -> AtomPrimitive {
     match primitive {
         AtomPrimitive::Symbol { aromatic, .. } => {
@@ -1489,16 +1754,15 @@ fn generalize_atom_primitive<R: Rng>(
         AtomPrimitive::RingMembership(Some(_)) => AtomPrimitive::RingMembership(None),
         AtomPrimitive::RingSize(Some(_)) => AtomPrimitive::RingSize(None),
         AtomPrimitive::RingConnectivity(Some(_)) => AtomPrimitive::RingConnectivity(None),
-        AtomPrimitive::HeteroNeighbor(Some(_)) => AtomPrimitive::HeteroNeighbor(None),
-        AtomPrimitive::AliphaticHeteroNeighbor(Some(_)) => {
-            AtomPrimitive::AliphaticHeteroNeighbor(None)
-        }
-        AtomPrimitive::Hybridization(_) | AtomPrimitive::Chirality(_) => AtomPrimitive::Wildcard,
-        AtomPrimitive::RecursiveQuery(_) => AtomPrimitive::Wildcard,
+        AtomPrimitive::HeteroNeighbor(_)
+        | AtomPrimitive::AliphaticHeteroNeighbor(_)
+        | AtomPrimitive::Hybridization(_)
+        | AtomPrimitive::Chirality(_)
+        | AtomPrimitive::RecursiveQuery(_) => AtomPrimitive::Wildcard,
         AtomPrimitive::Charge(charge) if *charge > 1 => AtomPrimitive::Charge(charge - 1),
         AtomPrimitive::Charge(charge) if *charge < -1 => AtomPrimitive::Charge(charge + 1),
         AtomPrimitive::Charge(_) => AtomPrimitive::Wildcard,
-        _ => random_atom_primitive(rng, recursive_depth),
+        _ => random_atom_primitive(rng, recursive_depth, compatibility),
     }
 }
 
@@ -1506,10 +1770,11 @@ fn specialize_atom_primitive<R: Rng>(
     primitive: &AtomPrimitive,
     rng: &mut R,
     recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
 ) -> AtomPrimitive {
     match primitive {
         AtomPrimitive::Wildcard | AtomPrimitive::AliphaticAny | AtomPrimitive::AromaticAny => {
-            random_symbol_primitive(rng)
+            random_symbol_primitive(rng, compatibility)
         }
         AtomPrimitive::RingMembership(None) => AtomPrimitive::RingMembership(Some(
             NumericQuery::Exact(rng.random_range(1..=MAX_RING_MEMBERSHIP)),
@@ -1520,10 +1785,12 @@ fn specialize_atom_primitive<R: Rng>(
         AtomPrimitive::RingConnectivity(None) => AtomPrimitive::RingConnectivity(Some(
             NumericQuery::Exact(rng.random_range(1..=MAX_RING_CONNECTIVITY)),
         )),
-        AtomPrimitive::HeteroNeighbor(None) => AtomPrimitive::HeteroNeighbor(Some(
-            NumericQuery::Exact(rng.random_range(1..=MAX_HETERO_NEIGHBOR)),
-        )),
-        AtomPrimitive::AliphaticHeteroNeighbor(None) => {
+        AtomPrimitive::HeteroNeighbor(None) if !compatibility.pubchem_compatible() => {
+            AtomPrimitive::HeteroNeighbor(Some(NumericQuery::Exact(
+                rng.random_range(1..=MAX_HETERO_NEIGHBOR),
+            )))
+        }
+        AtomPrimitive::AliphaticHeteroNeighbor(None) if !compatibility.pubchem_compatible() => {
             AtomPrimitive::AliphaticHeteroNeighbor(Some(NumericQuery::Exact(
                 rng.random_range(1..=MAX_ALIPHATIC_HETERO_NEIGHBOR),
             )))
@@ -1555,44 +1822,95 @@ fn specialize_atom_primitive<R: Rng>(
             AtomPrimitive::AtomicNumber(element.atomic_number().into())
         }
         AtomPrimitive::AtomicNumber(_) => {
-            AtomPrimitive::IsotopeWildcard(random_isotope_wildcard(rng))
+            AtomPrimitive::IsotopeWildcard(random_isotope_wildcard(rng, compatibility))
         }
         AtomPrimitive::RecursiveQuery(_) | AtomPrimitive::Chirality(_) => {
-            random_atom_primitive(rng, recursive_depth)
+            random_atom_primitive(rng, recursive_depth, compatibility)
         }
-        _ => random_atom_primitive(rng, recursive_depth),
+        _ => random_atom_primitive(rng, recursive_depth, compatibility),
     }
 }
 
-fn random_bond_expr<R: Rng>(rng: &mut R) -> BondExpr {
+fn random_bond_expr<R: Rng>(rng: &mut R, compatibility: SmartsCompatibilityMode) -> BondExpr {
     if rng.random_bool(0.15) {
         BondExpr::Elided
     } else {
-        BondExpr::Query(random_bond_tree(rng, 0))
+        BondExpr::Query(random_bond_tree(rng, 0, compatibility))
     }
 }
 
-fn random_bond_tree<R: Rng>(rng: &mut R, tree_depth: usize) -> BondExprTree {
+fn random_bond_tree<R: Rng>(
+    rng: &mut R,
+    tree_depth: usize,
+    compatibility: SmartsCompatibilityMode,
+) -> BondExprTree {
     if tree_depth >= MAX_EXPR_TREE_DEPTH {
-        return BondExprTree::Primitive(random_bond_primitive(rng));
+        return BondExprTree::Primitive(random_bond_primitive(rng, compatibility));
     }
 
     match rng.random_range(0..6) {
-        0 | 1 => BondExprTree::Primitive(random_bond_primitive(rng)),
-        2 => BondExprTree::Not(Box::new(random_bond_tree(rng, tree_depth + 1))),
-        3 => BondExprTree::HighAnd(random_bond_children(rng, tree_depth)),
-        4 => BondExprTree::Or(random_bond_children(rng, tree_depth)),
-        _ => BondExprTree::LowAnd(random_bond_children(rng, tree_depth)),
+        0 | 1 => BondExprTree::Primitive(random_bond_primitive(rng, compatibility)),
+        2 => {
+            let mut child = random_bond_tree(rng, tree_depth + 1, compatibility);
+            if compatibility.pubchem_compatible() && bond_tree_contains_not(&child) {
+                child = BondExprTree::Primitive(random_bond_primitive(rng, compatibility));
+            }
+            BondExprTree::Not(Box::new(child))
+        }
+        3 => BondExprTree::HighAnd(random_bond_children(rng, tree_depth, compatibility)),
+        4 => BondExprTree::Or(random_bond_children(rng, tree_depth, compatibility)),
+        _ => BondExprTree::LowAnd(random_bond_children(rng, tree_depth, compatibility)),
     }
 }
 
-fn random_bond_children<R: Rng>(rng: &mut R, tree_depth: usize) -> Vec<BondExprTree> {
+fn random_bond_children<R: Rng>(
+    rng: &mut R,
+    tree_depth: usize,
+    compatibility: SmartsCompatibilityMode,
+) -> Vec<BondExprTree> {
     (0..rng.random_range(2..=MAX_BOOLEAN_CHILDREN))
-        .map(|_| random_bond_tree(rng, tree_depth + 1))
+        .map(|_| random_bond_tree(rng, tree_depth + 1, compatibility))
         .collect()
 }
 
-fn random_bond_primitive<R: Rng>(rng: &mut R) -> BondPrimitive {
+fn bracket_tree_contains_not(tree: &BracketExprTree) -> bool {
+    match tree {
+        BracketExprTree::Primitive(_) => false,
+        BracketExprTree::Not(_) => true,
+        BracketExprTree::HighAnd(children)
+        | BracketExprTree::Or(children)
+        | BracketExprTree::LowAnd(children) => children.iter().any(bracket_tree_contains_not),
+    }
+}
+
+fn random_pubchem_negation_child_atom_primitive<R: Rng>(
+    rng: &mut R,
+    recursive_depth: usize,
+) -> AtomPrimitive {
+    match random_atom_primitive(rng, recursive_depth, SmartsCompatibilityMode::PubChem) {
+        AtomPrimitive::Wildcard => AtomPrimitive::AliphaticAny,
+        primitive => primitive,
+    }
+}
+
+fn bond_tree_contains_not(tree: &BondExprTree) -> bool {
+    match tree {
+        BondExprTree::Primitive(_) => false,
+        BondExprTree::Not(_) => true,
+        BondExprTree::HighAnd(children)
+        | BondExprTree::Or(children)
+        | BondExprTree::LowAnd(children) => children.iter().any(bond_tree_contains_not),
+    }
+}
+
+fn random_bond_primitive<R: Rng>(
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> BondPrimitive {
+    if compatibility.pubchem_compatible() {
+        return random_pubchem_bond_primitive(rng);
+    }
+
     match rng.random_range(0..100) {
         0..=34 => BondPrimitive::Bond(Bond::Single),
         35..=54 => BondPrimitive::Bond(Bond::Double),
@@ -1606,6 +1924,19 @@ fn random_bond_primitive<R: Rng>(rng: &mut R) -> BondPrimitive {
     }
 }
 
+fn random_pubchem_bond_primitive<R: Rng>(rng: &mut R) -> BondPrimitive {
+    match rng.random_range(0..100) {
+        0..=34 => BondPrimitive::Bond(Bond::Single),
+        35..=54 => BondPrimitive::Bond(Bond::Double),
+        55..=66 => BondPrimitive::Bond(Bond::Aromatic),
+        67..=78 => BondPrimitive::Any,
+        79..=88 => BondPrimitive::Ring,
+        89..=93 => BondPrimitive::Bond(Bond::Triple),
+        94..=96 => BondPrimitive::Bond(Bond::Up),
+        _ => BondPrimitive::Bond(Bond::Down),
+    }
+}
+
 fn random_atomic_number<R: Rng>(rng: &mut R) -> u16 {
     if rng.random_bool(0.90) {
         COMMON_ATOMIC_NUMBERS[rng.random_range(0..COMMON_ATOMIC_NUMBERS.len())]
@@ -1614,26 +1945,41 @@ fn random_atomic_number<R: Rng>(rng: &mut R) -> u16 {
     }
 }
 
-fn random_symbol_primitive<R: Rng>(rng: &mut R) -> AtomPrimitive {
+fn random_symbol_primitive<R: Rng>(
+    rng: &mut R,
+    compatibility: SmartsCompatibilityMode,
+) -> AtomPrimitive {
     let aromatic = rng.random_bool(0.30);
-    let element = random_supported_element(rng, aromatic);
+    let element = random_supported_element(rng, aromatic, compatibility);
     AtomPrimitive::Symbol { element, aromatic }
 }
 
-fn random_supported_element<R: Rng>(rng: &mut R, aromatic: bool) -> Element {
-    let symbol = if aromatic {
-        AROMATIC_ELEMENT_SYMBOLS[rng.random_range(0..AROMATIC_ELEMENT_SYMBOLS.len())]
-    } else if rng.random_bool(0.90) {
-        COMMON_ALIPHATIC_ELEMENT_SYMBOLS
-            [rng.random_range(0..COMMON_ALIPHATIC_ELEMENT_SYMBOLS.len())]
-    } else {
-        ALL_ELEMENT_SYMBOLS[rng.random_range(0..ALL_ELEMENT_SYMBOLS.len())]
-    };
-    match Element::from_str(symbol) {
-        Ok(element) => element,
-        Err(error) => {
-            debug_assert!(false, "invalid built-in element symbol {symbol}: {error}");
-            Element::C
+fn random_supported_element<R: Rng>(
+    rng: &mut R,
+    aromatic: bool,
+    compatibility: SmartsCompatibilityMode,
+) -> Element {
+    loop {
+        let symbol = if aromatic {
+            AROMATIC_ELEMENT_SYMBOLS[rng.random_range(0..AROMATIC_ELEMENT_SYMBOLS.len())]
+        } else if rng.random_bool(0.90) {
+            COMMON_ALIPHATIC_ELEMENT_SYMBOLS
+                [rng.random_range(0..COMMON_ALIPHATIC_ELEMENT_SYMBOLS.len())]
+        } else {
+            ALL_ELEMENT_SYMBOLS[rng.random_range(0..ALL_ELEMENT_SYMBOLS.len())]
+        };
+        match Element::from_str(symbol) {
+            Ok(element)
+                if !compatibility.pubchem_compatible()
+                    || pubchem_element_symbol_is_compatible(element) =>
+            {
+                return element;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                debug_assert!(false, "invalid built-in element symbol {symbol}: {error}");
+                return Element::C;
+            }
         }
     }
 }
@@ -1649,9 +1995,9 @@ fn random_isotope<R: Rng>(rng: &mut R) -> Isotope {
     }
 }
 
-fn random_isotope_wildcard<R: Rng>(rng: &mut R) -> u16 {
-    if rng.random_bool(0.90) {
-        rng.random_range(0..=255)
+fn random_isotope_wildcard<R: Rng>(rng: &mut R, compatibility: SmartsCompatibilityMode) -> u16 {
+    if compatibility.pubchem_compatible() || rng.random_bool(0.90) {
+        rng.random_range(0..=PUBCHEM_MAX_ISOTOPE_MASS_NUMBER)
     } else {
         rng.random_range(0..=MAX_ISOTOPE_WILDCARD)
     }
@@ -1665,7 +2011,16 @@ fn random_charge<R: Rng>(rng: &mut R) -> i8 {
     }
 }
 
-fn random_chirality<R: Rng>(rng: &mut R) -> Chirality {
+fn random_chirality<R: Rng>(rng: &mut R, compatibility: SmartsCompatibilityMode) -> Chirality {
+    if compatibility.pubchem_compatible() {
+        return match rng.random_range(0..4) {
+            0 => Chirality::At,
+            1 => Chirality::AtAt,
+            2 => Chirality::try_th(rng.random_range(1..=2)).unwrap_or(Chirality::At),
+            _ => Chirality::try_sp(rng.random_range(1..=3)).unwrap_or(Chirality::At),
+        };
+    }
+
     match rng.random_range(0..7) {
         0 => Chirality::At,
         1 => Chirality::AtAt,
@@ -1677,16 +2032,39 @@ fn random_chirality<R: Rng>(rng: &mut R) -> Chirality {
     }
 }
 
-fn random_optional_numeric_query<R: Rng>(rng: &mut R, min: u16, max: u16) -> Option<NumericQuery> {
+fn random_optional_numeric_query<R: Rng>(
+    rng: &mut R,
+    min: u16,
+    max: u16,
+    compatibility: SmartsCompatibilityMode,
+) -> Option<NumericQuery> {
     if rng.random_bool(0.25) {
         None
     } else {
-        Some(random_numeric_query(rng, min, max))
+        Some(random_numeric_query(rng, min, max, compatibility))
     }
 }
 
-fn random_numeric_query<R: Rng>(rng: &mut R, min: u16, max: u16) -> NumericQuery {
-    if min == max || rng.random_bool(0.6) {
+fn random_pubchem_required_numeric_query<R: Rng>(
+    rng: &mut R,
+    min: u16,
+    max: u16,
+    compatibility: SmartsCompatibilityMode,
+) -> Option<NumericQuery> {
+    if compatibility.pubchem_compatible() {
+        Some(random_numeric_query(rng, min, max, compatibility))
+    } else {
+        random_optional_numeric_query(rng, min, max, compatibility)
+    }
+}
+
+fn random_numeric_query<R: Rng>(
+    rng: &mut R,
+    min: u16,
+    max: u16,
+    compatibility: SmartsCompatibilityMode,
+) -> NumericQuery {
+    if compatibility.pubchem_compatible() || min == max || rng.random_bool(0.6) {
         NumericQuery::Exact(rng.random_range(min..=max))
     } else {
         let start = rng.random_range(min..=max);
@@ -1712,8 +2090,17 @@ fn query_from_known_valid_smarts(smarts: &str) -> QueryMol {
     QueryMol::from_str(smarts).unwrap()
 }
 
-fn random_recursive_query<R: Rng>(rng: &mut R, recursive_depth: usize) -> QueryMol {
-    let smarts = RECURSIVE_FRAGMENT_SMARTS[rng.random_range(0..RECURSIVE_FRAGMENT_SMARTS.len())];
+fn random_recursive_query<R: Rng>(
+    rng: &mut R,
+    recursive_depth: usize,
+    compatibility: SmartsCompatibilityMode,
+) -> QueryMol {
+    let fragments = if compatibility.pubchem_compatible() {
+        PUBCHEM_RECURSIVE_FRAGMENT_SMARTS
+    } else {
+        RECURSIVE_FRAGMENT_SMARTS
+    };
+    let smarts = fragments[rng.random_range(0..fragments.len())];
     let mut query = query_from_known_valid_smarts(smarts);
     if recursive_depth < MAX_RECURSIVE_QUERY_DEPTH && rng.random_bool(0.35) {
         let mut editable = query.edit();
@@ -1723,15 +2110,24 @@ fn random_recursive_query<R: Rng>(rng: &mut R, recursive_depth: usize) -> QueryM
             rng,
             recursive_depth,
             MutationDirection::Balanced,
+            compatibility,
         );
         if edit.changed
             && let Ok(candidate) = editable.into_query_mol()
-            && genome_from_query(&candidate).is_some()
+            && recursive_query_is_valid_for_context(&candidate, compatibility)
         {
             query = candidate;
         }
     }
     query
+}
+
+fn recursive_query_is_valid_for_context(
+    query: &QueryMol,
+    compatibility: SmartsCompatibilityMode,
+) -> bool {
+    genome_from_query(query, compatibility).is_some()
+        && (!compatibility.pubchem_compatible() || pubchem_recursive_query_is_compatible(query))
 }
 
 fn normalize_component_groups(
@@ -1988,6 +2384,7 @@ mod tests {
                     &mut rng,
                     0,
                     MutationDirection::Balanced,
+                    SmartsCompatibilityMode::Full,
                 ) && editable
                     .into_query_mol()
                     .map(|query| SmartsGenome::from_query_mol(&query).is_valid())
@@ -2063,7 +2460,7 @@ mod tests {
         let over_limit = over_limit_smarts_fixture();
         let query = QueryMol::from_str(&over_limit).unwrap();
 
-        assert!(genome_from_query(&query).is_none());
+        assert!(genome_from_query(&query, SmartsCompatibilityMode::Full).is_none());
     }
 
     #[test]
@@ -2090,6 +2487,7 @@ mod tests {
             &mut editable,
             &mut SmallRng::seed_from_u64(3),
             0,
+            SmartsCompatibilityMode::Full,
         ));
 
         let mut editable = query.edit();
@@ -2098,12 +2496,14 @@ mod tests {
             &mut SmallRng::seed_from_u64(4),
             0,
             MutationDirection::Balanced,
+            SmartsCompatibilityMode::Full,
         ));
 
         let mut editable = query.edit();
         assert!(!mutate_bond_constraints(
             &mut editable,
-            &mut SmallRng::seed_from_u64(5)
+            &mut SmallRng::seed_from_u64(5),
+            SmartsCompatibilityMode::Full,
         ));
 
         let mut editable = query.edit();
@@ -2115,14 +2515,16 @@ mod tests {
         let mut editable = query.edit();
         assert!(!toggle_atom_not(
             &mut editable,
-            &mut SmallRng::seed_from_u64(7)
+            &mut SmallRng::seed_from_u64(7),
+            SmartsCompatibilityMode::Full,
         ));
 
         let mut editable = query.edit();
         assert!(!graft_seed_fragment(
             &mut editable,
             &[],
-            &mut SmallRng::seed_from_u64(8)
+            &mut SmallRng::seed_from_u64(8),
+            SmartsCompatibilityMode::Full,
         ));
     }
 
@@ -2137,6 +2539,7 @@ mod tests {
                 &mut SmallRng::seed_from_u64(seed),
                 0,
                 MutationDirection::Balanced,
+                SmartsCompatibilityMode::Full,
             ));
             let refined = editable.into_query_mol().unwrap();
 
@@ -2150,19 +2553,39 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(9);
 
         assert!(matches!(
-            specialize_atom_primitive(&AtomPrimitive::Wildcard, &mut rng, 0),
+            specialize_atom_primitive(
+                &AtomPrimitive::Wildcard,
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::Symbol { .. }
         ));
         assert!(matches!(
-            specialize_atom_primitive(&AtomPrimitive::RingMembership(None), &mut rng, 0),
+            specialize_atom_primitive(
+                &AtomPrimitive::RingMembership(None),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::RingMembership(Some(_))
         ));
         assert!(matches!(
-            specialize_atom_primitive(&AtomPrimitive::RingSize(None), &mut rng, 0),
+            specialize_atom_primitive(
+                &AtomPrimitive::RingSize(None),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::RingSize(Some(_))
         ));
         assert!(matches!(
-            specialize_atom_primitive(&AtomPrimitive::RingConnectivity(None), &mut rng, 0),
+            specialize_atom_primitive(
+                &AtomPrimitive::RingConnectivity(None),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::RingConnectivity(Some(_))
         ));
     }
@@ -2179,7 +2602,7 @@ mod tests {
         let mut saw_implicit_h = false;
 
         for _ in 0..4096 {
-            match random_atom_primitive(&mut rng, 0) {
+            match random_atom_primitive(&mut rng, 0, SmartsCompatibilityMode::Full) {
                 AtomPrimitive::RecursiveQuery(_) => saw_recursive = true,
                 AtomPrimitive::Isotope { .. } | AtomPrimitive::IsotopeWildcard(_) => {
                     saw_isotope = true
@@ -2212,7 +2635,7 @@ mod tests {
         let mut saw_quadruple = false;
 
         for _ in 0..1024 {
-            match random_bond_expr(&mut rng) {
+            match random_bond_expr(&mut rng, SmartsCompatibilityMode::Full) {
                 BondExpr::Elided => {}
                 BondExpr::Query(
                     BondExprTree::Not(_)
@@ -2236,6 +2659,59 @@ mod tests {
     }
 
     #[test]
+    fn random_bond_expr_omits_pubchem_unsupported_bonds() {
+        let mut rng = SmallRng::seed_from_u64(321);
+
+        for _ in 0..4096 {
+            assert!(pubchem_bond_expr_is_compatible(&random_bond_expr(
+                &mut rng,
+                SmartsCompatibilityMode::PubChem,
+            )));
+        }
+    }
+
+    #[test]
+    fn random_atom_primitive_omits_pubchem_unsupported_features() {
+        let mut rng = SmallRng::seed_from_u64(322);
+
+        for _ in 0..4096 {
+            let primitive = random_atom_primitive(&mut rng, 0, SmartsCompatibilityMode::PubChem);
+
+            assert!(!matches!(
+                primitive,
+                AtomPrimitive::Hydrogen(HydrogenKind::Implicit, _)
+                    | AtomPrimitive::Hybridization(_)
+                    | AtomPrimitive::HeteroNeighbor(_)
+                    | AtomPrimitive::AliphaticHeteroNeighbor(_)
+                    | AtomPrimitive::Chirality(Chirality::TB(_) | Chirality::OH(_))
+                    | AtomPrimitive::Valence(None)
+            ));
+
+            if let AtomPrimitive::IsotopeWildcard(mass_number) = primitive {
+                assert!(mass_number <= PUBCHEM_MAX_ISOTOPE_MASS_NUMBER);
+            }
+
+            if let AtomPrimitive::Symbol { element, .. } = primitive {
+                assert!(pubchem_element_symbol_is_compatible(element));
+            }
+        }
+
+        for _ in 0..4096 {
+            if let AtomExpr::Bare { element, .. } =
+                random_bare_atom_expr(&mut rng, SmartsCompatibilityMode::PubChem)
+            {
+                assert!(pubchem_element_symbol_is_compatible(element));
+            }
+        }
+
+        for _ in 0..4096 {
+            let expr = random_bracket_expr(&mut rng, 0, SmartsCompatibilityMode::PubChem);
+            assert!(!bracket_tree_has_negation_below_negation(&expr.tree, false));
+            assert!(!bracket_tree_has_wildcard_below_negation(&expr.tree, false));
+        }
+    }
+
+    #[test]
     fn recursive_query_mutation_round_trips() {
         let mut editable = QueryMol::from_str("[$(CC)]N").unwrap().edit();
         assert!(mutate_recursive_query(
@@ -2244,6 +2720,7 @@ mod tests {
             &mut SmallRng::seed_from_u64(55),
             0,
             MutationDirection::Balanced,
+            SmartsCompatibilityMode::Full,
         ));
         let query = editable.into_query_mol().unwrap();
         assert!(query.to_string().contains("$("));
@@ -2254,15 +2731,31 @@ mod tests {
     fn random_recursive_query_keeps_nested_mutations_valid() {
         for seed in 0..128 {
             let mut rng = SmallRng::seed_from_u64(seed);
-            let query = random_recursive_query(&mut rng, 0);
-            assert!(genome_from_query(&query).is_some());
+            let query = random_recursive_query(&mut rng, 0, SmartsCompatibilityMode::Full);
+            assert!(genome_from_query(&query, SmartsCompatibilityMode::Full).is_some());
+        }
+    }
+
+    #[test]
+    fn random_recursive_query_omits_disconnected_pubchem_queries() {
+        for seed in 0..256 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let query = random_recursive_query(&mut rng, 0, SmartsCompatibilityMode::PubChem);
+            assert!(recursive_query_is_valid_for_context(
+                &query,
+                SmartsCompatibilityMode::PubChem
+            ));
         }
     }
 
     #[test]
     fn ring_and_component_mutations_are_available() {
         let mut ring_query = QueryMol::from_str("CCC").unwrap().edit();
-        assert!(ring_edit(&mut ring_query, &mut SmallRng::seed_from_u64(77)));
+        assert!(ring_edit(
+            &mut ring_query,
+            &mut SmallRng::seed_from_u64(77),
+            SmartsCompatibilityMode::Full,
+        ));
         let ring_query = ring_query.into_query_mol().unwrap();
         assert!(!ring_query.ring_bonds().is_empty());
 
@@ -2270,7 +2763,8 @@ mod tests {
         assert!(component_edit(
             &mut component_query,
             &mut SmallRng::seed_from_u64(88),
-            0
+            0,
+            SmartsCompatibilityMode::Full,
         ));
         let component_query = component_query.into_query_mol().unwrap();
         assert!(component_query.component_count() >= 1);
@@ -2281,13 +2775,15 @@ mod tests {
         let mut editable = QueryMol::from_str("C").unwrap().edit();
         assert!(!mutate_atom_map(
             &mut editable,
-            &mut SmallRng::seed_from_u64(91)
+            &mut SmallRng::seed_from_u64(91),
+            SmartsCompatibilityMode::Full,
         ));
 
         let mut editable = QueryMol::from_str("[#6:1]~[#7]").unwrap().edit();
         assert!(mutate_atom_map(
             &mut editable,
-            &mut SmallRng::seed_from_u64(92)
+            &mut SmallRng::seed_from_u64(92),
+            SmartsCompatibilityMode::Full,
         ));
         let mutated = editable.into_query_mol().unwrap();
         let mapped_atoms = mutated
@@ -2305,6 +2801,13 @@ mod tests {
             .count();
 
         assert!(mapped_atoms <= 1);
+
+        let mut rng = SmallRng::seed_from_u64(93);
+        for _ in 0..4096 {
+            assert!(
+                random_atom_map(&mut rng, SmartsCompatibilityMode::PubChem) <= PUBCHEM_MAX_ATOM_MAP
+            );
+        }
     }
 
     #[test]
@@ -2316,7 +2819,7 @@ mod tests {
 
         for _ in 0..4096 {
             let NumericQuery::Range(NumericRange { min, max }) =
-                random_numeric_query(&mut rng, 1, 6)
+                random_numeric_query(&mut rng, 1, 6, SmartsCompatibilityMode::Full)
             else {
                 continue;
             };
@@ -2332,6 +2835,18 @@ mod tests {
         assert!(saw_closed);
         assert!(saw_open_lower);
         assert!(saw_open_upper);
+    }
+
+    #[test]
+    fn random_numeric_query_uses_exact_values_in_pubchem_mode() {
+        let mut rng = SmallRng::seed_from_u64(92);
+
+        for _ in 0..4096 {
+            assert!(matches!(
+                random_numeric_query(&mut rng, 1, 6, SmartsCompatibilityMode::PubChem,),
+                NumericQuery::Exact(_)
+            ));
+        }
     }
 
     #[test]
@@ -2352,6 +2867,7 @@ mod tests {
             &mut SmallRng::seed_from_u64(100),
             MAX_RECURSIVE_QUERY_DEPTH,
             MutationDirection::Balanced,
+            SmartsCompatibilityMode::Full,
         ));
 
         let mut editable = QueryMol::from_str("C").unwrap().edit();
@@ -2361,12 +2877,17 @@ mod tests {
         ));
 
         let mut editable = QueryMol::from_str("C").unwrap().edit();
-        assert!(!ring_edit(&mut editable, &mut SmallRng::seed_from_u64(102)));
+        assert!(!ring_edit(
+            &mut editable,
+            &mut SmallRng::seed_from_u64(102),
+            SmartsCompatibilityMode::Full,
+        ));
 
         let mut editable = QueryMol::from_str("CC").unwrap().edit();
         assert!(mutate_bond_constraints(
             &mut editable,
             &mut SmallRng::seed_from_u64(103),
+            SmartsCompatibilityMode::Full,
         ));
 
         let regrouped = normalize_component_groups(vec![Some(4), None, Some(7), Some(4)]);
@@ -2385,24 +2906,45 @@ mod tests {
                 },
                 &mut rng,
                 0,
+                SmartsCompatibilityMode::Full,
             ),
             AtomPrimitive::AromaticAny
         ));
         assert!(matches!(
-            generalize_atom_primitive(&AtomPrimitive::AtomicNumber(6), &mut rng, 0),
+            generalize_atom_primitive(
+                &AtomPrimitive::AtomicNumber(6),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::Wildcard
         ));
         assert!(matches!(
-            generalize_atom_primitive(&AtomPrimitive::Charge(2), &mut rng, 0),
+            generalize_atom_primitive(
+                &AtomPrimitive::Charge(2),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::Charge(1)
         ));
         assert!(matches!(
-            generalize_atom_primitive(&AtomPrimitive::Charge(-2), &mut rng, 0),
+            generalize_atom_primitive(
+                &AtomPrimitive::Charge(-2),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::Charge(-1)
         ));
 
         assert!(matches!(
-            specialize_atom_primitive(&AtomPrimitive::AtomicNumber(6), &mut rng, 0),
+            specialize_atom_primitive(
+                &AtomPrimitive::AtomicNumber(6),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::IsotopeWildcard(_)
         ));
         assert!(matches!(
@@ -2413,22 +2955,34 @@ mod tests {
                 },
                 &mut rng,
                 0,
+                SmartsCompatibilityMode::Full,
             ),
             AtomPrimitive::AtomicNumber(26)
         ));
         assert!(matches!(
-            specialize_atom_primitive(&AtomPrimitive::Charge(1), &mut rng, 0),
+            specialize_atom_primitive(
+                &AtomPrimitive::Charge(1),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::Charge(2)
         ));
         assert!(matches!(
-            specialize_atom_primitive(&AtomPrimitive::Charge(-1), &mut rng, 0),
+            specialize_atom_primitive(
+                &AtomPrimitive::Charge(-1),
+                &mut rng,
+                0,
+                SmartsCompatibilityMode::Full,
+            ),
             AtomPrimitive::Charge(-2)
         ));
         assert!(matches!(
             specialize_atom_primitive(
                 &AtomPrimitive::RecursiveQuery(Box::new(QueryMol::from_str("[#6]").unwrap())),
                 &mut rng,
-                0
+                0,
+                SmartsCompatibilityMode::Full,
             ),
             AtomPrimitive::Wildcard
                 | AtomPrimitive::AliphaticAny
@@ -2464,25 +3018,28 @@ mod tests {
         let mut saw_elided = false;
 
         for _ in 0..2048 {
-            match random_bare_atom_expr(&mut rng) {
+            match random_bare_atom_expr(&mut rng, SmartsCompatibilityMode::Full) {
                 AtomExpr::Bare { aromatic: true, .. } => saw_bare_aromatic = true,
                 AtomExpr::Bare {
                     aromatic: false, ..
                 } => saw_bare_aliphatic = true,
                 _ => {}
             }
-            match random_symbol_primitive(&mut rng) {
+            match random_symbol_primitive(&mut rng, SmartsCompatibilityMode::Full) {
                 AtomPrimitive::Symbol { aromatic: true, .. } => saw_symbol_aromatic = true,
                 AtomPrimitive::Symbol {
                     aromatic: false, ..
                 } => saw_symbol_aliphatic = true,
                 _ => {}
             }
-            match random_optional_numeric_query(&mut rng, 0, 3) {
+            match random_optional_numeric_query(&mut rng, 0, 3, SmartsCompatibilityMode::Full) {
                 None => saw_optional_none = true,
                 Some(_) => saw_optional_some = true,
             }
-            if matches!(random_bond_expr(&mut rng), BondExpr::Elided) {
+            if matches!(
+                random_bond_expr(&mut rng, SmartsCompatibilityMode::Full),
+                BondExpr::Elided
+            ) {
                 saw_elided = true;
             }
         }
@@ -2509,7 +3066,7 @@ mod tests {
                 saw_heavy_atomic_number = true;
             }
 
-            if random_isotope_wildcard(&mut rng) > 2095 {
+            if random_isotope_wildcard(&mut rng, SmartsCompatibilityMode::Full) > 2095 {
                 saw_large_isotope_wildcard = true;
             }
 
@@ -2517,7 +3074,8 @@ mod tests {
                 saw_large_charge = true;
             }
 
-            if let AtomPrimitive::Symbol { element, .. } = random_symbol_primitive(&mut rng)
+            if let AtomPrimitive::Symbol { element, .. } =
+                random_symbol_primitive(&mut rng, SmartsCompatibilityMode::Full)
                 && element.atomic_number() > 53
             {
                 saw_uncommon_symbol = true;
@@ -2531,6 +3089,83 @@ mod tests {
     }
 
     #[test]
+    fn genome_from_query_rejects_pubchem_incompatible_constructs() {
+        for smarts in [
+            "[D{2-4}]",
+            "[65535*]",
+            "[^2]",
+            "[z2]",
+            "[Z2]",
+            "[#0]",
+            "[#119]",
+            "[#6:1000]",
+            "[c;h1]",
+            "[C@TB1](F)(Cl)Br",
+            "[Rf]",
+            "[Og]",
+            "[$([#6]-[#8].[#7])]",
+            "[$(([#6].[#8]))]",
+            "[!*]",
+        ] {
+            let query = QueryMol::from_str(smarts).unwrap();
+
+            assert!(
+                genome_from_query(&query, SmartsCompatibilityMode::PubChem).is_none(),
+                "{smarts}"
+            );
+        }
+
+        let mut editable = QueryMol::from_str("[#6]-[#6]").unwrap().edit();
+        editable
+            .replace_bond_expr(
+                0,
+                BondExpr::Query(BondExprTree::Primitive(BondPrimitive::Bond(
+                    Bond::Quadruple,
+                ))),
+            )
+            .unwrap();
+        let query = editable.into_query_mol().unwrap();
+
+        assert!(
+            genome_from_query(&query, SmartsCompatibilityMode::PubChem).is_none(),
+            "quadruple bond"
+        );
+    }
+
+    fn bracket_tree_has_negation_below_negation(
+        tree: &BracketExprTree,
+        already_negated: bool,
+    ) -> bool {
+        match tree {
+            BracketExprTree::Primitive(_) => false,
+            BracketExprTree::Not(inner) => {
+                already_negated || bracket_tree_has_negation_below_negation(inner, true)
+            }
+            BracketExprTree::HighAnd(children)
+            | BracketExprTree::Or(children)
+            | BracketExprTree::LowAnd(children) => children
+                .iter()
+                .any(|child| bracket_tree_has_negation_below_negation(child, already_negated)),
+        }
+    }
+
+    fn bracket_tree_has_wildcard_below_negation(
+        tree: &BracketExprTree,
+        already_negated: bool,
+    ) -> bool {
+        match tree {
+            BracketExprTree::Primitive(AtomPrimitive::Wildcard) => already_negated,
+            BracketExprTree::Primitive(_) => false,
+            BracketExprTree::Not(inner) => bracket_tree_has_wildcard_below_negation(inner, true),
+            BracketExprTree::HighAnd(children)
+            | BracketExprTree::Or(children)
+            | BracketExprTree::LowAnd(children) => children
+                .iter()
+                .any(|child| bracket_tree_has_wildcard_below_negation(child, already_negated)),
+        }
+    }
+
+    #[test]
     fn reset_pool_restarts_from_seed_and_applies_variation() {
         let mutator = SmartsMutation {
             mutation_rate: 1.0,
@@ -2538,6 +3173,7 @@ mod tests {
             reset_probability: 1.0,
             max_mutation_steps: 1,
             attempt_budget: 128,
+            smarts_compatibility: SmartsCompatibilityMode::Full,
         };
 
         for seed in 0..16 {

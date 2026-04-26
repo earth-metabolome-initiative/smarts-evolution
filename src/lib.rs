@@ -25,6 +25,7 @@ pub use fitness::evaluator::{
     FoldSample, LabeledCorpus, SmartsEvaluator,
 };
 pub use genome::SmartsGenome;
+pub use genome::compatibility::SmartsCompatibilityMode;
 pub use genome::seed::SeedCorpus;
 #[cfg(feature = "std")]
 pub use logging::{FileLogConfig, FileLogInitError, LevelFilter, init_file_logger};

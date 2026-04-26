@@ -1,6 +1,8 @@
 use alloc::string::String;
 use core::time::Duration;
 
+use crate::genome::compatibility::SmartsCompatibilityMode;
+
 const DEFAULT_POPULATION_SIZE: usize = 200;
 const DEFAULT_GENERATION_LIMIT: u64 = 500;
 const DEFAULT_MUTATION_RATE: f64 = 0.85;
@@ -29,6 +31,7 @@ pub struct EvolutionConfig {
     rng_seed: Option<u64>,
     fitness_cache_capacity: usize,
     max_evaluation_smarts_len: Option<usize>,
+    smarts_compatibility: SmartsCompatibilityMode,
     match_time_limit: Option<Duration>,
     slow_evaluation_log_threshold: Option<Duration>,
 }
@@ -48,6 +51,7 @@ pub struct EvolutionConfigBuilder {
     rng_seed: Option<u64>,
     fitness_cache_capacity: usize,
     max_evaluation_smarts_len: Option<usize>,
+    smarts_compatibility: SmartsCompatibilityMode,
     match_time_limit: Option<Duration>,
     slow_evaluation_log_threshold: Option<Duration>,
 }
@@ -73,6 +77,7 @@ impl Default for EvolutionConfigBuilder {
             rng_seed: None,
             fitness_cache_capacity: DEFAULT_FITNESS_CACHE_CAPACITY,
             max_evaluation_smarts_len: None,
+            smarts_compatibility: SmartsCompatibilityMode::Full,
             match_time_limit: Some(DEFAULT_MATCH_TIME_LIMIT),
             slow_evaluation_log_threshold: Some(DEFAULT_SLOW_EVALUATION_LOG_THRESHOLD),
         }
@@ -196,6 +201,20 @@ impl EvolutionConfig {
         self.max_evaluation_smarts_len
     }
 
+    /// SMARTS compatibility profile used by mutation and crossover.
+    pub fn smarts_compatibility(&self) -> SmartsCompatibilityMode {
+        self.smarts_compatibility
+    }
+
+    /// Whether generated SMARTS are restricted to the conservative
+    /// PubChem-oriented compatibility profile.
+    ///
+    /// See [`EvolutionConfigBuilder::pubchem_compatible_smarts`] for the
+    /// detailed list of generation restrictions.
+    pub fn pubchem_compatible_smarts(&self) -> bool {
+        self.smarts_compatibility.pubchem_compatible()
+    }
+
     pub fn match_time_limit(&self) -> Option<Duration> {
         self.match_time_limit
     }
@@ -271,6 +290,61 @@ impl EvolutionConfigBuilder {
         self
     }
 
+    /// Select the SMARTS compatibility profile used by mutation and crossover.
+    ///
+    /// The default is [`SmartsCompatibilityMode::Full`], which allows the full
+    /// SMARTS feature set accepted by `smarts-rs` and only applies the normal
+    /// GA validity and length limits.
+    ///
+    /// [`SmartsCompatibilityMode::PubChem`] switches generation to the
+    /// conservative PubChem-oriented profile documented in
+    /// `docs/pubchem-smarts-compatibility.md`.
+    pub fn smarts_compatibility(mut self, mode: SmartsCompatibilityMode) -> Self {
+        self.smarts_compatibility = mode;
+        self
+    }
+
+    /// Enable or disable PubChem-compatible SMARTS generation.
+    ///
+    /// This is a convenience wrapper around [`Self::smarts_compatibility`].
+    /// Passing `true` sets [`SmartsCompatibilityMode::PubChem`]; passing
+    /// `false` restores [`SmartsCompatibilityMode::Full`].
+    ///
+    /// When enabled, mutation and crossover reject generated children whose
+    /// canonical SMARTS contain constructs that PubChem PUG-REST or
+    /// PubChem-oriented tooling reject or mishandle. The suppressed constructs
+    /// include, among others:
+    ///
+    /// - numeric ranges such as `[D{2-4}]`
+    /// - smarts-rs extension predicates such as hybridization `^`,
+    ///   hetero-neighbor `z`, and aliphatic hetero-neighbor `Z`
+    /// - implicit lowercase hydrogen `h`
+    /// - bare valence `v` without an exact numeric value
+    /// - element-symbol forms observed to fail PubChem-oriented validation,
+    ///   while atomic-number forms remain allowed
+    /// - atom maps above `999`
+    /// - disconnected recursive SMARTS
+    /// - nested atom or bond negation
+    /// - wildcard atoms below atom negation, such as `[!*]`
+    /// - canonical bracket forms that PubChem rejects, such as leading bare
+    ///   negative charge `[-...]` and leading chirality `[@...]`
+    /// - allene chirality `@AL`, because current canonicalization emits a
+    ///   PubChem-failing boolean form
+    /// - quadruple bonds and isotope wildcard masses above `255`
+    ///
+    /// This profile is intentionally conservative. It does not prove that every
+    /// generated SMARTS will return PubChem hits or avoid PubChem search-time
+    /// failures for very complex queries; it only avoids the unsupported syntax
+    /// and serialization classes currently known to the GA.
+    pub fn pubchem_compatible_smarts(mut self, enabled: bool) -> Self {
+        self.smarts_compatibility = if enabled {
+            SmartsCompatibilityMode::PubChem
+        } else {
+            SmartsCompatibilityMode::Full
+        };
+        self
+    }
+
     pub fn match_time_limit(mut self, threshold: Duration) -> Self {
         self.match_time_limit = Some(threshold);
         self
@@ -311,6 +385,7 @@ impl EvolutionConfigBuilder {
             rng_seed: self.rng_seed,
             fitness_cache_capacity: self.fitness_cache_capacity,
             max_evaluation_smarts_len: self.max_evaluation_smarts_len,
+            smarts_compatibility: self.smarts_compatibility,
             match_time_limit: self.match_time_limit,
             slow_evaluation_log_threshold: self.slow_evaluation_log_threshold,
         }
@@ -326,6 +401,8 @@ mod tests {
         let config = EvolutionConfig::default();
         assert!(config.validate().is_ok());
         assert_eq!(config.max_evaluation_smarts_len(), None);
+        assert_eq!(config.smarts_compatibility(), SmartsCompatibilityMode::Full);
+        assert!(!config.pubchem_compatible_smarts());
         assert_eq!(config.match_time_limit(), Some(DEFAULT_MATCH_TIME_LIMIT));
         assert_eq!(
             config.slow_evaluation_log_threshold(),
@@ -430,6 +507,7 @@ mod tests {
             .rng_seed(7)
             .fitness_cache_capacity(1234)
             .max_evaluation_smarts_len(256)
+            .smarts_compatibility(SmartsCompatibilityMode::PubChem)
             .match_time_limit(Duration::from_millis(100))
             .slow_evaluation_log_threshold(Duration::from_millis(250))
             .build()
@@ -438,6 +516,11 @@ mod tests {
         assert_eq!(config.rng_seed(), Some(7));
         assert_eq!(config.fitness_cache_capacity(), 1234);
         assert_eq!(config.max_evaluation_smarts_len(), Some(256));
+        assert_eq!(
+            config.smarts_compatibility(),
+            SmartsCompatibilityMode::PubChem
+        );
+        assert!(config.pubchem_compatible_smarts());
         assert_eq!(config.match_time_limit(), Some(Duration::from_millis(100)));
         assert_eq!(
             config.slow_evaluation_log_threshold(),
@@ -447,11 +530,13 @@ mod tests {
         let config = EvolutionConfig::builder()
             .max_evaluation_smarts_len(10)
             .no_max_evaluation_smarts_len()
+            .pubchem_compatible_smarts(false)
             .disable_match_time_limit()
             .disable_slow_evaluation_logging()
             .build()
             .unwrap();
         assert_eq!(config.max_evaluation_smarts_len(), None);
+        assert_eq!(config.smarts_compatibility(), SmartsCompatibilityMode::Full);
         assert_eq!(config.match_time_limit(), None);
         assert_eq!(config.slow_evaluation_log_threshold(), None);
     }

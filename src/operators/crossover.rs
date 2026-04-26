@@ -7,6 +7,7 @@ use rand::prelude::IndexedRandom;
 use smarts_rs::QueryMol;
 
 use crate::genome::SmartsGenome;
+use crate::genome::compatibility::SmartsCompatibilityMode;
 use crate::genome::limits::MAX_CROSSOVER_CHILD_SMARTS_LEN;
 
 /// SMARTS-aware crossover operator.
@@ -17,11 +18,30 @@ use crate::genome::limits::MAX_CROSSOVER_CHILD_SMARTS_LEN;
 #[derive(Clone, Debug)]
 pub struct SmartsCrossover {
     crossover_rate: f64,
+    smarts_compatibility: SmartsCompatibilityMode,
 }
 
 impl SmartsCrossover {
     pub fn new(crossover_rate: f64) -> Self {
-        Self { crossover_rate }
+        Self {
+            crossover_rate,
+            smarts_compatibility: SmartsCompatibilityMode::Full,
+        }
+    }
+
+    #[must_use]
+    pub fn with_smarts_compatibility(mut self, mode: SmartsCompatibilityMode) -> Self {
+        self.smarts_compatibility = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_pubchem_compatible_smarts(self, enabled: bool) -> Self {
+        self.with_smarts_compatibility(if enabled {
+            SmartsCompatibilityMode::PubChem
+        } else {
+            SmartsCompatibilityMode::Full
+        })
     }
 
     pub fn crossover_pair<R>(
@@ -47,10 +67,26 @@ impl SmartsCrossover {
             return (parent_a.clone(), parent_b.clone());
         };
 
-        let c1 = build_spliced_child(query_a, anchor_a, child_a, query_b, child_b, &subtree_b)
-            .unwrap_or_else(|| parent_a.clone());
-        let c2 = build_spliced_child(query_b, anchor_b, child_b, query_a, child_a, &subtree_a)
-            .unwrap_or_else(|| parent_b.clone());
+        let c1 = build_spliced_child(
+            query_a,
+            anchor_a,
+            child_a,
+            query_b,
+            child_b,
+            &subtree_b,
+            self.smarts_compatibility,
+        )
+        .unwrap_or_else(|| parent_a.clone());
+        let c2 = build_spliced_child(
+            query_b,
+            anchor_b,
+            child_b,
+            query_a,
+            child_a,
+            &subtree_a,
+            self.smarts_compatibility,
+        )
+        .unwrap_or_else(|| parent_b.clone());
 
         (c1, c2)
     }
@@ -90,6 +126,7 @@ fn build_spliced_child(
     donor: &QueryMol,
     donor_child: usize,
     donor_subtree: &[usize],
+    compatibility: SmartsCompatibilityMode,
 ) -> Option<SmartsGenome> {
     let fragment = donor.clone_subgraph(donor_subtree).ok()?;
     let fragment_root = donor_subtree
@@ -101,12 +138,18 @@ fn build_spliced_child(
         .replace_subtree(recipient_anchor, recipient_child, &fragment, fragment_root)
         .ok()?;
     let query = editable.into_query_mol().ok()?;
-    genome_from_query(&query)
+    genome_from_query(&query, compatibility)
 }
 
-fn genome_from_query(query: &QueryMol) -> Option<SmartsGenome> {
+fn genome_from_query(
+    query: &QueryMol,
+    compatibility: SmartsCompatibilityMode,
+) -> Option<SmartsGenome> {
     let genome = SmartsGenome::from_query_mol(query);
-    (genome.smarts_len() <= MAX_CROSSOVER_CHILD_SMARTS_LEN && genome.is_valid()).then_some(genome)
+    (genome.smarts_len() <= MAX_CROSSOVER_CHILD_SMARTS_LEN
+        && genome.is_valid()
+        && compatibility.allows_query(genome.query()))
+    .then_some(genome)
 }
 
 #[cfg(test)]

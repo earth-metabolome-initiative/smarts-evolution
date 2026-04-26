@@ -120,6 +120,7 @@ fn build_config(input: &EvolutionConfigInput) -> Result<EvolutionConfig, String>
         .elite_count(input.elite_count())
         .random_immigrant_ratio(input.random_immigrant_ratio())
         .stagnation_limit(input.stagnation_limit())
+        .pubchem_compatible_smarts(input.pubchem_compatible_smarts())
         .match_time_limit(WORKER_MATCH_TIME_LIMIT)
         .build()
 }

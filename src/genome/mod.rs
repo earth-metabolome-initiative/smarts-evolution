@@ -1,5 +1,6 @@
 //! SMARTS genome types, limits, and seed corpus support.
 
+pub mod compatibility;
 pub mod limits;
 pub mod pattern;
 pub mod seed;

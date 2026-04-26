@@ -9,6 +9,12 @@ const DEFAULT_TOURNAMENT_SIZE: usize = 3;
 const DEFAULT_ELITE_COUNT: usize = 4;
 const DEFAULT_RANDOM_IMMIGRANT_RATIO: f64 = 0.10;
 const DEFAULT_STAGNATION_LIMIT: u64 = 50;
+const DEFAULT_PUBCHEM_COMPATIBLE_SMARTS: bool = true;
+
+const fn default_pubchem_compatible_smarts() -> bool {
+    DEFAULT_PUBCHEM_COMPATIBLE_SMARTS
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvolutionConfigInput {
     population_size: usize,
@@ -20,6 +26,8 @@ pub struct EvolutionConfigInput {
     elite_count: usize,
     random_immigrant_ratio: f64,
     stagnation_limit: u64,
+    #[serde(default = "default_pubchem_compatible_smarts")]
+    pubchem_compatible_smarts: bool,
 }
 
 impl Default for EvolutionConfigInput {
@@ -34,6 +42,7 @@ impl Default for EvolutionConfigInput {
             elite_count: DEFAULT_ELITE_COUNT,
             random_immigrant_ratio: DEFAULT_RANDOM_IMMIGRANT_RATIO,
             stagnation_limit: DEFAULT_STAGNATION_LIMIT,
+            pubchem_compatible_smarts: DEFAULT_PUBCHEM_COMPATIBLE_SMARTS,
         }
     }
 }
@@ -73,6 +82,10 @@ impl EvolutionConfigInput {
 
     pub fn stagnation_limit(&self) -> u64 {
         self.stagnation_limit
+    }
+
+    pub fn pubchem_compatible_smarts(&self) -> bool {
+        self.pubchem_compatible_smarts
     }
 
     #[must_use]
@@ -126,6 +139,33 @@ impl EvolutionConfigInput {
     #[must_use]
     pub const fn with_stagnation_limit(mut self, stagnation_limit: u64) -> Self {
         self.stagnation_limit = stagnation_limit;
+        self
+    }
+
+    /// Enable or disable PubChem-compatible SMARTS generation in the web worker.
+    ///
+    /// The web protocol defaults this flag to `true`, so browser runs generate
+    /// the conservative PubChem-oriented subset unless the request explicitly
+    /// opts out. Setting it to `false` lets the worker use the full SMARTS
+    /// feature set supported by the native GA and `smarts-rs`.
+    ///
+    /// When enabled, the worker asks the GA to suppress known PubChem-problematic
+    /// constructs during mutation and crossover, including numeric ranges,
+    /// smarts-rs extension predicates such as `^`, `z`, and `Z`, implicit
+    /// lowercase hydrogen `h`, bare valence `v`, high atom maps, disconnected
+    /// recursive SMARTS, nested negation, negated wildcard atoms, problematic
+    /// canonical leading `[-...]` or `[@...]` bracket forms, `@AL`, quadruple
+    /// bonds, and isotope wildcard masses above `255`.
+    ///
+    /// This is a generation compatibility profile, not a guarantee that every
+    /// emitted SMARTS will produce PubChem hits or avoid PubChem search-time
+    /// failures for very complex queries.
+    #[must_use]
+    pub const fn with_pubchem_compatible_smarts(
+        mut self,
+        pubchem_compatible_smarts: bool,
+    ) -> Self {
+        self.pubchem_compatible_smarts = pubchem_compatible_smarts;
         self
     }
 }

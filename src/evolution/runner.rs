@@ -813,9 +813,11 @@ impl EvolutionSession {
             population.len(),
         );
 
-        let crossover = SmartsCrossover::new(config.crossover_rate());
+        let crossover = SmartsCrossover::new(config.crossover_rate())
+            .with_smarts_compatibility(config.smarts_compatibility());
         let reset_pool = build_reset_pool(&task_seed_corpus, &population, RESET_POOL_SIZE);
-        let mutator = SmartsMutation::with_reset_pool(config.mutation_rate(), reset_pool);
+        let mutator = SmartsMutation::with_reset_pool(config.mutation_rate(), reset_pool)
+            .with_smarts_compatibility(config.smarts_compatibility());
 
         Ok(Self {
             task_id,
