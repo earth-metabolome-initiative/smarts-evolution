@@ -62,6 +62,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -496,6 +506,7 @@ dependencies = [
 name = "smarts-evolution-web-worker"
 version = "0.1.0"
 dependencies = [
+ "console_error_panic_hook",
  "getrandom",
  "js-sys",
  "serde-wasm-bindgen",
@@ -510,7 +521,7 @@ dependencies = [
 [[package]]
 name = "smarts-rs"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#3ccb272e010471a0ab2f9f6ce86013ac6a2962e4"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#0243ebaa42d00d96af913a0dfb6b2f3fcc30ff88"
 dependencies = [
  "elements_rs",
  "geometric-traits",

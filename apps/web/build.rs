@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed=../../src");
     println!("cargo:rerun-if-changed=../web-worker/Cargo.toml");
+    println!("cargo:rerun-if-changed=../web-worker/Cargo.lock");
     println!("cargo:rerun-if-changed=../web-worker/src");
     println!("cargo:rerun-if-changed=../web-protocol/src");
 

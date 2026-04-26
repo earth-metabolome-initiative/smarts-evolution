@@ -45,6 +45,8 @@ struct ActiveRun {
 /// Starts the dedicated evolution worker.
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
+    install_panic_hook();
+
     let scope = worker_scope();
     let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
         let request = match serde_wasm_bindgen::from_value::<WorkerRequest>(event.data()) {
@@ -83,6 +85,14 @@ pub fn start() -> Result<(), JsValue> {
     onmessage.forget();
     Ok(())
 }
+
+#[cfg(target_arch = "wasm32")]
+fn install_panic_hook() {
+    console_error_panic_hook::set_once();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const fn install_panic_hook() {}
 
 fn start_run(request: RunRequest) -> Result<(), String> {
     let run_id = request.run_id();
