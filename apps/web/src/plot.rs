@@ -118,8 +118,8 @@ fn candidate_tooltip(tooltip: &ScatterTooltip) -> Element {
                 span { class: "plot-tooltip-value", {format!("{:.3}", tooltip.candidate.mcc())} }
             }
             div { class: "plot-tooltip-row",
-                span { class: "plot-tooltip-label", "SMARTS length" }
-                span { class: "plot-tooltip-value", {tooltip.candidate.smarts_len().to_string()} }
+                span { class: "plot-tooltip-label", "Coverage" }
+                span { class: "plot-tooltip-value", {format!("{:.3}", tooltip.candidate.coverage_score())} }
             }
             p { class: "plot-tooltip-smarts", {tooltip.candidate.smarts()} }
         }
@@ -177,7 +177,7 @@ fn compare_ranked_candidates(left: &RankedCandidate, right: &RankedCandidate) ->
         .mcc()
         .partial_cmp(&left.mcc())
         .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| left.smarts_len().cmp(&right.smarts_len()))
+        .then_with(|| right.coverage_score().total_cmp(&left.coverage_score()))
         .then_with(|| left.smarts().cmp(right.smarts()))
 }
 
@@ -457,16 +457,16 @@ mod tests {
     use super::{RankedCandidate, compare_ranked_candidates};
 
     #[test]
-    fn ranked_candidate_order_prefers_lower_smarts_len_ties() {
-        let simpler = RankedCandidate::new("[#6]", 0.8124, 1);
-        let longer = RankedCandidate::new("[N]", 0.8124, 2);
-        assert!(compare_ranked_candidates(&simpler, &longer).is_lt());
+    fn ranked_candidate_order_prefers_higher_coverage_ties() {
+        let lower_coverage = RankedCandidate::new("[#6]", 0.8124, 4, 0.25);
+        let higher_coverage = RankedCandidate::new("[#6]~[#7]", 0.8124, 9, 0.80);
+        assert!(compare_ranked_candidates(&higher_coverage, &lower_coverage).is_lt());
     }
 
     #[test]
     fn ranked_candidate_order_prefers_higher_mcc() {
-        let lower_mcc = RankedCandidate::new("[#6]", 0.8000, 1);
-        let higher_mcc = RankedCandidate::new("[#6]", 0.9000, 1);
+        let lower_mcc = RankedCandidate::new("[#6]", 0.8000, 4, 0.25);
+        let higher_mcc = RankedCandidate::new("[#6]", 0.9000, 4, 0.25);
 
         assert!(compare_ranked_candidates(&higher_mcc, &lower_mcc).is_lt());
     }

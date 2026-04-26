@@ -8,8 +8,8 @@ use core::time::Duration;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use rayon::prelude::*;
 use smarts_rs::{
-    CompiledQuery, MatchLimitResult, MatchScratch, PreparedTarget, QueryMol, QueryScreen,
-    TargetCorpusIndex, TargetCorpusScratch,
+    CompiledQuery, MatchOutcome, MatchOutcomeLimitResult, MatchScratch, PreparedTarget, QueryMol,
+    QueryScreen, TargetCorpusIndex, TargetCorpusScratch,
 };
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::sync::Mutex;
@@ -202,14 +202,16 @@ pub struct EvaluatedSmarts {
     smarts: String,
     mcc: f64,
     smarts_len: usize,
+    coverage_score: f64,
 }
 
 impl EvaluatedSmarts {
-    fn new(genome: &SmartsGenome, fitness: ObjectiveFitness) -> Self {
+    fn new(genome: &SmartsGenome, evaluation: &GenomeEvaluation) -> Self {
         Self {
             smarts: genome.smarts().to_string(),
-            mcc: fitness.mcc(),
+            mcc: evaluation.fitness().mcc(),
             smarts_len: genome.smarts_len(),
+            coverage_score: evaluation.coverage_score(),
         }
     }
 
@@ -223,6 +225,10 @@ impl EvaluatedSmarts {
 
     pub fn smarts_len(&self) -> usize {
         self.smarts_len
+    }
+
+    pub fn coverage_score(&self) -> f64 {
+        self.coverage_score
     }
 }
 
@@ -271,6 +277,10 @@ impl EvaluationProgress {
         self.last().map(EvaluatedSmarts::mcc)
     }
 
+    pub fn last_coverage_score(&self) -> Option<f64> {
+        self.last().map(EvaluatedSmarts::coverage_score)
+    }
+
     pub fn best(&self) -> Option<&EvaluatedSmarts> {
         self.best.as_ref()
     }
@@ -281,6 +291,10 @@ impl EvaluationProgress {
 
     pub fn best_mcc(&self) -> Option<f64> {
         self.best().map(EvaluatedSmarts::mcc)
+    }
+
+    pub fn best_coverage_score(&self) -> Option<f64> {
+        self.best().map(EvaluatedSmarts::coverage_score)
     }
 }
 
@@ -313,10 +327,11 @@ impl ScreeningProxyFitness {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GenomeEvaluation {
     fitness: ObjectiveFitness,
     phenotype: Arc<[u64]>,
+    coverage_score: f64,
     limit_exceeded: bool,
 }
 
@@ -329,9 +344,26 @@ impl GenomeEvaluation {
         &self.phenotype
     }
 
+    pub fn coverage_score(&self) -> f64 {
+        self.coverage_score
+    }
+
     pub fn limit_exceeded(&self) -> bool {
         self.limit_exceeded
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FoldMatchSummary {
+    counts: ConfusionCounts,
+    positive_coverage_sum: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EvaluationSummary {
+    fold_counts: Vec<ConfusionCounts>,
+    phenotype: Arc<[u64]>,
+    coverage_score: f64,
 }
 
 impl fmt::Debug for SmartsEvaluator {
@@ -360,7 +392,7 @@ impl SmartsEvaluator {
         &self,
         query: &QueryMol,
         limit: EvaluationMatchLimit<'_>,
-    ) -> Result<(Vec<ConfusionCounts>, Arc<[u64]>), EvaluationFailure> {
+    ) -> Result<EvaluationSummary, EvaluationFailure> {
         let compiled =
             CompiledQuery::new(query.clone()).map_err(|_| EvaluationFailure::InvalidQuery)?;
         let screen = QueryScreen::new(compiled.query());
@@ -373,13 +405,15 @@ impl SmartsEvaluator {
         compiled: &CompiledQuery,
         screen: &QueryScreen,
         limit: EvaluationMatchLimit<'_>,
-    ) -> Result<(Vec<ConfusionCounts>, Arc<[u64]>), EvaluationFailure> {
+    ) -> Result<EvaluationSummary, EvaluationFailure> {
         let total_samples: usize = self.folds.iter().map(FoldData::len).sum();
+        let positive_count: usize = self.folds.iter().map(FoldData::positive_count).sum();
         let mut behavior_words = vec![0u64; total_samples.div_ceil(64)];
         let mut bit_index = 0usize;
         let mut fold_counts = Vec::with_capacity(self.folds.len());
+        let mut positive_coverage_sum = 0.0;
         for fold in &self.folds {
-            let counts = count_matches_in_fold(
+            let summary = count_matches_in_fold(
                 compiled,
                 screen,
                 fold,
@@ -387,9 +421,19 @@ impl SmartsEvaluator {
                 &mut bit_index,
                 limit,
             )?;
-            fold_counts.push(counts);
+            fold_counts.push(summary.counts);
+            positive_coverage_sum += summary.positive_coverage_sum;
         }
-        Ok((fold_counts, Arc::from(behavior_words)))
+        let coverage_score = if positive_count == 0 {
+            0.0
+        } else {
+            positive_coverage_sum / positive_count as f64
+        };
+        Ok(EvaluationSummary {
+            fold_counts,
+            phenotype: Arc::from(behavior_words),
+            coverage_score,
+        })
     }
 
     /// Evaluate the MCC objective for a genome.
@@ -461,22 +505,23 @@ impl SmartsEvaluator {
         genome: &SmartsGenome,
         limit: EvaluationMatchLimit<'_>,
     ) -> GenomeEvaluation {
-        let (fold_counts, phenotype) =
-            match self.fold_counts_and_behavior_for_query(genome.query(), limit) {
-                Ok(result) => result,
-                Err(failure) => {
-                    return GenomeEvaluation {
-                        fitness: ObjectiveFitness::invalid(),
-                        phenotype: Arc::from([]),
-                        limit_exceeded: failure == EvaluationFailure::LimitExceeded,
-                    };
-                }
-            };
+        let summary = match self.fold_counts_and_behavior_for_query(genome.query(), limit) {
+            Ok(result) => result,
+            Err(failure) => {
+                return GenomeEvaluation {
+                    fitness: ObjectiveFitness::invalid(),
+                    phenotype: Arc::from([]),
+                    coverage_score: 0.0,
+                    limit_exceeded: failure == EvaluationFailure::LimitExceeded,
+                };
+            }
+        };
 
-        let mcc = compute_fold_averaged_mcc(&fold_counts);
+        let mcc = compute_fold_averaged_mcc(&summary.fold_counts);
         GenomeEvaluation {
             fitness: ObjectiveFitness::from_mcc(mcc),
-            phenotype,
+            phenotype: summary.phenotype,
+            coverage_score: summary.coverage_score,
             limit_exceeded: false,
         }
     }
@@ -663,10 +708,8 @@ impl SmartsEvaluator {
                 .map(|genome| {
                     let evaluation = self.evaluate_with_logging(&genome, settings);
                     match progress_state.lock() {
-                        Ok(mut progress) => progress.record(&genome, evaluation.fitness()),
-                        Err(poisoned) => {
-                            poisoned.into_inner().record(&genome, evaluation.fitness())
-                        }
+                        Ok(mut progress) => progress.record(&genome, &evaluation),
+                        Err(poisoned) => poisoned.into_inner().record(&genome, &evaluation),
                     }
                     (genome, evaluation)
                 })
@@ -682,7 +725,7 @@ impl SmartsEvaluator {
                     #[cfg(target_arch = "wasm32")]
                     now_ms,
                 );
-                progress.record(&genome, evaluation.fitness());
+                progress.record(&genome, &evaluation);
                 (genome, evaluation)
             })
             .collect()
@@ -723,8 +766,8 @@ where
         (self.on_progress)(EvaluationProgress::new(0, self.total, None, None));
     }
 
-    fn record(&mut self, genome: &SmartsGenome, fitness: ObjectiveFitness) {
-        let last = EvaluatedSmarts::new(genome, fitness);
+    fn record(&mut self, genome: &SmartsGenome, evaluation: &GenomeEvaluation) {
+        let last = EvaluatedSmarts::new(genome, evaluation);
         update_best_evaluated(&mut self.best, &last);
         self.completed += 1;
         (self.on_progress)(EvaluationProgress::new(
@@ -811,9 +854,14 @@ fn update_best_evaluated(best: &mut Option<EvaluatedSmarts>, candidate: &Evaluat
 fn evaluated_is_better(candidate: &EvaluatedSmarts, current: &EvaluatedSmarts) -> bool {
     candidate.mcc() > current.mcc()
         || (candidate.mcc() == current.mcc()
-            && (candidate.smarts_len() < current.smarts_len()
-                || (candidate.smarts_len() == current.smarts_len()
-                    && candidate.smarts() < current.smarts())))
+            && match candidate
+                .coverage_score()
+                .total_cmp(&current.coverage_score())
+            {
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Equal => candidate.smarts() < current.smarts(),
+                core::cmp::Ordering::Less => false,
+            })
 }
 
 fn count_matches_in_fold(
@@ -823,7 +871,7 @@ fn count_matches_in_fold(
     behavior_words: &mut [u64],
     bit_index: &mut usize,
     limit: EvaluationMatchLimit<'_>,
-) -> Result<ConfusionCounts, EvaluationFailure> {
+) -> Result<FoldMatchSummary, EvaluationFailure> {
     let fold_start_bit_index = *bit_index;
     *bit_index += fold.len();
 
@@ -835,85 +883,89 @@ fn count_matches_in_fold(
     let mut match_scratch = MatchScratch::new();
     let mut true_positives = 0u64;
     let mut false_positives = 0u64;
+    let mut positive_coverage_sum = 0.0;
 
     for target_id in candidates {
         let sample = &fold.samples()[target_id];
-        let matched = match match_with_limit(query, sample.target(), &mut match_scratch, limit) {
-            MatchLimitResult::Complete(matched) => matched,
-            MatchLimitResult::Exceeded => return Err(EvaluationFailure::LimitExceeded),
-        };
-        if !matched {
+        let outcome = match_outcome_with_limit(query, sample.target(), &mut match_scratch, limit)?;
+        if !outcome.matched {
             continue;
         }
 
         record_behavior_match(behavior_words, fold_start_bit_index + target_id, true);
         if sample.is_positive() {
             true_positives += 1;
+            positive_coverage_sum += outcome.coverage;
         } else {
             false_positives += 1;
         }
     }
 
-    Ok(ConfusionCounts::new(
-        true_positives,
-        false_positives,
-        fold.negative_count() as u64 - false_positives,
-        fold.positive_count() as u64 - true_positives,
-    ))
+    Ok(FoldMatchSummary {
+        counts: ConfusionCounts::new(
+            true_positives,
+            false_positives,
+            fold.negative_count() as u64 - false_positives,
+            fold.positive_count() as u64 - true_positives,
+        ),
+        positive_coverage_sum,
+    })
 }
 
-fn match_with_limit(
+fn match_outcome_with_limit(
     query: &CompiledQuery,
     target: &PreparedTarget,
     scratch: &mut MatchScratch,
     limit: EvaluationMatchLimit<'_>,
-) -> MatchLimitResult {
+) -> Result<MatchOutcome, EvaluationFailure> {
     match limit {
-        EvaluationMatchLimit::None => {
-            MatchLimitResult::Complete(query.matches_with_scratch(target, scratch))
-        }
+        EvaluationMatchLimit::None => Ok(query.match_outcome_with_scratch(target, scratch)),
         EvaluationMatchLimit::Configured {
             max_elapsed,
             #[cfg(target_arch = "wasm32")]
             now_ms,
             #[cfg(not(target_arch = "wasm32"))]
                 _marker: _,
-        } => match_with_configured_limit(
+        } => match match_outcome_with_configured_limit(
             query,
             target,
             scratch,
             max_elapsed,
             #[cfg(target_arch = "wasm32")]
             now_ms,
-        ),
+        ) {
+            MatchOutcomeLimitResult::Complete(outcome) => Ok(outcome),
+            MatchOutcomeLimitResult::Exceeded => Err(EvaluationFailure::LimitExceeded),
+        },
     }
 }
 
-fn match_with_configured_limit(
+fn match_outcome_with_configured_limit(
     query: &CompiledQuery,
     target: &PreparedTarget,
     scratch: &mut MatchScratch,
     max_elapsed: Duration,
     #[cfg(target_arch = "wasm32")] now_ms: Option<&dyn Fn() -> f64>,
-) -> MatchLimitResult {
+) -> MatchOutcomeLimitResult {
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     {
-        query.matches_with_scratch_and_time_limit(target, scratch, max_elapsed)
+        query.match_outcome_with_scratch_and_time_limit(target, scratch, max_elapsed)
     }
 
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(now_ms) = now_ms {
             let deadline_ms = now_ms() + max_elapsed.as_secs_f64() * 1_000.0;
-            return query
-                .matches_with_scratch_and_interrupt(target, scratch, || now_ms() >= deadline_ms);
+            return query.match_outcome_with_scratch_and_interrupt(target, scratch, || {
+                now_ms() >= deadline_ms
+            });
         }
     }
 
     #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
     {
         let _ = max_elapsed;
-        MatchLimitResult::Complete(query.matches_with_scratch(target, scratch))
+        MatchOutcomeLimitResult::Complete(query.match_outcome_with_scratch(target, scratch))
     }
 }
 
@@ -977,7 +1029,7 @@ mod tests {
         let mut behavior = vec![0u64; 1];
         let mut bit_index = 0usize;
 
-        let counts = count_matches_in_fold(
+        let summary = count_matches_in_fold(
             &compiled,
             &screen,
             &fold,
@@ -986,8 +1038,33 @@ mod tests {
             EvaluationMatchLimit::None,
         );
 
-        assert_eq!(counts, Ok(ConfusionCounts::new(1, 1, 1, 1)));
+        assert_eq!(
+            summary,
+            Ok(FoldMatchSummary {
+                counts: ConfusionCounts::new(1, 1, 1, 1),
+                positive_coverage_sum: 1.0,
+            })
+        );
         assert_eq!(behavior[0], 0b0011);
+    }
+
+    #[test]
+    fn evaluator_scores_positive_match_coverage() {
+        let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
+            sample("CN", true),
+            sample("CCN", true),
+            sample("CC", false),
+        ])]);
+        let atom = SmartsGenome::from_smarts("[#7]").unwrap();
+        let bond = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+
+        let atom_eval = evaluator.evaluate(&atom);
+        let bond_eval = evaluator.evaluate(&bond);
+
+        assert_eq!(atom_eval.fitness(), bond_eval.fitness());
+        assert!((atom_eval.coverage_score() - (4.0 / 15.0)).abs() < 1e-12);
+        assert!((bond_eval.coverage_score() - 0.8).abs() < 1e-12);
+        assert!(bond_eval.coverage_score() > atom_eval.coverage_score());
     }
 
     #[test]
@@ -1127,9 +1204,11 @@ mod tests {
                     && progress.last().is_some()
                     && progress.last_smarts().is_some()
                     && progress.last_mcc().is_some_and(f64::is_finite)
+                    && progress.last_coverage_score().is_some_and(f64::is_finite)
                     && progress.best().is_some()
                     && progress.best_smarts().is_some()
-                    && progress.best_mcc().is_some_and(f64::is_finite))
+                    && progress.best_mcc().is_some_and(f64::is_finite)
+                    && progress.best_coverage_score().is_some_and(f64::is_finite))
         );
     }
 

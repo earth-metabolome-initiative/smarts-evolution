@@ -11,7 +11,7 @@ use log::{debug, info, warn};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
-use smarts_rs::BondLabel;
+use smarts_rs::{BondLabel, CompiledQuery, PreparedTarget, QueryMol};
 
 use super::config::EvolutionConfig;
 use crate::fitness::evaluator::{
@@ -84,6 +84,7 @@ impl EvaluationRejectionCounts {
 struct CachedEvaluation {
     fitness: ObjectiveFitness,
     phenotype: Arc<[u64]>,
+    coverage_score: f64,
     stamp: u64,
 }
 
@@ -104,7 +105,7 @@ impl FitnessCache {
         }
     }
 
-    fn get(&mut self, key: &Arc<str>) -> Option<(ObjectiveFitness, Arc<[u64]>)> {
+    fn get(&mut self, key: &Arc<str>) -> Option<(ObjectiveFitness, Arc<[u64]>, f64)> {
         if self.capacity == 0 {
             return None;
         }
@@ -113,14 +114,24 @@ impl FitnessCache {
         let evaluation = {
             let cached = self.entries.get_mut(key)?;
             cached.stamp = stamp;
-            (cached.fitness, cached.phenotype.clone())
+            (
+                cached.fitness,
+                cached.phenotype.clone(),
+                cached.coverage_score,
+            )
         };
         self.access_order.push_back((key.clone(), stamp));
         self.compact_if_needed();
         Some(evaluation)
     }
 
-    fn insert(&mut self, key: Arc<str>, fitness: ObjectiveFitness, phenotype: Arc<[u64]>) {
+    fn insert(
+        &mut self,
+        key: Arc<str>,
+        fitness: ObjectiveFitness,
+        phenotype: Arc<[u64]>,
+        coverage_score: f64,
+    ) {
         if self.capacity == 0 {
             return;
         }
@@ -131,6 +142,7 @@ impl FitnessCache {
             CachedEvaluation {
                 fitness,
                 phenotype,
+                coverage_score,
                 stamp,
             },
         );
@@ -191,6 +203,7 @@ struct ScoredGenome {
     genome: SmartsGenome,
     fitness: ObjectiveFitness,
     phenotype: Arc<[u64]>,
+    coverage_score: f64,
 }
 
 struct PreparedPopulationScores {
@@ -365,6 +378,7 @@ pub struct TaskResult {
     best_smarts: String,
     best_mcc: f64,
     best_smarts_len: usize,
+    best_coverage_score: f64,
     generations: u64,
     leaders: Vec<RankedSmarts>,
 }
@@ -386,6 +400,10 @@ impl TaskResult {
         self.best_smarts_len
     }
 
+    pub fn best_coverage_score(&self) -> f64 {
+        self.best_coverage_score
+    }
+
     pub fn generations(&self) -> u64 {
         self.generations
     }
@@ -401,22 +419,25 @@ pub struct RankedSmarts {
     smarts: String,
     mcc: f64,
     smarts_len: usize,
+    coverage_score: f64,
 }
 
 impl RankedSmarts {
-    fn new(genome: &SmartsGenome, fitness: ObjectiveFitness) -> Self {
+    fn new(genome: &SmartsGenome, fitness: ObjectiveFitness, coverage_score: f64) -> Self {
         Self::from_parts(
             genome.smarts().to_string(),
             fitness.mcc(),
             genome.smarts_len(),
+            coverage_score,
         )
     }
 
-    fn from_parts(smarts: String, mcc: f64, smarts_len: usize) -> Self {
+    fn from_parts(smarts: String, mcc: f64, smarts_len: usize, coverage_score: f64) -> Self {
         Self {
             smarts,
             mcc,
             smarts_len,
+            coverage_score,
         }
     }
 
@@ -425,7 +446,12 @@ impl RankedSmarts {
             evaluated.smarts().to_string(),
             evaluated.mcc(),
             evaluated.smarts_len(),
+            evaluated.coverage_score(),
         )
+    }
+
+    fn from_scored(scored: &ScoredGenome) -> Self {
+        Self::new(&scored.genome, scored.fitness, scored.coverage_score)
     }
 
     pub fn smarts(&self) -> &str {
@@ -438,6 +464,10 @@ impl RankedSmarts {
 
     pub fn smarts_len(&self) -> usize {
         self.smarts_len
+    }
+
+    pub fn coverage_score(&self) -> f64 {
+        self.coverage_score
     }
 }
 
@@ -699,6 +729,7 @@ pub struct EvolutionSession {
     best_fitness: ObjectiveFitness,
     best_smarts: String,
     best_smarts_len: usize,
+    best_coverage_score: f64,
     stagnation: u64,
     fitness_cache: FitnessCache,
     last_leaders: Vec<RankedSmarts>,
@@ -786,6 +817,7 @@ impl EvolutionSession {
             best_fitness: ObjectiveFitness::invalid(),
             best_smarts: String::from("[#6]"),
             best_smarts_len: 0,
+            best_coverage_score: 0.0,
             stagnation: 0,
             fitness_cache: FitnessCache::new(config.fitness_cache_capacity()),
             last_leaders: Vec::new(),
@@ -983,11 +1015,12 @@ impl EvolutionSession {
             generation: generations,
             generation_limit,
             status,
-            best: RankedSmarts::new(&lead.genome, lead.fitness),
+            best: RankedSmarts::from_scored(lead),
             best_so_far: RankedSmarts {
                 smarts: self.best_smarts.clone(),
                 mcc: self.best_fitness.mcc(),
                 smarts_len: self.best_smarts_len,
+                coverage_score: self.best_coverage_score,
             },
             leaders,
             stats: &stats,
@@ -1008,6 +1041,7 @@ impl EvolutionSession {
                 self.best_smarts.clone(),
                 self.best_fitness,
                 self.best_smarts_len,
+                self.best_coverage_score,
                 generations,
                 self.last_leaders.clone(),
             ));
@@ -1026,6 +1060,7 @@ impl EvolutionSession {
                 self.best_smarts.clone(),
                 self.best_fitness,
                 self.best_smarts_len,
+                self.best_coverage_score,
                 generations,
                 self.last_leaders.clone(),
             ));
@@ -1076,16 +1111,19 @@ impl EvolutionSession {
             if let Some(rejection) = genome_evaluation_rejection(&self.config, &genome) {
                 rejection_counts.record(rejection);
                 log_rejected_genome(&self.task_id, generation, &genome, rejection);
-                let ranked = RankedSmarts::new(&genome, ObjectiveFitness::invalid());
+                let ranked = RankedSmarts::new(&genome, ObjectiveFitness::invalid(), 0.0);
                 unique_scored.push(build_rejected_scored_genome(genome));
                 evaluation_progress.record_completed(Some(ranked), on_evaluation_progress);
-            } else if let Some((fitness, phenotype)) = self.fitness_cache.get(&smarts) {
+            } else if let Some((fitness, phenotype, coverage_score)) =
+                self.fitness_cache.get(&smarts)
+            {
                 cache_hits += 1;
-                let ranked = RankedSmarts::new(&genome, fitness);
+                let ranked = RankedSmarts::new(&genome, fitness, coverage_score);
                 unique_scored.push(ScoredGenome {
                     genome,
                     fitness,
                     phenotype,
+                    coverage_score,
                 });
                 evaluation_progress.record_completed(Some(ranked), on_evaluation_progress);
             } else {
@@ -1205,14 +1243,16 @@ impl EvolutionSession {
             || is_better_candidate(
                 lead.fitness,
                 &lead.genome,
+                lead.coverage_score,
                 self.best_fitness,
-                self.best_smarts_len,
+                self.best_coverage_score,
                 &self.best_smarts,
             )
         {
             self.best_fitness = lead.fitness;
             self.best_smarts = lead.genome.smarts().to_string();
             self.best_smarts_len = lead.genome.smarts_len();
+            self.best_coverage_score = lead.coverage_score;
             self.stagnation = 0;
         } else {
             self.stagnation += 1;
@@ -1316,6 +1356,7 @@ impl EvolutionSession {
             self.best_smarts.clone(),
             self.best_fitness.mcc(),
             self.best_smarts_len,
+            self.best_coverage_score,
         )
     }
 }
@@ -1395,9 +1436,14 @@ fn update_ranked_best(best: &mut Option<RankedSmarts>, candidate: &RankedSmarts)
 fn ranked_is_better(candidate: &RankedSmarts, current: &RankedSmarts) -> bool {
     candidate.mcc() > current.mcc()
         || (candidate.mcc() == current.mcc()
-            && (candidate.smarts_len() < current.smarts_len()
-                || (candidate.smarts_len() == current.smarts_len()
-                    && candidate.smarts() < current.smarts())))
+            && match candidate
+                .coverage_score()
+                .total_cmp(&current.coverage_score())
+            {
+                Ordering::Greater => true,
+                Ordering::Equal => candidate.smarts() < current.smarts(),
+                Ordering::Less => false,
+            })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1445,6 +1491,7 @@ fn build_task_result(
     best_smarts: String,
     best_fitness: ObjectiveFitness,
     best_smarts_len: usize,
+    best_coverage_score: f64,
     generations: u64,
     leaders: Vec<RankedSmarts>,
 ) -> TaskResult {
@@ -1453,6 +1500,7 @@ fn build_task_result(
         best_smarts,
         best_mcc: best_fitness.mcc(),
         best_smarts_len,
+        best_coverage_score,
         generations,
         leaders,
     }
@@ -1465,11 +1513,18 @@ fn build_scored_genome(
 ) -> ScoredGenome {
     let phenotype = evaluation.phenotype().clone();
     let fitness = evaluation.fitness();
-    fitness_cache.insert(genome.smarts_shared().clone(), fitness, phenotype.clone());
+    let coverage_score = evaluation.coverage_score();
+    fitness_cache.insert(
+        genome.smarts_shared().clone(),
+        fitness,
+        phenotype.clone(),
+        coverage_score,
+    );
     ScoredGenome {
         genome,
         fitness,
         phenotype,
+        coverage_score,
     }
 }
 
@@ -1478,6 +1533,7 @@ fn build_rejected_scored_genome(genome: SmartsGenome) -> ScoredGenome {
         genome,
         fitness: ObjectiveFitness::invalid(),
         phenotype: Arc::from([]),
+        coverage_score: 0.0,
     }
 }
 
@@ -1620,8 +1676,12 @@ impl DatasetSeedFeature {
         }
     }
 
-    fn smarts_len(self) -> usize {
-        self.smarts().len()
+    fn constraint_rank(self) -> usize {
+        match self {
+            Self::Atom(_) => 0,
+            Self::RingAtom(_) | Self::TotalHydrogen { .. } => 1,
+            Self::Bond { bond, .. } => bond.constraint_rank(),
+        }
     }
 }
 
@@ -1654,12 +1714,20 @@ impl DatasetSeedBond {
             Self::Aromatic => ":",
         }
     }
+
+    fn constraint_rank(self) -> usize {
+        match self {
+            Self::Any => 0,
+            Self::Single | Self::Double | Self::Triple | Self::Aromatic => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct DatasetSeedFeatureCounts {
     positive_targets: u64,
     negative_targets: u64,
+    positive_coverage_sum: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1667,6 +1735,7 @@ struct DatasetSeedFeatureScore {
     mcc: f64,
     positive_targets: u64,
     negative_targets: u64,
+    positive_coverage_sum: f64,
 }
 
 fn dataset_seed_corpus(folds: &[FoldData], limit: usize) -> SeedCorpus {
@@ -1687,6 +1756,8 @@ fn dataset_seed_corpus(folds: &[FoldData], limit: usize) -> SeedCorpus {
                 let entry = counts.entry(feature).or_default();
                 if sample.is_positive() {
                     entry.positive_targets += 1;
+                    entry.positive_coverage_sum +=
+                        dataset_seed_feature_coverage(feature, sample.target());
                 } else {
                     entry.negative_targets += 1;
                 }
@@ -1710,7 +1781,7 @@ fn dataset_seed_corpus(folds: &[FoldData], limit: usize) -> SeedCorpus {
     corpus
 }
 
-fn target_dataset_seed_features(target: &smarts_rs::PreparedTarget) -> Vec<DatasetSeedFeature> {
+fn target_dataset_seed_features(target: &PreparedTarget) -> Vec<DatasetSeedFeature> {
     let mut features = BTreeSet::new();
     for atom_id in 0..target.atom_count() {
         let Some(atomic_number) = target_atomic_number(target, atom_id) else {
@@ -1759,7 +1830,7 @@ fn target_dataset_seed_features(target: &smarts_rs::PreparedTarget) -> Vec<Datas
     features.into_iter().collect()
 }
 
-fn target_atomic_number(target: &smarts_rs::PreparedTarget, atom_id: usize) -> Option<u16> {
+fn target_atomic_number(target: &PreparedTarget, atom_id: usize) -> Option<u16> {
     target
         .atom(atom_id)?
         .element()
@@ -1789,7 +1860,18 @@ fn dataset_seed_feature_score(
         mcc,
         positive_targets: counts.positive_targets,
         negative_targets: counts.negative_targets,
+        positive_coverage_sum: counts.positive_coverage_sum,
     })
+}
+
+fn dataset_seed_feature_coverage(feature: DatasetSeedFeature, target: &PreparedTarget) -> f64 {
+    let Ok(query) = feature.smarts().parse::<QueryMol>() else {
+        return 0.0;
+    };
+    let Ok(compiled) = CompiledQuery::new(query) else {
+        return 0.0;
+    };
+    compiled.match_outcome(target).coverage
 }
 
 fn compare_dataset_seed_features(
@@ -1802,7 +1884,13 @@ fn compare_dataset_seed_features(
         .total_cmp(&left.1.mcc)
         .then_with(|| right.1.positive_targets.cmp(&left.1.positive_targets))
         .then_with(|| left.1.negative_targets.cmp(&right.1.negative_targets))
-        .then_with(|| left.0.smarts_len().cmp(&right.0.smarts_len()))
+        .then_with(|| {
+            right
+                .1
+                .positive_coverage_sum
+                .total_cmp(&left.1.positive_coverage_sum)
+        })
+        .then_with(|| right.0.constraint_rank().cmp(&left.0.constraint_rank()))
         .then_with(|| left.0.cmp(&right.0))
 }
 
@@ -1855,21 +1943,25 @@ fn compare_scored_genomes(left: &ScoredGenome, right: &ScoredGenome) -> Ordering
     right
         .fitness
         .cmp(&left.fitness)
-        .then_with(|| left.genome.smarts_len().cmp(&right.genome.smarts_len()))
+        .then_with(|| right.coverage_score.total_cmp(&left.coverage_score))
         .then_with(|| left.genome.smarts().cmp(right.genome.smarts()))
 }
 
 fn is_better_candidate(
     candidate_fitness: ObjectiveFitness,
     candidate: &SmartsGenome,
+    candidate_coverage_score: f64,
     best_fitness: ObjectiveFitness,
-    best_smarts_len: usize,
+    best_coverage_score: f64,
     best_smarts: &str,
 ) -> bool {
     candidate_fitness > best_fitness
         || (candidate_fitness == best_fitness
-            && (candidate.smarts_len() < best_smarts_len
-                || (candidate.smarts_len() == best_smarts_len && candidate.smarts() < best_smarts)))
+            && match candidate_coverage_score.total_cmp(&best_coverage_score) {
+                Ordering::Greater => true,
+                Ordering::Equal => candidate.smarts() < best_smarts,
+                Ordering::Less => false,
+            })
 }
 
 fn select_screened_mutation_candidate(
@@ -1909,9 +2001,7 @@ fn screened_mutation_candidate_is_better(
         || (candidate_score.mcc() == current_score.mcc()
             && (candidate_score.negative_candidates() < current_score.negative_candidates()
                 || (candidate_score.negative_candidates() == current_score.negative_candidates()
-                    && (candidate.smarts_len() < current.smarts_len()
-                        || (candidate.smarts_len() == current.smarts_len()
-                            && candidate.smarts() < current.smarts())))))
+                    && candidate.smarts() < current.smarts())))
 }
 
 fn mutation_direction_from_counts(counts: ConfusionCounts) -> MutationDirection {
@@ -1968,7 +2058,7 @@ fn leaderboard_from_scored(scored: &[ScoredGenome], limit: usize) -> Vec<RankedS
     scored
         .iter()
         .take(limit.max(1))
-        .map(|candidate| RankedSmarts::new(&candidate.genome, candidate.fitness))
+        .map(RankedSmarts::from_scored)
         .collect()
 }
 
@@ -2074,10 +2164,20 @@ mod regression_tests {
     }
 
     fn scored(smarts: &str, mcc: f64, phenotype: &[u64]) -> ScoredGenome {
+        scored_with_coverage(smarts, mcc, 0.0, phenotype)
+    }
+
+    fn scored_with_coverage(
+        smarts: &str,
+        mcc: f64,
+        coverage_score: f64,
+        phenotype: &[u64],
+    ) -> ScoredGenome {
         ScoredGenome {
             genome: SmartsGenome::from_smarts(smarts).unwrap(),
             fitness: fitness(mcc),
             phenotype: Arc::from(phenotype.to_vec()),
+            coverage_score,
         }
     }
 
@@ -2562,7 +2662,11 @@ mod regression_tests {
 
         assert!(smarts.contains(&"[#7]"));
         assert!(smarts.contains(&"[#6]~[#7]"));
+        assert!(smarts.contains(&"[#6]-[#7]"));
         assert!(!smarts.contains(&"[#8]"));
+
+        let top = dataset_seed_corpus(&folds, 1);
+        assert_eq!(top.entries()[0].smarts(), "[#6]-[#7]");
     }
 
     #[test]
@@ -2585,21 +2689,21 @@ mod regression_tests {
     }
 
     #[test]
-    fn lower_smarts_len_smarts_win_when_scores_tie() {
-        let simple = scored("[#6]", 0.75, &[0b0001]);
-        let longer = scored("[#6]~[#7]", 0.75, &[0b0010]);
+    fn higher_coverage_wins_when_scores_tie() {
+        let simple = scored_with_coverage("[#6]", 0.75, 0.30, &[0b0001]);
+        let broader = scored_with_coverage("[#6]~[#7]", 0.75, 0.80, &[0b0010]);
 
-        assert!(simple.genome.smarts_len() < longer.genome.smarts_len());
-
-        assert!(compare_scored_genomes(&simple, &longer).is_lt());
-        assert!(compare_scored_genomes(&longer, &simple).is_gt());
+        assert!(simple.genome.smarts_len() < broader.genome.smarts_len());
+        assert!(broader.coverage_score > simple.coverage_score);
+        assert!(compare_scored_genomes(&broader, &simple).is_lt());
+        assert!(compare_scored_genomes(&simple, &broader).is_gt());
     }
 
     #[test]
     fn phenotypic_dedup_keeps_best_representative_for_same_behavior() {
         let deduped = phenotypically_deduplicate(vec![
-            scored("[#6]~[#7]", 0.80, &[0b0101]),
-            scored("[#6]", 0.80, &[0b0101]),
+            scored_with_coverage("[#6]~[#7]", 0.80, 0.80, &[0b0101]),
+            scored_with_coverage("[#6]", 0.80, 0.30, &[0b0101]),
             scored("[#8]", 0.70, &[0b0011]),
         ]);
         let mut smarts = deduped
@@ -2608,7 +2712,7 @@ mod regression_tests {
             .collect::<Vec<_>>();
         smarts.sort_unstable();
 
-        assert_eq!(smarts, vec!["[#6]", "[#8]"]);
+        assert_eq!(smarts, vec!["[#6]~[#7]", "[#8]"]);
     }
 
     #[test]
@@ -2683,10 +2787,10 @@ mod regression_tests {
         let b: Arc<str> = "[#7]".into();
         let c: Arc<str> = "[#8]".into();
 
-        cache.insert(a.clone(), fitness(0.8), Arc::from([0b0001u64]));
-        cache.insert(b.clone(), fitness(0.7), Arc::from([0b0010u64]));
+        cache.insert(a.clone(), fitness(0.8), Arc::from([0b0001u64]), 0.8);
+        cache.insert(b.clone(), fitness(0.7), Arc::from([0b0010u64]), 0.7);
         assert!(cache.get(&a).is_some());
-        cache.insert(c.clone(), fitness(0.6), Arc::from([0b0100u64]));
+        cache.insert(c.clone(), fitness(0.6), Arc::from([0b0100u64]), 0.6);
 
         assert_eq!(cache.len(), 2);
         assert!(cache.get(&a).is_some());
@@ -2698,13 +2802,13 @@ mod regression_tests {
     fn fitness_cache_zero_capacity_and_compaction_paths_are_safe() {
         let mut cache = FitnessCache::new(0);
         let key: Arc<str> = "[#6]".into();
-        cache.insert(key.clone(), fitness(0.8), Arc::from([0b1u64]));
+        cache.insert(key.clone(), fitness(0.8), Arc::from([0b1u64]), 0.8);
         assert!(cache.get(&key).is_none());
         assert_eq!(cache.len(), 0);
 
         let mut cache = FitnessCache::new(1);
         let key: Arc<str> = "[#7]".into();
-        cache.insert(key.clone(), fitness(0.7), Arc::from([0b10u64]));
+        cache.insert(key.clone(), fitness(0.7), Arc::from([0b10u64]), 0.7);
         for _ in 0..1100 {
             assert!(cache.get(&key).is_some());
         }
@@ -2714,10 +2818,11 @@ mod regression_tests {
     #[test]
     fn public_accessors_and_display_helpers_round_trip() {
         let genome = SmartsGenome::from_smarts("[#6]").unwrap();
-        let ranked = RankedSmarts::new(&genome, fitness(0.5));
+        let ranked = RankedSmarts::new(&genome, fitness(0.5), 0.42);
         assert_eq!(ranked.smarts(), "[#6]");
         assert_eq!(ranked.mcc(), 0.5);
         assert_eq!(ranked.smarts_len(), genome.smarts_len());
+        assert_eq!(ranked.coverage_score(), 0.42);
 
         let stats = GenerationStats {
             unique_count: 2,
@@ -2793,6 +2898,7 @@ mod regression_tests {
             "[#7]".to_string(),
             fitness(0.75),
             11,
+            0.87,
             4,
             vec![ranked],
         );
@@ -2800,6 +2906,7 @@ mod regression_tests {
         assert_eq!(result.best_smarts(), "[#7]");
         assert_eq!(result.best_mcc(), 0.75);
         assert_eq!(result.best_smarts_len(), 11);
+        assert_eq!(result.best_coverage_score(), 0.87);
         assert_eq!(result.generations(), 4);
         assert_eq!(result.leaders().len(), 1);
 
@@ -2817,31 +2924,33 @@ mod regression_tests {
         assert_eq!(rng_a.random::<u64>(), rng_b.random::<u64>());
 
         let simple = SmartsGenome::from_smarts("[#6]").unwrap();
-        let longer = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
-        assert!(simple.smarts_len() < longer.smarts_len());
-        assert!(is_better_candidate(
-            fitness(0.5),
-            &simple,
-            fitness(0.5),
-            longer.smarts_len(),
-            longer.smarts(),
-        ));
+        let higher_coverage = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+        assert!(simple.smarts_len() < higher_coverage.smarts_len());
         assert!(!is_better_candidate(
             fitness(0.5),
-            &longer,
+            &simple,
+            0.30,
             fitness(0.5),
-            simple.smarts_len(),
+            0.80,
+            higher_coverage.smarts(),
+        ));
+        assert!(is_better_candidate(
+            fitness(0.5),
+            &higher_coverage,
+            0.80,
+            fitness(0.5),
+            0.30,
             simple.smarts(),
         ));
 
         let alpha = SmartsGenome::from_smarts("[#6]").unwrap();
         let beta = SmartsGenome::from_smarts("[#7]").unwrap();
-        assert_eq!(alpha.smarts_len(), beta.smarts_len());
         assert!(is_better_candidate(
             fitness(0.5),
             &alpha,
+            0.50,
             fitness(0.5),
-            beta.smarts_len(),
+            0.50,
             beta.smarts(),
         ));
 

@@ -260,6 +260,7 @@ fn completed_run_from_result(run_id: u64, result: &TaskResult) -> CompletedRun {
             result.best_smarts(),
             result.best_mcc(),
             result.best_smarts_len(),
+            result.best_coverage_score(),
         ),
         result.leaders().iter().map(ranked_candidate).collect(),
         result.generations(),
@@ -409,7 +410,12 @@ fn drive_active_run() {
 }
 
 fn ranked_candidate(candidate: &RankedSmarts) -> RankedCandidate {
-    RankedCandidate::new(candidate.smarts(), candidate.mcc(), candidate.smarts_len())
+    RankedCandidate::new(
+        candidate.smarts(),
+        candidate.mcc(),
+        candidate.smarts_len(),
+        candidate.coverage_score(),
+    )
 }
 
 const fn run_status(status: EvolutionStatus) -> RunStatus {

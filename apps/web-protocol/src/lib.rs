@@ -189,14 +189,21 @@ pub struct RankedCandidate {
     smarts: String,
     mcc: f64,
     smarts_len: usize,
+    coverage_score: f64,
 }
 
 impl RankedCandidate {
-    pub fn new(smarts: impl Into<String>, mcc: f64, smarts_len: usize) -> Self {
+    pub fn new(
+        smarts: impl Into<String>,
+        mcc: f64,
+        smarts_len: usize,
+        coverage_score: f64,
+    ) -> Self {
         Self {
             smarts: smarts.into(),
             mcc,
             smarts_len,
+            coverage_score,
         }
     }
 
@@ -210,6 +217,10 @@ impl RankedCandidate {
 
     pub fn smarts_len(&self) -> usize {
         self.smarts_len
+    }
+
+    pub fn coverage_score(&self) -> f64 {
+        self.coverage_score
     }
 }
 

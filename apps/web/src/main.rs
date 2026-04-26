@@ -953,7 +953,7 @@ fn App() -> Element {
                             if let Some(best) = best {
                                 div { class: "stats-grid",
                                     {stat_card("Best MCC", format!("{:.3}", best.mcc()))}
-                                    {stat_card("SMARTS length", best.smarts_len().to_string())}
+                                    {stat_card("Coverage", format!("{:.3}", best.coverage_score()))}
                                     if let Some(stagnation) = last_stagnation {
                                         {stat_card("No improvement", stagnation.to_string())}
                                     }
@@ -1051,7 +1051,7 @@ fn App() -> Element {
                                             th { "#" }
                                             th { "SMARTS" }
                                             th { "MCC" }
-                                            th { "SMARTS length" }
+                                            th { "Coverage" }
                                         }
                                     }
                                     tbody {
@@ -1061,7 +1061,7 @@ fn App() -> Element {
                                                 td { "{page_window.start + index + 1}" }
                                                 td { class: "smarts-cell", "{candidate.smarts()}" }
                                                 td { {format!("{:.3}", candidate.mcc())} }
-                                                td { "{candidate.smarts_len()}" }
+                                                td { {format!("{:.3}", candidate.coverage_score())} }
                                             }
                                         }
                                     }
