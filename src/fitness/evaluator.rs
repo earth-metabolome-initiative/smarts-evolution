@@ -162,12 +162,17 @@ impl EvaluationLogSettings {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(any(feature = "std", target_arch = "wasm32")), allow(dead_code))]
 pub(crate) enum EvaluationMatchLimit<'a> {
     None,
     Configured {
         max_elapsed: Duration,
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        started: Instant,
         #[cfg(target_arch = "wasm32")]
-        now_ms: Option<&'a dyn Fn() -> f64>,
+        deadline_ms: f64,
+        #[cfg(target_arch = "wasm32")]
+        now_ms: &'a dyn Fn() -> f64,
         #[cfg(not(target_arch = "wasm32"))]
         _marker: core::marker::PhantomData<&'a ()>,
     },
@@ -178,15 +183,83 @@ impl<'a> EvaluationMatchLimit<'a> {
         settings: Option<&EvaluationLogSettings>,
         #[cfg(target_arch = "wasm32")] now_ms: Option<&'a dyn Fn() -> f64>,
     ) -> Self {
-        match settings.and_then(|settings| settings.match_time_limit) {
-            Some(max_elapsed) => Self::Configured {
+        let Some(max_elapsed) = settings.and_then(|settings| settings.match_time_limit) else {
+            return Self::None;
+        };
+
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        {
+            Self::Configured {
                 max_elapsed,
+                started: Instant::now(),
+                _marker: core::marker::PhantomData,
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            match now_ms {
+                Some(now_ms) => Self::Configured {
+                    max_elapsed,
+                    deadline_ms: now_ms() + max_elapsed.as_secs_f64() * 1_000.0,
+                    now_ms,
+                },
+                None => Self::None,
+            }
+        }
+
+        #[cfg(not(any(
+            all(feature = "std", not(target_arch = "wasm32")),
+            target_arch = "wasm32"
+        )))]
+        {
+            let _ = max_elapsed;
+            Self::None
+        }
+    }
+
+    fn remaining(self) -> Result<Duration, EvaluationFailure> {
+        match self {
+            Self::None => unreachable!("remaining time is only requested for configured limits"),
+            Self::Configured {
+                max_elapsed,
+                #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+                started,
+                #[cfg(target_arch = "wasm32")]
+                deadline_ms,
                 #[cfg(target_arch = "wasm32")]
                 now_ms,
                 #[cfg(not(target_arch = "wasm32"))]
-                _marker: core::marker::PhantomData,
-            },
-            None => Self::None,
+                    _marker: _,
+            } => {
+                #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+                {
+                    max_elapsed
+                        .checked_sub(started.elapsed())
+                        .filter(|remaining| !remaining.is_zero())
+                        .ok_or(EvaluationFailure::LimitExceeded)
+                }
+
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = max_elapsed;
+                    let remaining_ms = deadline_ms - now_ms();
+                    if !remaining_ms.is_finite() || remaining_ms <= 0.0 {
+                        Err(EvaluationFailure::LimitExceeded)
+                    } else {
+                        Ok(Duration::from_secs_f64(remaining_ms / 1_000.0))
+                    }
+                }
+
+                #[cfg(not(any(
+                    all(feature = "std", not(target_arch = "wasm32")),
+                    target_arch = "wasm32"
+                )))]
+                {
+                    let _ = max_elapsed;
+                    Ok(Duration::MAX)
+                }
+            }
         }
     }
 }
@@ -921,22 +994,27 @@ fn match_outcome_with_limit(
     match limit {
         EvaluationMatchLimit::None => Ok(query.match_outcome_with_scratch(target, scratch)),
         EvaluationMatchLimit::Configured {
-            max_elapsed,
+            #[cfg(target_arch = "wasm32")]
+            deadline_ms,
             #[cfg(target_arch = "wasm32")]
             now_ms,
-            #[cfg(not(target_arch = "wasm32"))]
-                _marker: _,
-        } => match match_outcome_with_configured_limit(
-            query,
-            target,
-            scratch,
-            max_elapsed,
-            #[cfg(target_arch = "wasm32")]
-            now_ms,
-        ) {
-            MatchOutcomeLimitResult::Complete(outcome) => Ok(outcome),
-            MatchOutcomeLimitResult::Exceeded => Err(EvaluationFailure::LimitExceeded),
-        },
+            ..
+        } => {
+            let remaining = limit.remaining()?;
+            match match_outcome_with_configured_limit(
+                query,
+                target,
+                scratch,
+                remaining,
+                #[cfg(target_arch = "wasm32")]
+                deadline_ms,
+                #[cfg(target_arch = "wasm32")]
+                now_ms,
+            ) {
+                MatchOutcomeLimitResult::Complete(outcome) => Ok(outcome),
+                MatchOutcomeLimitResult::Exceeded => Err(EvaluationFailure::LimitExceeded),
+            }
+        }
     }
 }
 
@@ -944,27 +1022,27 @@ fn match_outcome_with_configured_limit(
     query: &CompiledQuery,
     target: &PreparedTarget,
     scratch: &mut MatchScratch,
-    max_elapsed: Duration,
-    #[cfg(target_arch = "wasm32")] now_ms: Option<&dyn Fn() -> f64>,
+    remaining: Duration,
+    #[cfg(target_arch = "wasm32")] deadline_ms: f64,
+    #[cfg(target_arch = "wasm32")] now_ms: &dyn Fn() -> f64,
 ) -> MatchOutcomeLimitResult {
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     {
-        query.match_outcome_with_scratch_and_time_limit(target, scratch, max_elapsed)
+        query.match_outcome_with_scratch_and_time_limit(target, scratch, remaining)
     }
 
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(now_ms) = now_ms {
-            let deadline_ms = now_ms() + max_elapsed.as_secs_f64() * 1_000.0;
-            return query.match_outcome_with_scratch_and_interrupt(target, scratch, || {
-                now_ms() >= deadline_ms
-            });
-        }
+        let _ = remaining;
+        query.match_outcome_with_scratch_and_interrupt(target, scratch, || now_ms() >= deadline_ms)
     }
 
-    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    #[cfg(not(any(
+        all(feature = "std", not(target_arch = "wasm32")),
+        target_arch = "wasm32"
+    )))]
     {
-        let _ = max_elapsed;
+        let _ = remaining;
         MatchOutcomeLimitResult::Complete(query.match_outcome_with_scratch(target, scratch))
     }
 }
@@ -1065,6 +1143,34 @@ mod tests {
         assert!((atom_eval.coverage_score() - (4.0 / 15.0)).abs() < 1e-12);
         assert!((bond_eval.coverage_score() - 0.8).abs() < 1e-12);
         assert!(bond_eval.coverage_score() > atom_eval.coverage_score());
+    }
+
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    #[test]
+    fn native_match_limit_expires_across_reused_limit() {
+        let settings = EvaluationLogSettings::new(
+            String::from("test"),
+            0,
+            1,
+            1,
+            Some(Duration::from_millis(1)),
+            None,
+        );
+        let limit = EvaluationMatchLimit::from_settings(Some(&settings));
+        assert!(limit.remaining().is_ok());
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(limit.remaining(), Err(EvaluationFailure::LimitExceeded));
+
+        let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+        let query = CompiledQuery::new(genome.query().clone()).unwrap();
+        let target = prepared("CN");
+        let mut scratch = MatchScratch::new();
+
+        assert_eq!(
+            match_outcome_with_limit(&query, &target, &mut scratch, limit),
+            Err(EvaluationFailure::LimitExceeded)
+        );
     }
 
     #[test]

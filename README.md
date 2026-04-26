@@ -55,7 +55,7 @@ Enable the `indicatif` feature and call `task.evolve_with_indicatif(&config, &se
 
 ## Pathological SMARTS Evaluation
 
-The GA logs each SMARTS evaluation at `debug` level, applies `EvolutionConfig::match_time_limit` as a cooperative per-match safety fuse, and emits a `warn` log when matching exceeds that limit. `MatchLimitResult::Exceeded` is treated as unknown, so the affected genome receives invalid fitness instead of counting the sample as a non-match. SMARTS length is used only for deterministic tie-breaking and optional `max_evaluation_smarts_len` filtering.
+The GA logs each SMARTS evaluation at `debug` level, applies `EvolutionConfig::match_time_limit` as a cooperative per-SMARTS evaluation safety fuse, and emits a `warn` log when matching exceeds that limit. Limit-exceeded matcher results are treated as unknown, so the affected genome receives invalid fitness instead of counting the sample as a non-match. SMARTS length is used only for deterministic tie-breaking and optional `max_evaluation_smarts_len` filtering.
 
 For a standalone `.log` file, initialize the built-in file logger before starting evolution:
 
