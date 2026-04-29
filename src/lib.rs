@@ -21,6 +21,8 @@ pub use evolution::runner::{
     EvolutionProgressObserver, EvolutionSession, EvolutionStatus, EvolutionTask, RankedSmarts,
     TaskResult,
 };
+#[cfg(all(feature = "tui", not(target_arch = "wasm32")))]
+pub use evolution::tui::{TuiEvolutionDashboard, TuiEvolutionError, TuiMetric};
 pub use fitness::evaluator::{
     EvaluatedSmarts, EvaluationProgress as SmartsEvaluationProgress, EvaluationSet, FoldData,
     FoldSample, LabeledCorpus, SmartsEvaluator,

@@ -6,6 +6,8 @@
 
 Evolving SMARTS patterns against a binary classification task.
 
+Native terminal runs can use `task.evolve_with_tui(&config, &seed_corpus)` with the `tui` feature enabled.
+
 ## Quick Start
 
 ```rust
