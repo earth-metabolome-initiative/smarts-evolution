@@ -434,6 +434,7 @@ pub struct RankedSmarts {
     mcc: f64,
     smarts_len: usize,
     coverage_score: f64,
+    limit_exceeded: bool,
 }
 
 impl RankedSmarts {
@@ -447,20 +448,32 @@ impl RankedSmarts {
     }
 
     fn from_parts(smarts: String, mcc: f64, smarts_len: usize, coverage_score: f64) -> Self {
+        Self::from_parts_with_limit(smarts, mcc, smarts_len, coverage_score, false)
+    }
+
+    fn from_parts_with_limit(
+        smarts: String,
+        mcc: f64,
+        smarts_len: usize,
+        coverage_score: f64,
+        limit_exceeded: bool,
+    ) -> Self {
         Self {
             smarts,
             mcc,
             smarts_len,
             coverage_score,
+            limit_exceeded,
         }
     }
 
     fn from_evaluated(evaluated: &EvaluatedSmarts) -> Self {
-        Self::from_parts(
+        Self::from_parts_with_limit(
             evaluated.smarts().to_string(),
             evaluated.mcc(),
             evaluated.smarts_len(),
             evaluated.coverage_score(),
+            evaluated.limit_exceeded(),
         )
     }
 
@@ -482,6 +495,10 @@ impl RankedSmarts {
 
     pub fn coverage_score(&self) -> f64 {
         self.coverage_score
+    }
+
+    pub fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
     }
 }
 
@@ -669,6 +686,10 @@ impl EvolutionEvaluationProgress {
 
     pub fn last_mcc(&self) -> Option<f64> {
         self.last().map(RankedSmarts::mcc)
+    }
+
+    pub fn last_limit_exceeded(&self) -> Option<bool> {
+        self.last().map(RankedSmarts::limit_exceeded)
     }
 
     pub fn generation_best(&self) -> Option<&RankedSmarts> {
@@ -1156,6 +1177,7 @@ impl EvolutionSession {
                 mcc: self.best_fitness.mcc(),
                 smarts_len: self.best_smarts_len,
                 coverage_score: self.best_coverage_score,
+                limit_exceeded: false,
             },
             leaders,
             stats: &stats,
@@ -3403,6 +3425,10 @@ mod regression_tests {
         assert_eq!(ranked.mcc(), 0.5);
         assert_eq!(ranked.smarts_len(), genome.smarts_len());
         assert_eq!(ranked.coverage_score(), 0.42);
+        assert!(!ranked.limit_exceeded());
+        let timed_out_ranked =
+            RankedSmarts::from_parts_with_limit("[#7]".to_string(), -1.0, 4, 0.0, true);
+        assert!(timed_out_ranked.limit_exceeded());
 
         let stats = GenerationStats {
             unique_count: 2,
@@ -3463,6 +3489,7 @@ mod regression_tests {
         assert_eq!(evaluation_progress.last().unwrap().smarts(), "[#6]");
         assert_eq!(evaluation_progress.last_smarts(), Some("[#6]"));
         assert_eq!(evaluation_progress.last_mcc(), Some(0.5));
+        assert_eq!(evaluation_progress.last_limit_exceeded(), Some(false));
         assert_eq!(
             evaluation_progress.generation_best().unwrap().smarts(),
             "[#6]"

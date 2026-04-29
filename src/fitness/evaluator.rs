@@ -283,6 +283,7 @@ pub struct EvaluatedSmarts {
     mcc: f64,
     smarts_len: usize,
     coverage_score: f64,
+    limit_exceeded: bool,
 }
 
 impl EvaluatedSmarts {
@@ -292,6 +293,7 @@ impl EvaluatedSmarts {
             mcc: evaluation.fitness().mcc(),
             smarts_len: genome.smarts_len(),
             coverage_score: evaluation.coverage_score(),
+            limit_exceeded: evaluation.limit_exceeded(),
         }
     }
 
@@ -309,6 +311,10 @@ impl EvaluatedSmarts {
 
     pub fn coverage_score(&self) -> f64 {
         self.coverage_score
+    }
+
+    pub fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
     }
 }
 
@@ -359,6 +365,10 @@ impl EvaluationProgress {
 
     pub fn last_coverage_score(&self) -> Option<f64> {
         self.last().map(EvaluatedSmarts::coverage_score)
+    }
+
+    pub fn last_limit_exceeded(&self) -> Option<bool> {
+        self.last().map(EvaluatedSmarts::limit_exceeded)
     }
 
     pub fn best(&self) -> Option<&EvaluatedSmarts> {
@@ -1331,11 +1341,27 @@ mod tests {
                     && progress.last_smarts().is_some()
                     && progress.last_mcc().is_some_and(f64::is_finite)
                     && progress.last_coverage_score().is_some_and(f64::is_finite)
+                    && progress.last_limit_exceeded() == Some(false)
                     && progress.best().is_some()
                     && progress.best_smarts().is_some()
                     && progress.best_mcc().is_some_and(f64::is_finite)
                     && progress.best_coverage_score().is_some_and(f64::is_finite))
         );
+    }
+
+    #[test]
+    fn evaluated_smarts_retains_limit_exceeded_state() {
+        let genome = SmartsGenome::from_smarts("[#6]").unwrap();
+        let evaluation = GenomeEvaluation {
+            fitness: ObjectiveFitness::invalid(),
+            phenotype: Arc::from([0u64]),
+            coverage_score: 0.0,
+            limit_exceeded: true,
+        };
+        let evaluated = EvaluatedSmarts::new(&genome, &evaluation);
+
+        assert_eq!(evaluated.mcc(), -1.0);
+        assert!(evaluated.limit_exceeded());
     }
 
     #[test]

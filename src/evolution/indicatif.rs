@@ -161,6 +161,7 @@ impl IndicatifEvolutionProgress {
             .set_position(progress.completed() as u64);
         let message = evaluation_detail_message(
             progress.last_mcc(),
+            progress.last_limit_exceeded().unwrap_or(false),
             progress.last_smarts(),
             self.best_smarts_width,
         );
@@ -363,11 +364,14 @@ fn truncate_smarts(smarts: &str, max_width: usize) -> String {
 
 fn evaluation_detail_message(
     last_mcc: Option<f64>,
+    last_limit_exceeded: bool,
     last_smarts: Option<&str>,
     best_smarts_width: usize,
 ) -> String {
     let mut message = String::new();
-    if let Some(last_mcc) = last_mcc {
+    if last_limit_exceeded {
+        message.push_str(" current_mcc=OOT");
+    } else if let Some(last_mcc) = last_mcc {
         message.push_str(&format!(" current_mcc={last_mcc:.3}"));
     }
     if let Some(last_smarts) = last_smarts {
@@ -427,10 +431,14 @@ mod tests {
         );
         assert!(!EVALUATION_STYLE_TEMPLATE.contains("generation="));
         assert!(!EVALUATION_STYLE_TEMPLATE.contains("SMARTS="));
-        assert_eq!(evaluation_detail_message(None, None, 16), "");
+        assert_eq!(evaluation_detail_message(None, false, None, 16), "");
         assert_eq!(
-            evaluation_detail_message(Some(0.478), Some("[#7;R&+0:27651]"), 12),
+            evaluation_detail_message(Some(0.478), false, Some("[#7;R&+0:27651]"), 12),
             " current_mcc=0.478 current=[#7;R&+0:..."
+        );
+        assert_eq!(
+            evaluation_detail_message(Some(-1.0), true, Some("[#7]"), 12),
+            " current_mcc=OOT current=[#7]"
         );
     }
 
