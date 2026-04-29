@@ -297,8 +297,8 @@ impl EvolutionConfigBuilder {
     /// GA validity and length limits.
     ///
     /// [`SmartsCompatibilityMode::PubChem`] switches generation to the
-    /// conservative PubChem-oriented profile documented in
-    /// `docs/pubchem-smarts-compatibility.md`.
+    /// conservative PubChem-oriented profile described on
+    /// [`Self::pubchem_compatible_smarts`].
     pub fn smarts_compatibility(mut self, mode: SmartsCompatibilityMode) -> Self {
         self.smarts_compatibility = mode;
         self
