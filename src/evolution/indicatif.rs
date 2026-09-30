@@ -402,7 +402,7 @@ mod tests {
     use std::vec;
 
     use smarts_rs::PreparedTarget;
-    use smiles_parser::Smiles;
+    use smiles_rs::Smiles;
 
     use super::*;
     use crate::fitness::evaluator::{FoldData, FoldSample};

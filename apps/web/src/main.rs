@@ -14,7 +14,7 @@ use smarts_evolution_web_protocol::{
     CompletedRun, EvaluationUpdate, EvolutionConfigInput, OffspringUpdate, ProgressUpdate,
     RankedCandidate, RunRequest, StartupUpdate, WorkerRequest,
 };
-use smiles_parser::Smiles;
+use smiles_rs::Smiles;
 
 #[cfg(target_arch = "wasm32")]
 use smarts_evolution_web_protocol::WorkerResponse;

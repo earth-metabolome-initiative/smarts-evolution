@@ -9,7 +9,7 @@ Evolving SMARTS patterns against a binary classification task.
 ## Quick Start
 
 ```rust
-use smiles_parser::Smiles;
+use smiles_rs::Smiles;
 use smarts_evolution::{
     EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus,
 };

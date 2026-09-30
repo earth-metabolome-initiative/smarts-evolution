@@ -17,7 +17,7 @@ codegen-units = 1
 [dependencies]
 elements_rs = "0.2.3"
 smarts-rs = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main" }
-smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main" }
+smiles-rs = { git = "https://github.com/earth-metabolome-initiative/smiles-rs", branch = "main" }
 rand = { version = "0.10.1", default-features = false, features = ["alloc", "std_rng"] }
 getrandom = { version = "0.4.2", features = ["wasm_js"] }
 log = { version = "0.4.29", default-features = false }

@@ -18,7 +18,7 @@ use smarts_evolution_web_protocol::{
     WorkerResponse,
 };
 use smarts_rs::PreparedTarget;
-use smiles_parser::Smiles;
+use smiles_rs::Smiles;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 

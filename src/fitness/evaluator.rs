@@ -1090,7 +1090,7 @@ fn phenotype_bit(phenotype: &[u64], bit_index: usize) -> bool {
 mod tests {
     use std::{format, vec};
 
-    use smiles_parser::Smiles;
+    use smiles_rs::Smiles;
 
     use super::*;
 

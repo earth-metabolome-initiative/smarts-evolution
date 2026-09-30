@@ -25,7 +25,7 @@
 fn main() {
     use smarts_evolution::{EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus};
     use smarts_rs::PreparedTarget;
-    use smiles_parser::Smiles;
+    use smiles_rs::Smiles;
 
     fn prepared(smiles: &str) -> PreparedTarget {
         PreparedTarget::new(Smiles::from_str(smiles).unwrap())

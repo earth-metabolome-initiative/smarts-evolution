@@ -15,7 +15,7 @@ use smarts_evolution::{
     EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus, SmartsEvaluator, SmartsGenome,
 };
 use smarts_rs::{CompiledQuery, PreparedTarget};
-use smiles_parser::Smiles;
+use smiles_rs::Smiles;
 
 const POSITIVE_SMILES: &[&str] = &[
     "CC(=O)N",

@@ -7,8 +7,8 @@ use smarts_rs::{
     AtomExpr, AtomPrimitive, BondExpr, BondExprTree, BondPrimitive, BracketExprTree, HydrogenKind,
     NumericQuery, QueryMol,
 };
-use smiles_parser::atom::bracketed::chirality::Chirality;
-use smiles_parser::bond::Bond;
+use smiles_rs::atom::bracketed::chirality::Chirality;
+use smiles_rs::bond::Bond;
 
 pub(crate) const PUBCHEM_MAX_ATOM_MAP: u32 = 999;
 pub(crate) const PUBCHEM_MIN_ATOMIC_NUMBER: u16 = 1;
