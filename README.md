@@ -4,7 +4,7 @@
 [![codecov](https://codecov.io/gh/LucaCappelletti94/smarts-evolution/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/smarts-evolution)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Evolving SMARTS patterns against a binary classification task.
+Evolving SMARTS patterns against a binary classification task with molecules parsed by [`smiles-rs`](https://crates.io/crates/smiles-rs).
 
 ## Quick Start
 
