@@ -1202,6 +1202,36 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    #[test]
+    fn expired_match_limit_marks_evaluation_invalid_and_limit_exceeded() {
+        let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
+            sample("CN", true),
+            sample("CC", false),
+        ])]);
+        let genome = SmartsGenome::from_smarts("[#6]~[#7]").unwrap();
+        let settings = EvaluationLogSettings::new(
+            String::from("test"),
+            0,
+            1,
+            2,
+            Some(Duration::from_millis(1)),
+            None,
+        );
+        let limit = EvaluationMatchLimit::from_settings(Some(&settings));
+        std::thread::sleep(Duration::from_millis(5));
+
+        let unlimited = evaluator.evaluate(&genome);
+        let expired = evaluator.evaluate_with_limit(&genome, limit);
+
+        assert!(!unlimited.limit_exceeded());
+        assert_ne!(unlimited.fitness(), ObjectiveFitness::invalid());
+        assert!(expired.limit_exceeded());
+        assert_eq!(expired.fitness(), ObjectiveFitness::invalid());
+        assert!(expired.phenotype().is_empty());
+        assert_eq!(expired.coverage_score(), 0.0);
+    }
+
     #[test]
     fn evaluator_debug_and_objective_work_for_simple_fold() {
         let evaluator = SmartsEvaluator::new(vec![FoldData::new(vec![
