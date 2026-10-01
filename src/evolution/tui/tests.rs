@@ -14,7 +14,7 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{self, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::prelude::{Color, Modifier, Rect};
 use smarts_rs::PreparedTarget;
-use smiles_parser::Smiles;
+use smiles_rs::Smiles;
 
 use super::input::*;
 use super::layout::*;

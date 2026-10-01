@@ -268,7 +268,7 @@ impl EvolutionTask {
     /// ```
     /// use core::str::FromStr;
     ///
-    /// use smiles_parser::Smiles;
+    /// use smiles_rs::Smiles;
     /// use smarts_evolution::{
     ///     EvolutionConfig, EvolutionTask, FoldData, FoldSample, SeedCorpus,
     /// };
@@ -2578,7 +2578,7 @@ mod regression_tests {
 
     use crate::fitness::evaluator::FoldSample;
     use smarts_rs::PreparedTarget;
-    use smiles_parser::Smiles;
+    use smiles_rs::Smiles;
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
 

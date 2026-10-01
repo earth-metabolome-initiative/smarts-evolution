@@ -17,8 +17,8 @@ use smarts_rs::{
     QueryMol, add_atom_primitive, add_bond_primitive, normalize_bond_tree, remove_atom_primitive,
     remove_bond_primitive, replace_atom_primitive, replace_bond_primitive,
 };
-use smiles_parser::atom::bracketed::chirality::Chirality;
-use smiles_parser::bond::Bond;
+use smiles_rs::atom::bracketed::chirality::Chirality;
+use smiles_rs::bond::Bond;
 
 use crate::genome::SmartsGenome;
 #[cfg(test)]
