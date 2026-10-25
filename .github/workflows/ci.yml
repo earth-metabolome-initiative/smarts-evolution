@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   core:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout
@@ -39,7 +39,7 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown
 
   web:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout
@@ -76,7 +76,7 @@ jobs:
           "${{ runner.temp }}/dioxus-cli/bin/dx" build --platform web --release --debug-symbols false
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
